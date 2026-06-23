@@ -12,6 +12,7 @@ declare const chrome: {
   runtime: {
     id: string;
     sendMessage(message: unknown): Promise<unknown>;
+    getManifest(): { version: string };
     onMessage: ChromeEvent<[unknown, { id?: string; origin?: string; url?: string }, SendResponse]>;
     onMessageExternal: ChromeEvent<
       [unknown, { id?: string; origin?: string; url?: string }, SendResponse]

@@ -34,6 +34,7 @@ function buildDom() {
     <div id="privacy"></div>
     <section id="syncs"><h2 class="block-title">recent syncs</h2><ul id="sync-list" class="sync-list"></ul><p id="sync-empty" class="block-body" hidden>no syncs yet</p><button id="sync-more" type="button" class="sync-more" hidden>show more</button></section>
     <a id="repo-link"></a>
+    <a id="update-notice" hidden></a>
   `;
 }
 
@@ -199,6 +200,55 @@ describe("popup", () => {
     expect(document.getElementById("privacy")!.hidden).toBe(false);
     // generic fallback label, never a platform name
     expect(document.getElementById("what-we-fetch")!.textContent).toContain("professional network");
+  });
+
+  const LATEST_DOWNLOAD =
+    "https://github.com/noticedso/relationships-extension/releases/latest/download/noticed-relationships.zip";
+
+  function chromeWithManifest(version: string) {
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : status));
+    return {
+      runtime: {
+        sendMessage,
+        id: "abcdefghijklmnopabcdefghijklmnop",
+        getManifest: () => ({ version }),
+      },
+      tabs: { create: vi.fn() },
+    };
+  }
+
+  it("#1: reveals the update notice (with download href) when a newer release exists", async () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
+    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
+
+    await init(document);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const notice = document.getElementById("update-notice") as HTMLAnchorElement;
+    expect(notice.hidden).toBe(false);
+    expect(notice.getAttribute("href")).toBe(LATEST_DOWNLOAD);
+  });
+
+  it("#1: keeps the update notice hidden when the installed version is current", async () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
+    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.2" }) })) as unknown as typeof fetch;
+
+    await init(document);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
+  });
+
+  it("#1: leaves the update notice hidden (no throw) when the release fetch fails", async () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("network down");
+    }) as unknown as typeof fetch;
+
+    await expect(init(document)).resolves.toBeUndefined();
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
   });
 
   it("source names no platform", () => {

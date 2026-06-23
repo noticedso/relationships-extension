@@ -40,6 +40,12 @@ It's built in the open so you can verify exactly what it does.
 2. Sign in to noticed if prompted — it opens `noticed.so/x/connect` and pairs back to this extension.
 3. Approve the one-time LinkedIn access prompt, then **Scan now** (or wait for the monthly run).
 
+## Updating
+
+- **Installed from the Chrome Web Store:** updates automatically — Chrome polls the store and applies new versions for you. Nothing to do.
+- **Installed from GitHub (load unpacked):** Chrome does **not** auto-update these. The popup shows an "update available" notice when a newer release exists. To update, download the latest release `.zip`, then reload at `chrome://extensions` — either **remove** the extension and **Load unpacked** the new folder again, or replace the folder's contents and click the reload icon on the extension card.
+- Note: many fixes (for example, if LinkedIn changes its internal data shape) ship via the server-side recipe and need **no extension update at all**.
+
 ## Develop
 
 ```bash

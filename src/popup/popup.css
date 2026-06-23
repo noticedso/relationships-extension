@@ -182,6 +182,22 @@ body {
   margin: 0;
 }
 
+/* update-available notice */
+.update-notice {
+  display: block;
+  font-size: var(--text-micro);
+  color: var(--brand-text);
+  background: var(--muted);
+  border: 0.5px solid var(--border);
+  border-radius: calc(var(--radius) * 0.8);
+  padding: 7px 12px;
+  text-decoration: none;
+}
+.update-notice:hover {
+  filter: brightness(0.98);
+  text-decoration: underline;
+}
+
 /* connect / sign-in */
 .connect {
   display: flex;

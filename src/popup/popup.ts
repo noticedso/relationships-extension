@@ -6,6 +6,53 @@
 // `status.recipe.networkLabel`, so this extension stays platform-agnostic.
 
 const REPO_URL = "https://github.com/noticedso/relationships-extension";
+const LATEST_RELEASE_API = "https://api.github.com/repos/noticedso/relationships-extension/releases/latest";
+const LATEST_DOWNLOAD_URL =
+  "https://github.com/noticedso/relationships-extension/releases/latest/download/noticed-relationships.zip";
+
+// Numeric semver compare. Strips a leading "v", splits on ".", compares parts.
+// Returns >0 if a is newer than b, <0 if older, 0 if equal.
+function compareSemver(a: string, b: string): number {
+  const parse = (v: string) =>
+    v
+      .replace(/^v/, "")
+      .split(".")
+      .map((p) => Number.parseInt(p, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+// Best-effort: ask GitHub for the latest release and reveal an "update available"
+// notice when the installed version is behind. For GitHub / load-unpacked users
+// who don't auto-update. The releases API returns `Access-Control-Allow-Origin: *`,
+// so this works from a popup with no host permission. Never throws.
+async function checkForUpdate(root: Document | HTMLElement): Promise<void> {
+  if (typeof chrome === "undefined" || !chrome.runtime?.getManifest) return;
+  const notice = root.querySelector<HTMLAnchorElement>("#update-notice");
+  if (!notice) return;
+  try {
+    const installed = chrome.runtime.getManifest().version;
+    const res = await fetch(LATEST_RELEASE_API, {
+      headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!res.ok) return;
+    const data = (await res.json()) as { tag_name?: string };
+    const latest = data?.tag_name;
+    if (!latest || typeof latest !== "string") return;
+    if (compareSemver(latest, installed) > 0) {
+      notice.href = LATEST_DOWNLOAD_URL;
+      notice.hidden = false;
+    }
+  } catch {
+    // best-effort — leave the notice hidden on any fetch/parse error
+  }
+}
 
 const NOTICED_ORIGIN = "https://www.noticed.so";
 function openConnect(): void {
@@ -172,6 +219,9 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
   // Bail when the extension API isn't available (e.g. module imported under test
   // before the chrome mock is installed, or any non-extension context).
   if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
+
+  // Best-effort update check — don't block render, has its own try/catch.
+  void checkForUpdate(root);
 
   const status = await getStatus();
 
