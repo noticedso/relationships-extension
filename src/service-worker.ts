@@ -165,12 +165,17 @@ async function handleExternal(
       sendResponse({ ok: true });
       return;
     case "pair":
+      // Store the recipe + account and arm the monthly alarm. We do NOT request
+      // the host permission here: pair runs from the noticed page's message, with
+      // no user gesture in the service worker, so chrome.permissions.request would
+      // throw and the ack below would never be sent (leaving the connect page stuck
+      // on "Connecting…"). The host permission is requested from a user gesture in
+      // the popup's "Scan now" click instead.
       await setState({
         recipe: message.recipe,
         account: message.account,
         noticedOrigin: origin,
       });
-      await chrome.permissions.request({ origins: [message.recipe.targetOrigin + "/*"] });
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
       sendResponse({ ok: true });
       return;

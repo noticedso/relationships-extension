@@ -30,7 +30,7 @@ function isDevBuild(): boolean {
 
 type Status = {
   account?: { name?: string; email?: string } | null;
-  recipe?: { networkLabel?: string } | null;
+  recipe?: { networkLabel?: string; targetOrigin?: string } | null;
   nextScanAt?: number | null;
   lastScanAt?: number | null;
   lastScanCount?: number | null;
@@ -178,6 +178,20 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     button.dataset.wired = "1";
     button.addEventListener("click", () => {
       void (async () => {
+        // Request the host permission here — a popup click is a user gesture, so
+        // chrome.permissions.request works (it can't in the service worker). The
+        // permission persists, so the monthly background scan needs no gesture.
+        const { recipe } = await getStatus();
+        const origin = recipe?.targetOrigin;
+        if (origin) {
+          const granted = await chrome.permissions.request({
+            origins: [`${origin}/*`],
+          });
+          if (!granted) {
+            await init(root);
+            return;
+          }
+        }
         await chrome.runtime.sendMessage({ type: "scanNow" });
         await init(root);
       })();

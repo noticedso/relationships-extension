@@ -67,7 +67,7 @@ describe("service worker", () => {
     sw.registerListeners();
   });
 
-  it("1. external pair from allowed origin stores state, creates alarm, requests permissions", async () => {
+  it("1. external pair from allowed origin stores state + creates alarm, acks, and does NOT request permissions (no user gesture in the SW)", async () => {
     const chrome = getChrome();
     const createAlarm = vi.spyOn(chrome.alarms, "create");
     const reqPerms = vi.spyOn(chrome.permissions, "request");
@@ -81,7 +81,9 @@ describe("service worker", () => {
     expect(stored.noticedOrigin).toBe("https://app.noticed.so");
 
     expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 43200 });
-    expect(reqPerms).toHaveBeenCalledWith({ origins: [recipe.targetOrigin + "/*"] });
+    // pair must always ack — requesting permission here would throw (no gesture)
+    // and leave the connect page hanging. Permission is requested in the popup.
+    expect(reqPerms).not.toHaveBeenCalled();
   });
 
   it("2. external message from non-noticed origin is ignored", async () => {

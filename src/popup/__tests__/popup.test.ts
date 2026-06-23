@@ -98,7 +98,7 @@ describe("popup", () => {
     expect(sendMessage).not.toHaveBeenCalled(); // not wired in production
   });
 
-  it("wires scan-now to send a scanNow message", async () => {
+  it("wires scan-now to send a scanNow message (no targetOrigin → no permission prompt)", async () => {
     const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : status));
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
@@ -108,7 +108,50 @@ describe("popup", () => {
     await init(document);
     sendMessage.mockClear();
     document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
+    await new Promise((r) => setTimeout(r, 0));
     expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
+  });
+
+  it("requests the host permission on the scan click (user gesture) before scanning", async () => {
+    const withOrigin = {
+      ...status,
+      recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : withOrigin));
+    const request = vi.fn(async () => true);
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request, contains: vi.fn(async () => false) },
+    };
+
+    await init(document);
+    sendMessage.mockClear();
+    document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(request).toHaveBeenCalledWith({ origins: ["https://network.example.com/*"] });
+    expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
+  });
+
+  it("does not scan if the host permission is denied", async () => {
+    const withOrigin = {
+      ...status,
+      recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : withOrigin));
+    const request = vi.fn(async () => false);
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request, contains: vi.fn(async () => false) },
+    };
+
+    await init(document);
+    sendMessage.mockClear();
+    document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(request).toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalledWith({ type: "scanNow" });
   });
 
   it("source names no platform", () => {
