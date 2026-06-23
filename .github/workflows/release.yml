@@ -1,0 +1,47 @@
+name: release
+
+# Tag a version (v1.0.0) to build a verifiable release: tests → deterministic
+# build → zip → SHA-256 → GitHub Release with the .zip + hash attached.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npx vitest run
+      - run: node build.mjs
+      - name: Package + hash
+        id: pkg
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="noticed-relationships-${VERSION}.zip"
+          (cd dist && zip -rqX "../${ZIP}" .)
+          HASH=$(node scripts/hash-artifact.mjs | tail -1)
+          echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "${HASH}  ${ZIP}" > SHA256SUMS.txt
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            Reproducible build of the noticed Relationships extension.
+
+            **Artifact SHA-256:** `${{ steps.pkg.outputs.hash }}`
+
+            Verify locally: `npm ci && node build.mjs && node scripts/hash-artifact.mjs` — the digest must match.
+            The same `${{ steps.pkg.outputs.zip }}` is what's uploaded to the Chrome Web Store.
+          files: |
+            ${{ steps.pkg.outputs.zip }}
+            SHA256SUMS.txt

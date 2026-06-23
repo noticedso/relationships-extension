@@ -1,0 +1,35 @@
+name: ci
+
+on: [push, pull_request]
+
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - name: Test
+        run: npx vitest run
+
+      - name: Build + verify reproducibility
+        run: |
+          node build.mjs
+          H1=$(node scripts/hash-artifact.mjs | tail -1)
+          node build.mjs
+          H2=$(node scripts/hash-artifact.mjs | tail -1)
+          [ "$H1" = "$H2" ] || (echo "non-reproducible build"; exit 1)
+          echo "$H1" > artifact-sha256.txt
+          echo "artifact sha256: $H1"
+
+      - name: Upload artifact hash
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-sha256
+          path: artifact-sha256.txt

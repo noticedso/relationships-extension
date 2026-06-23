@@ -1,0 +1,268 @@
+/* noticed brand tokens — mirrored from /brand/system (packages/tailwind-config/shared-styles.css).
+   Self-contained for the extension popup: no Tailwind, no remote fonts. The
+   "noticed" wordmark is the exact outlined brand geometry (inline SVG in the
+   markup), so no display font is bundled. */
+
+:root {
+  /* surfaces */
+  --background: oklch(0.985 0.002 90);
+  --card: oklch(1 0 0);
+  --border: oklch(0 0 0 / 0.12);
+  --muted: oklch(0 0 0 / 0.04);
+  /* content roles */
+  --content-primary: oklch(0 0 0 / 0.85);
+  --content-secondary: oklch(0 0 0 / 0.7);
+  --content-tertiary: oklch(0 0 0 / 0.6);
+  /* brand */
+  --brand: oklch(0.92 0.13 125);
+  --brand-foreground: oklch(0.25 0.06 150);
+  --brand-text: oklch(0.45 0.09 145);
+  --destructive: oklch(0.55 0.2 27);
+  /* type scale */
+  --text-title-sm: 18px;
+  --text-row: 13px;
+  --text-label: 12px;
+  --text-micro: 11px;
+  /* shape + motion */
+  --radius: 6px;
+  --transition: 150ms cubic-bezier(0, 0, 0.2, 1);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(0.147 0.004 49);
+    --card: oklch(0.216 0.006 56);
+    --border: oklch(1 0 0 / 0.1);
+    --muted: oklch(1 0 0 / 0.06);
+    --content-primary: oklch(1 0 0 / 0.85);
+    --content-secondary: oklch(1 0 0 / 0.7);
+    --content-tertiary: oklch(1 0 0 / 0.6);
+    --brand-text: oklch(0.92 0.13 125);
+    --destructive: oklch(0.7 0.19 22);
+  }
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+/* Ensure the `hidden` attribute wins over author `display` rules (e.g. .toggle
+   uses display:flex, which would otherwise override [hidden]'s UA display:none). */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  width: 340px;
+  background: var(--background);
+  color: var(--content-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-row);
+  line-height: 20px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.pop {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+/* header / wordmark */
+.pop-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wordmark {
+  height: 16px;
+  width: auto;
+  color: var(--content-primary);
+  display: block;
+}
+.product {
+  font-size: var(--text-row);
+  font-weight: 500;
+  color: var(--content-secondary);
+  margin-bottom: -4px;
+}
+
+/* cards */
+.card {
+  background: var(--card);
+  border: 0.5px solid var(--border);
+  border-radius: calc(var(--radius) * 0.8);
+  padding: 12px;
+}
+.account {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.account-name {
+  font-size: var(--text-row);
+  font-weight: 600;
+  color: var(--content-primary);
+}
+.account-email {
+  font-size: var(--text-label);
+  color: var(--content-tertiary);
+}
+
+/* status */
+.status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.status-line {
+  font-size: var(--text-row);
+  color: var(--content-secondary);
+}
+.status-sub {
+  font-size: var(--text-label);
+  color: var(--content-tertiary);
+}
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.btn-brand {
+  appearance: none;
+  border: none;
+  cursor: pointer;
+  background: var(--brand);
+  color: var(--brand-foreground);
+  font-family: inherit;
+  font-size: var(--text-row);
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: calc(var(--radius) * 0.8);
+  transition: filter var(--transition);
+}
+.btn-brand:hover {
+  filter: brightness(0.96);
+}
+.btn-brand:active {
+  filter: brightness(0.92);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-micro);
+  color: var(--content-tertiary);
+  cursor: pointer;
+  user-select: none;
+}
+.toggle input {
+  accent-color: var(--brand-text);
+  margin: 0;
+}
+
+/* connect / sign-in */
+.connect {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0;
+}
+.connect-copy {
+  font-size: var(--text-row);
+  color: var(--content-secondary);
+}
+#signin-cta {
+  align-self: flex-start;
+}
+
+/* needs / warning */
+.needs:empty {
+  display: none;
+}
+.needs {
+  font-size: var(--text-label);
+  color: var(--destructive);
+  padding: 8px 12px;
+  border: 0.5px solid var(--border);
+  border-radius: calc(var(--radius) * 0.8);
+  background: var(--muted);
+}
+
+/* info blocks */
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.block-title {
+  font-size: var(--text-label);
+  font-weight: 600;
+  color: var(--content-secondary);
+}
+.block-body {
+  font-size: var(--text-row);
+  color: var(--content-tertiary);
+}
+
+/* recent syncs */
+.sync-list {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+.sync-row {
+  font-size: var(--text-row);
+  color: var(--content-secondary);
+  padding: 6px 0;
+  border-top: 0.5px solid var(--border);
+}
+.sync-row:first-child {
+  border-top: none;
+}
+.sync-row[data-status] {
+  color: var(--destructive);
+}
+.sync-more {
+  appearance: none;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+  align-self: flex-start;
+  font-family: inherit;
+  font-size: var(--text-label);
+  color: var(--brand-text);
+}
+.sync-more:hover {
+  text-decoration: underline;
+}
+
+/* footer */
+.pop-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding-top: 2px;
+}
+.footer-sep {
+  font-size: var(--text-label);
+  color: var(--content-tertiary);
+}
+.footer-link {
+  font-size: var(--text-label);
+  color: var(--brand-text);
+  text-decoration: none;
+}
+.footer-link:hover {
+  text-decoration: underline;
+}

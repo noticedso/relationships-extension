@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "noticed Relationships",
+  "version": "1.0.0",
+  "description": "Import your own LinkedIn connections into noticed — privately, in your browser, as yourself.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "alarms",
+    "cookies"
+  ],
+  "host_permissions": [
+    "https://*.noticed.so/*"
+  ],
+  "optional_host_permissions": [
+    "*://*.linkedin.com/*"
+  ],
+  "externally_connectable": {
+    "matches": [
+      "https://*.noticed.so/*"
+    ]
+  },
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}
