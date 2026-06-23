@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><style>
+  :root{--bg:oklch(0.985 0.002 90);--card:oklch(1 0 0);--border:oklch(0 0 0 / 0.12);
+    --brand:oklch(0.92 0.13 125);--brand-fg:oklch(0.25 0.06 150);--brand-text:oklch(0.45 0.09 145);
+    --primary:oklch(0 0 0 / 0.85);--secondary:oklch(0 0 0 / 0.68);--tertiary:oklch(0 0 0 / 0.6);
+    --font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;}
+  *{box-sizing:border-box;margin:0}
+  html,body{width:1400px;height:560px}
+  body{background:radial-gradient(1000px 520px at 80% 16%, oklch(0.92 0.13 125 / 0.10), transparent 60%), var(--bg);
+    font-family:var(--font);color:var(--primary);-webkit-font-smoothing:antialiased;
+    display:grid;grid-template-columns:1fr 400px;align-items:center;gap:56px;padding:0 96px}
+  .left{display:flex;flex-direction:column;gap:24px;max-width:680px}
+  .row{display:flex;align-items:center;gap:13px}
+  .row img{width:44px;height:44px;border-radius:10px;display:block}
+  .name{font-size:22px;font-weight:600;letter-spacing:-0.01em}
+  .name .m{color:var(--tertiary);font-weight:500}
+  h1{font-size:54px;line-height:1.07;letter-spacing:-0.025em;font-weight:600}
+  h1 .a{background:var(--brand);color:var(--brand-fg);padding:0 12px;border-radius:9px}
+  .sub{font-size:21px;line-height:1.5;color:var(--secondary)}
+  ul{list-style:none;display:flex;flex-direction:column;gap:11px;padding:0;margin-top:2px}
+  li{display:flex;align-items:center;gap:11px;font-size:17px;color:var(--secondary)}
+  .dot{width:20px;height:20px;border-radius:999px;background:var(--brand);color:var(--brand-fg);
+    display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex:0 0 auto}
+  .pop{width:400px;background:var(--card);border:0.5px solid var(--border);border-radius:16px;
+    box-shadow:0 28px 70px oklch(0 0 0 / 0.13), 0 2px 8px oklch(0 0 0 / 0.05);
+    display:flex;flex-direction:column;gap:13px;padding:20px}
+  .ph{display:flex;align-items:center;gap:9px}
+  .ph img{width:24px;height:24px;border-radius:6px}
+  .ph .wm{font-size:19px;font-weight:600;letter-spacing:-0.01em}
+  .ph .pr{font-size:14px;font-weight:500;color:var(--secondary)}
+  .pc{border:0.5px solid var(--border);border-radius:6px;padding:13px}
+  .nm{font-size:14px;font-weight:600}.em{font-size:13px;color:var(--tertiary)}
+  .sl{font-size:14px;color:var(--secondary)}.ss{font-size:13px;color:var(--tertiary);margin-top:3px}
+  .btn{margin-top:11px;display:inline-block;background:var(--brand);color:var(--brand-fg);font-size:14px;font-weight:600;padding:8px 15px;border-radius:6px}
+  .bt{font-size:13px;font-weight:600;color:var(--secondary)}.bb{font-size:14px;color:var(--tertiary);margin-top:4px;line-height:1.45}
+</style></head><body>
+  <div class="left">
+    <div class="row"><img src="../icons/icon128.png" alt=""/><span class="name">noticed <span class="m">Relationships</span></span></div>
+    <h1>Your <span class="a">LinkedIn</span> connections, in noticed.</h1>
+    <p class="sub">Import your own connections privately, right from your browser — and keep them fresh, automatically.</p>
+    <ul>
+      <li><span class="dot">✓</span> Only your own connection list — never your messages</li>
+      <li><span class="dot">✓</span> Goes only to your noticed account, encrypted</li>
+      <li><span class="dot">✓</span> Open source &amp; reproducible — verify the code</li>
+    </ul>
+  </div>
+  <div class="pop">
+    <div class="ph"><img src="../icons/icon48.png" alt=""/><span class="wm">noticed</span><span class="pr">Relationships</span></div>
+    <div class="pc"><div class="nm">Simão Nogueira</div><div class="em">simao@noticed.so</div></div>
+    <div class="pc"><div class="sl">next scan: 16 Jul 2026</div><div class="ss">412 connections synced — 16 Jun 2026</div><div><span class="btn">scan now</span></div></div>
+    <div><div class="bt">what we fetch</div><div class="bb">we read your LinkedIn connection list — name, headline, profile link, connection date — as you, about once a month.</div></div>
+  </div>
+</body></html>

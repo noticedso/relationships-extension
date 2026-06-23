@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8" /><style>
+  :root{--bg:oklch(0.985 0.002 90);--brand:oklch(0.92 0.13 125);--brand-fg:oklch(0.25 0.06 150);
+    --primary:oklch(0 0 0 / 0.85);--secondary:oklch(0 0 0 / 0.62);
+    --font:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;}
+  *{box-sizing:border-box;margin:0}
+  html,body{width:440px;height:280px}
+  body{background:radial-gradient(420px 240px at 82% 12%, oklch(0.92 0.13 125 / 0.12), transparent 60%), var(--bg);
+    font-family:var(--font);color:var(--primary);-webkit-font-smoothing:antialiased;
+    display:flex;flex-direction:column;justify-content:center;gap:14px;padding:30px 32px}
+  .row{display:flex;align-items:center;gap:11px}
+  .row img{width:38px;height:38px;border-radius:9px;display:block}
+  .name{font-size:19px;font-weight:600;letter-spacing:-0.01em}
+  .name .m{color:var(--secondary);font-weight:500}
+  h1{font-size:27px;line-height:1.12;letter-spacing:-0.02em;font-weight:600}
+  h1 .a{background:var(--brand);color:var(--brand-fg);padding:0 7px;border-radius:6px}
+  p{font-size:14px;color:var(--secondary);line-height:1.4}
+</style></head><body>
+  <div class="row"><img src="../icons/icon128.png" alt=""/><span class="name">noticed <span class="m">Relationships</span></span></div>
+  <h1>Your <span class="a">LinkedIn</span> connections, in noticed.</h1>
+  <p>Import them privately, from your browser — refreshed monthly.</p>
+</body></html>
