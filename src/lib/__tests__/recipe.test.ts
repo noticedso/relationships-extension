@@ -49,6 +49,81 @@ describe("applyFieldMap", () => {
     const out = applyFieldMap(page, fieldMap as any);
     expect(out.map((c) => c.connectedOn)).toEqual([null, null]);
   });
+
+  it("pictureUrl is null for a field map without the picture paths (back-compat)", () => {
+    const page = { elements: [{ m: { publicIdentifier: "x" } }] };
+    const out = applyFieldMap(page, fieldMap as any);
+    expect(out[0].pictureUrl).toBeNull();
+  });
+});
+
+describe("applyFieldMap picture composition", () => {
+  const pictureFieldMap = {
+    elementsPath: "elements",
+    firstName: "m.firstName",
+    lastName: "m.lastName",
+    profileUrl: "m.publicIdentifier",
+    headline: "m.headline",
+    pictureRootUrl: "m.profilePicture.displayImageReference.vectorImage.rootUrl",
+    pictureArtifactsPath: "m.profilePicture.displayImageReference.vectorImage.artifacts",
+  };
+
+  it("composes the width-400 artifact onto the root url", () => {
+    const page = {
+      elements: [
+        {
+          m: {
+            publicIdentifier: "pic-1",
+            profilePicture: {
+              displayImageReference: {
+                vectorImage: {
+                  rootUrl: "https://media.example/dms/image/x/photo_",
+                  artifacts: [
+                    { width: 100, fileIdentifyingUrlPathSegment: "100" },
+                    { width: 400, fileIdentifyingUrlPathSegment: "400seg" },
+                    { width: 800, fileIdentifyingUrlPathSegment: "800" },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      ],
+    };
+    const out = applyFieldMap(page, pictureFieldMap as any);
+    expect(out[0].pictureUrl).toBe("https://media.example/dms/image/x/photo_400seg");
+  });
+
+  it("falls back to the largest artifact when 400 is absent", () => {
+    const page = {
+      elements: [
+        {
+          m: {
+            publicIdentifier: "pic-2",
+            profilePicture: {
+              displayImageReference: {
+                vectorImage: {
+                  rootUrl: "https://media.example/r_",
+                  artifacts: [
+                    { width: 100, fileIdentifyingUrlPathSegment: "100" },
+                    { width: 800, fileIdentifyingUrlPathSegment: "800seg" },
+                  ],
+                },
+              },
+            },
+          },
+        },
+      ],
+    };
+    const out = applyFieldMap(page, pictureFieldMap as any);
+    expect(out[0].pictureUrl).toBe("https://media.example/r_800seg");
+  });
+
+  it("pictureUrl is null when the connection has no profile picture", () => {
+    const page = { elements: [{ m: { publicIdentifier: "pic-3" } }] };
+    const out = applyFieldMap(page, pictureFieldMap as any);
+    expect(out[0].pictureUrl).toBeNull();
+  });
 });
 
 // Locks the live contract validated in C1 (2026-06-22) against a real logged-in
@@ -63,6 +138,8 @@ describe("live connections contract (C1)", () => {
     profileUrl: "connectedMemberResolutionResult.publicIdentifier",
     headline: "connectedMemberResolutionResult.headline",
     connectedOn: "createdAt",
+    pictureRootUrl: "connectedMemberResolutionResult.profilePicture.displayImageReference.vectorImage.rootUrl",
+    pictureArtifactsPath: "connectedMemberResolutionResult.profilePicture.displayImageReference.vectorImage.artifacts",
   };
 
   // Real element shape captured from the live endpoint (values anonymized).
@@ -76,6 +153,18 @@ describe("live connections contract (C1)", () => {
           headline: "Creative media and marketing specialist",
           publicIdentifier: "sample-person-296389207",
           entityUrn: "urn:li:fsd_profile:ACoAADxxxx",
+          profilePicture: {
+            displayImageReference: {
+              vectorImage: {
+                rootUrl: "https://media.example/dms/image/x/photo_",
+                artifacts: [
+                  { width: 100, fileIdentifyingUrlPathSegment: "100" },
+                  { width: 400, fileIdentifyingUrlPathSegment: "400seg" },
+                  { width: 800, fileIdentifyingUrlPathSegment: "800" },
+                ],
+              },
+            },
+          },
         },
         createdAt: 1781820040000,
         connectedMember: "urn:li:fsd_profile:ACoAADxxxx",
@@ -96,5 +185,7 @@ describe("live connections contract (C1)", () => {
     });
     // epoch-ms createdAt → YYYY-MM-DD
     expect(out[0].connectedOn).toBe("2026-06-18");
+    // vector image composed at width 400
+    expect(out[0].pictureUrl).toBe("https://media.example/dms/image/x/photo_400seg");
   });
 });

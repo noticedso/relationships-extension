@@ -4,6 +4,7 @@ export type ScanConnection = {
   lastName: string | null;
   headline: string | null;
   connectedOn: string | null;
+  pictureUrl: string | null;
 };
 
 export type FieldMap = {
@@ -13,6 +14,8 @@ export type FieldMap = {
   profileUrl: string;
   headline: string;
   connectedOn?: string;
+  pictureRootUrl?: string;
+  pictureArtifactsPath?: string;
 };
 
 export function getByPath(obj: unknown, path: string): unknown {
@@ -46,6 +49,32 @@ function toConnectedOn(value: unknown): string | null {
   return null;
 }
 
+function composePictureUrl(element: unknown, fieldMap: FieldMap): string | null {
+  if (!fieldMap.pictureRootUrl || !fieldMap.pictureArtifactsPath) return null;
+  const root = toStringOrNull(getByPath(element, fieldMap.pictureRootUrl));
+  const arts = getByPath(element, fieldMap.pictureArtifactsPath);
+  if (!root || !Array.isArray(arts) || arts.length === 0) return null;
+
+  let chosen: unknown = null;
+  let bestWidth = -Infinity;
+  for (const art of arts) {
+    const width = (art as Record<string, unknown>)?.width;
+    if (typeof width !== "number") continue;
+    if (width === 400) {
+      chosen = art;
+      break;
+    }
+    if (width > bestWidth) {
+      bestWidth = width;
+      chosen = art;
+    }
+  }
+  if (chosen === null) return null;
+
+  const seg = toStringOrNull(getByPath(chosen, "fileIdentifyingUrlPathSegment"));
+  return root && seg ? root + seg : null;
+}
+
 export function applyFieldMap(page: unknown, fieldMap: FieldMap): ScanConnection[] {
   const elements = getByPath(page, fieldMap.elementsPath);
   if (!Array.isArray(elements)) return [];
@@ -63,6 +92,7 @@ export function applyFieldMap(page: unknown, fieldMap: FieldMap): ScanConnection
       connectedOn: fieldMap.connectedOn
         ? toConnectedOn(getByPath(element, fieldMap.connectedOn))
         : null,
+      pictureUrl: composePictureUrl(element, fieldMap),
     });
   }
   return out;

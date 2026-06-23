@@ -14,6 +14,8 @@ export type ScanRecipe = {
     profileUrl: string;
     headline: string;
     connectedOn?: string;
+    pictureRootUrl?: string;
+    pictureArtifactsPath?: string;
   };
   /** Source values to hide from the sync history (recipe-driven, set at pair time). */
   excludeSources?: string[];
