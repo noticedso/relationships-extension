@@ -45,3 +45,19 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.zip }}
             SHA256SUMS.txt
+
+      # Auto-publish the new version to the Chrome Web Store. No-ops until the
+      # four repo secrets are set (see PUBLISHING.md). The store ITEM must already
+      # exist (created by the first manual upload) so CHROME_EXTENSION_ID is known.
+      - name: Publish to Chrome Web Store
+        if: ${{ env.CHROME_EXTENSION_ID != '' }}
+        uses: mnao305/chrome-extension-upload@v5.0.0
+        with:
+          file-path: ${{ steps.pkg.outputs.zip }}
+          extension-id: ${{ secrets.CHROME_EXTENSION_ID }}
+          client-id: ${{ secrets.CHROME_CLIENT_ID }}
+          client-secret: ${{ secrets.CHROME_CLIENT_SECRET }}
+          refresh-token: ${{ secrets.CHROME_REFRESH_TOKEN }}
+          publish: true
+        env:
+          CHROME_EXTENSION_ID: ${{ secrets.CHROME_EXTENSION_ID }}
