@@ -26,6 +26,7 @@ function buildDom() {
     <div id="next-scan"></div>
     <div id="last-scan"></div>
     <button id="scan-now"></button>
+    <span id="scan-spinner" hidden></span>
     <label id="test-mode-toggle" hidden><input type="checkbox" id="test-mode" /></label>
     <div id="needs"></div>
     <button id="signin-cta" hidden></button>
@@ -112,7 +113,7 @@ describe("popup", () => {
     expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
   });
 
-  it("requests the host permission on the scan click (user gesture) before scanning", async () => {
+  it("when the host permission is NOT granted: button says 'grant access' and clicking requests permission (does not scan)", async () => {
     const withOrigin = {
       ...status,
       recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
@@ -126,32 +127,78 @@ describe("popup", () => {
     };
 
     await init(document);
+    expect(document.getElementById("scan-now")!.textContent).toBe("grant access");
     sendMessage.mockClear();
     document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
     await new Promise((r) => setTimeout(r, 0));
     expect(request).toHaveBeenCalledWith({ origins: ["https://network.example.com/*"] });
-    expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
+    expect(sendMessage).not.toHaveBeenCalledWith({ type: "scanNow" });
   });
 
-  it("does not scan if the host permission is denied", async () => {
+  it("when the host permission IS granted: button says 'scan now' and clicking sends scanNow", async () => {
     const withOrigin = {
       ...status,
       recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
     };
     const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : withOrigin));
-    const request = vi.fn(async () => false);
+    const request = vi.fn(async () => true);
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
       tabs: { create: vi.fn() },
-      permissions: { request, contains: vi.fn(async () => false) },
+      permissions: { request, contains: vi.fn(async () => true) },
     };
 
     await init(document);
+    expect(document.getElementById("scan-now")!.textContent).toBe("scan now");
     sendMessage.mockClear();
     document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
     await new Promise((r) => setTimeout(r, 0));
-    expect(request).toHaveBeenCalled();
-    expect(sendMessage).not.toHaveBeenCalledWith({ type: "scanNow" });
+    expect(request).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
+  });
+
+  it("granted scan-now shows progress: button disabled + 'scanning…' synchronously on click", async () => {
+    const withOrigin = {
+      ...status,
+      recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
+    };
+    let resolveScan: () => void = () => {};
+    const sendMessage = vi.fn(async (m: { type: string }) => {
+      if (m.type === "getSyncHistory") return { runs: [] };
+      if (m.type === "scanNow") return new Promise<{ ok: true }>((r) => (resolveScan = () => r({ ok: true })));
+      return withOrigin;
+    });
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request: vi.fn(async () => true), contains: vi.fn(async () => true) },
+    };
+
+    await init(document);
+    const btn = document.getElementById("scan-now") as HTMLButtonElement;
+    btn.dispatchEvent(new Event("click"));
+    // The scanNow promise is still pending — assert the in-progress UI synchronously.
+    await new Promise((r) => setTimeout(r, 0));
+    const live = document.getElementById("scan-now") as HTMLButtonElement;
+    expect(live.disabled).toBe(true);
+    expect(live.textContent).toBe("scanning…");
+    expect(document.getElementById("scan-spinner")!.hidden).toBe(false);
+    resolveScan();
+  });
+
+  it("#1: shows 'what we fetch' + 'how it's kept private' even when disconnected", async () => {
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : { account: null, recipe: null, needs: null },
+    );
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+    await init(document);
+    expect(document.getElementById("what-we-fetch")!.hidden).toBe(false);
+    expect(document.getElementById("privacy")!.hidden).toBe(false);
+    // generic fallback label, never a platform name
+    expect(document.getElementById("what-we-fetch")!.textContent).toContain("professional network");
   });
 
   it("source names no platform", () => {

@@ -8,7 +8,7 @@
  * at runtime.
  */
 import { buildCsrfHeaders } from "./lib/cookies";
-import { applyFieldMap } from "./lib/recipe";
+import { applyFieldMap, getByPath } from "./lib/recipe";
 import type { ScanConnection } from "./lib/recipe";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe } from "./lib/storage";
@@ -103,14 +103,18 @@ export async function runScan(deps: RunScanDeps = {}): Promise<RunScanResult> {
 
   const jitter = deps.jitter ?? makeJitter(recipe);
 
-  const fetchPage = async (start: number): Promise<ScanConnection[]> => {
+  const fetchPage = async (
+    start: number,
+  ): Promise<{ items: ScanConnection[]; rawCount: number }> => {
     const res = await fetchImpl(buildPageUrl(recipe, start), {
       credentials: "include",
       headers,
     });
     if (!res.ok) throw new Error(`scan page fetch failed: ${res.status}`);
     const json = await res.json();
-    return applyFieldMap(json, recipe.fieldMap);
+    const rawElements = getByPath(json, recipe.fieldMap.elementsPath);
+    const rawCount = Array.isArray(rawElements) ? rawElements.length : 0;
+    return { items: applyFieldMap(json, recipe.fieldMap), rawCount };
   };
 
   // Imported lazily-free: scanConnections is pure I/O-injected pagination.

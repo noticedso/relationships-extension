@@ -173,37 +173,15 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
   // before the chrome mock is installed, or any non-extension context).
   if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
 
-  const button = root.querySelector<HTMLButtonElement>("#scan-now");
-  if (button && button.dataset.wired !== "1") {
-    button.dataset.wired = "1";
-    button.addEventListener("click", () => {
-      void (async () => {
-        // Request the host permission here — a popup click is a user gesture, so
-        // chrome.permissions.request works (it can't in the service worker). The
-        // permission persists, so the monthly background scan needs no gesture.
-        const { recipe } = await getStatus();
-        const origin = recipe?.targetOrigin;
-        if (origin) {
-          const granted = await chrome.permissions.request({
-            origins: [`${origin}/*`],
-          });
-          if (!granted) {
-            await init(root);
-            return;
-          }
-        }
-        await chrome.runtime.sendMessage({ type: "scanNow" });
-        await init(root);
-      })();
-    });
-  }
-
   const status = await getStatus();
 
   const connected = Boolean(status.recipe || status.account);
   const connectSection = root.querySelector<HTMLElement>("#connect");
   if (connectSection) connectSection.hidden = connected;
-  for (const sel of ["#account", "#what-we-fetch", "#privacy", "#syncs"]) {
+  // Note: #what-we-fetch + #privacy always show (pre- and post-connect) — they
+  // are informational and render() fills them every call with a generic label
+  // fallback when there's no recipe.
+  for (const sel of ["#account", "#syncs"]) {
     const el = root.querySelector<HTMLElement>(sel);
     if (el) el.hidden = !connected;
   }
@@ -214,6 +192,53 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
   render(root, status);
 
   if (!connected) return;
+
+  // Two explicit scan-now states, gated on whether the host permission is
+  // already granted. Requesting a host permission from a popup CLOSES the popup,
+  // so we never request-then-scan in one click: that scan would never run.
+  const origin = status.recipe?.targetOrigin;
+  const granted =
+    origin && chrome.permissions?.contains
+      ? await chrome.permissions.contains({ origins: [`${origin}/*`] })
+      : true; // no origin / no API → don't gate
+
+  const scanBtn = root.querySelector<HTMLButtonElement>("#scan-now");
+  if (scanBtn) {
+    // Re-wire each render by cloning to clear stale listeners.
+    const next = scanBtn.cloneNode(true) as HTMLButtonElement;
+    scanBtn.replaceWith(next);
+    const spinner = root.querySelector<HTMLElement>("#scan-spinner");
+    if (!granted && origin) {
+      next.textContent = "grant access";
+      next.addEventListener("click", () => {
+        void (async () => {
+          // A popup click is a user gesture, so chrome.permissions.request works
+          // (it can't in the service worker). Requesting may close the popup; on
+          // re-open the user lands in the "scan now" state. If it stays open and
+          // permission was granted, init() re-renders into the scan state.
+          await chrome.permissions.request({ origins: [`${origin}/*`] });
+          await init(root);
+        })();
+      });
+    } else {
+      next.textContent = "scan now";
+      next.addEventListener("click", () => {
+        void (async () => {
+          // Show progress: a real scan paces pagination over a minute+.
+          next.disabled = true;
+          next.textContent = "scanning…";
+          if (spinner) spinner.hidden = false;
+          try {
+            await chrome.runtime.sendMessage({ type: "scanNow" });
+            await init(root);
+          } finally {
+            next.disabled = false;
+            if (spinner) spinner.hidden = true;
+          }
+        })();
+      });
+    }
+  }
 
   const history = await getSyncHistory();
   const signin = root.querySelector<HTMLButtonElement>("#signin-cta");

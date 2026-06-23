@@ -4,7 +4,8 @@
  * with injected jittered delays and capped at `maxPages`.
  */
 export async function scanConnections<T>(opts: {
-  fetchPage: (start: number) => Promise<T[]>; // returns one page of items
+  // rawCount = raw elements on the page, before mapping/filtering
+  fetchPage: (start: number) => Promise<{ items: T[]; rawCount: number }>;
   pageSize: number; // expected full-page length
   maxPages: number; // hard cap on pages fetched
   sleep: (ms: number) => Promise<void>; // injected delay
@@ -14,9 +15,9 @@ export async function scanConnections<T>(opts: {
   const all: T[] = [];
   let start = 0;
   for (let page = 0; page < maxPages; page++) {
-    const items = await fetchPage(start);
+    const { items, rawCount } = await fetchPage(start);
     all.push(...items);
-    const lastPage = items.length < pageSize;
+    const lastPage = rawCount < pageSize;
     const capReached = page + 1 >= maxPages;
     if (lastPage || capReached) break;
     await sleep(jitter());

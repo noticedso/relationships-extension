@@ -33,6 +33,7 @@
         <p id="last-scan" class="status-sub"></p>
         <div class="actions">
           <button id="scan-now" type="button" class="btn-brand">scan now</button>
+          <span id="scan-spinner" class="spinner" hidden aria-hidden="true"></span>
           <!-- Dev-only affordance: hidden by default; revealed by popup.ts only in
                local-development builds (__DEV__). Never shown in the published extension. -->
           <label class="toggle" id="test-mode-toggle" hidden>
