@@ -27,6 +27,9 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           ZIP="noticed-relationships-${VERSION}.zip"
           (cd dist && zip -rqX "../${ZIP}" .)
+          # Stable-named copy so releases/latest/download/noticed-relationships.zip
+          # always resolves to the newest release (the in-app install link uses it).
+          cp "${ZIP}" noticed-relationships.zip
           HASH=$(node scripts/hash-artifact.mjs | tail -1)
           echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
           echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
@@ -44,6 +47,7 @@ jobs:
             The same `${{ steps.pkg.outputs.zip }}` is what's uploaded to the Chrome Web Store.
           files: |
             ${{ steps.pkg.outputs.zip }}
+            noticed-relationships.zip
             SHA256SUMS.txt
 
       # Auto-publish the new version to the Chrome Web Store. No-ops until the
