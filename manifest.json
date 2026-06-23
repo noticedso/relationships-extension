@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "noticed Relationships",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Import your own LinkedIn connections into noticed — privately, in your browser, as yourself.",
   "icons": {
     "16": "icons/icon16.png",
