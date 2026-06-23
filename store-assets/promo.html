@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      :root {
+        --background: oklch(0.985 0.002 90);
+        --card: oklch(1 0 0);
+        --border: oklch(0 0 0 / 0.12);
+        --muted: oklch(0 0 0 / 0.04);
+        --content-primary: oklch(0 0 0 / 0.85);
+        --content-secondary: oklch(0 0 0 / 0.7);
+        --content-tertiary: oklch(0 0 0 / 0.6);
+        --brand: oklch(0.92 0.13 125);
+        --brand-foreground: oklch(0.25 0.06 150);
+        --brand-text: oklch(0.45 0.09 145);
+        --radius: 6px;
+        --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      * { box-sizing: border-box; margin: 0; }
+      html, body { width: 1280px; height: 800px; }
+      body {
+        background:
+          radial-gradient(900px 500px at 78% 18%, oklch(0.92 0.13 125 / 0.10), transparent 60%),
+          var(--background);
+        font-family: var(--font-sans);
+        color: var(--content-primary);
+        -webkit-font-smoothing: antialiased;
+        display: grid;
+        grid-template-columns: 1fr 420px;
+        align-items: center;
+        gap: 40px;
+        padding: 0 88px;
+      }
+      .left { display: flex; flex-direction: column; gap: 22px; max-width: 560px; }
+      .brandrow { display: flex; align-items: center; gap: 12px; }
+      .brandrow img { width: 40px; height: 40px; border-radius: 9px; display: block; }
+      .brandname { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+      .brandname .muted { color: var(--content-tertiary); font-weight: 500; }
+      h1 { font-size: 46px; line-height: 1.08; letter-spacing: -0.025em; font-weight: 600; }
+      h1 .accent { background: var(--brand); color: var(--brand-foreground); padding: 0 10px; border-radius: 8px; }
+      .sub { font-size: 19px; line-height: 1.5; color: var(--content-secondary); }
+      ul { list-style: none; display: flex; flex-direction: column; gap: 12px; padding: 0; }
+      li { display: flex; align-items: center; gap: 10px; font-size: 16px; color: var(--content-secondary); }
+      .dot { width: 18px; height: 18px; border-radius: 999px; background: var(--brand); color: var(--brand-foreground);
+             display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex: 0 0 auto; }
+
+      /* the popup card */
+      .popwrap { display: flex; justify-content: center; }
+      .pop {
+        width: 360px; background: var(--card); border: 0.5px solid var(--border); border-radius: 14px;
+        box-shadow: 0 24px 60px oklch(0 0 0 / 0.12), 0 2px 8px oklch(0 0 0 / 0.05);
+        display: flex; flex-direction: column; gap: 12px; padding: 18px;
+      }
+      .pop-header { display: flex; align-items: center; gap: 8px; }
+      .pop-header img { width: 22px; height: 22px; border-radius: 6px; }
+      .pop-header .wm { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+      .pop-header .product { font-size: 13px; font-weight: 500; color: var(--content-secondary); }
+      .pcard { background: var(--card); border: 0.5px solid var(--border); border-radius: 5px; padding: 12px; }
+      .acct-name { font-size: 13px; font-weight: 600; }
+      .acct-email { font-size: 12px; color: var(--content-tertiary); }
+      .status-line { font-size: 13px; color: var(--content-secondary); }
+      .status-sub { font-size: 12px; color: var(--content-tertiary); margin-top: 2px; }
+      .actions { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+      .btn { background: var(--brand); color: var(--brand-foreground); font-size: 13px; font-weight: 600;
+             padding: 7px 14px; border-radius: 5px; border: none; }
+      .toggle { font-size: 11px; color: var(--content-tertiary); }
+      .blk-title { font-size: 12px; font-weight: 600; color: var(--content-secondary); }
+      .blk-body { font-size: 13px; color: var(--content-tertiary); margin-top: 4px; line-height: 1.45; }
+      .syncs { display: flex; flex-direction: column; }
+      .syncs h2 { font-size: 12px; font-weight: 600; color: var(--content-secondary); margin-bottom: 4px; }
+      .srow { font-size: 13px; color: var(--content-secondary); padding: 6px 0; border-top: 0.5px solid var(--border); }
+      .srow:first-of-type { border-top: none; }
+      .foot { display: flex; justify-content: center; gap: 8px; padding-top: 2px; font-size: 12px; }
+      .foot a { color: var(--brand-text); text-decoration: none; }
+      .foot .sep { color: var(--content-tertiary); }
+    </style>
+  </head>
+  <body>
+    <div class="left">
+      <div class="brandrow">
+        <img src="../icons/icon128.png" alt="" />
+        <span class="brandname">noticed <span class="muted">Relationships</span></span>
+      </div>
+      <h1>Your <span class="accent">LinkedIn</span> connections, in&nbsp;noticed.</h1>
+      <p class="sub">Import your own connections privately, right from your browser — and keep them fresh, automatically.</p>
+      <ul>
+        <li><span class="dot">✓</span> Only your own connection list — never your messages</li>
+        <li><span class="dot">✓</span> Goes only to your noticed account, encrypted</li>
+        <li><span class="dot">✓</span> Refreshes about once a month, on its own</li>
+        <li><span class="dot">✓</span> Open source &amp; reproducible — verify the code</li>
+      </ul>
+    </div>
+
+    <div class="popwrap">
+      <div class="pop">
+        <div class="pop-header">
+          <img src="../icons/icon48.png" alt="" />
+          <span class="wm">noticed</span>
+          <span class="product">Relationships</span>
+        </div>
+        <div class="pcard">
+          <div class="acct-name">Simão Nogueira</div>
+          <div class="acct-email">simao@noticed.so</div>
+        </div>
+        <div class="pcard">
+          <div class="status-line">next scan: 16 Jul 2026</div>
+          <div class="status-sub">412 connections synced — 16 Jun 2026</div>
+          <div class="actions">
+            <button class="btn">scan now</button>
+          </div>
+        </div>
+        <div>
+          <div class="blk-title">what we fetch</div>
+          <div class="blk-body">we read your LinkedIn connection list — name, headline, profile link, connection date — as you, paced like a human, about once a month.</div>
+        </div>
+        <div class="syncs">
+          <h2>recent syncs</h2>
+          <div class="srow">LinkedIn · 412 relationships · 16 Jun</div>
+          <div class="srow">LinkedIn · 388 relationships · 16 May</div>
+        </div>
+        <div class="foot"><a>noticed.so</a><span class="sep">·</span><a>view the code</a></div>
+      </div>
+    </div>
+  </body>
+</html>
