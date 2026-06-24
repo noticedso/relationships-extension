@@ -43,6 +43,7 @@ export interface ChromeMock {
   };
   alarms: {
     create: (name: string, alarmInfo?: unknown) => void;
+    clear: (name: string) => Promise<boolean>;
     onAlarm: FakeEvent<[{ name: string }]>;
   };
   cookies: {
@@ -53,7 +54,8 @@ export interface ChromeMock {
     contains: (permissions: unknown) => Promise<boolean>;
   };
   tabs: {
-    create: (createProperties: { url?: string }) => Promise<{ id: number; url?: string }>;
+    create: (createProperties: { url?: string; active?: boolean }) => Promise<{ id: number; url?: string }>;
+    remove: (tabId: number) => Promise<void>;
   };
 }
 
@@ -90,6 +92,9 @@ function createChromeMock(): ChromeMock {
     storage: { local },
     alarms: {
       create(_name: string, _alarmInfo?: unknown): void {},
+      async clear(_name: string): Promise<boolean> {
+        return true;
+      },
       onAlarm: createEvent(),
     },
     cookies: {
@@ -106,9 +111,10 @@ function createChromeMock(): ChromeMock {
       },
     },
     tabs: {
-      async create(createProperties: { url?: string }): Promise<{ id: number; url?: string }> {
+      async create(createProperties: { url?: string; active?: boolean }): Promise<{ id: number; url?: string }> {
         return { id: 1, url: createProperties.url };
       },
+      async remove(_tabId: number): Promise<void> {},
     },
   };
 }

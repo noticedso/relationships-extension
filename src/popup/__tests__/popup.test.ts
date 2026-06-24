@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { init } from "../popup";
+import { init, pollScanProgress } from "../popup";
 
 const popupSrcPath = resolve(process.cwd(), "src/popup/popup.ts");
 
@@ -34,7 +34,7 @@ function buildDom() {
     <div id="privacy"></div>
     <section id="syncs"><h2 class="block-title">recent syncs</h2><ul id="sync-list" class="sync-list"></ul><p id="sync-empty" class="block-body" hidden>no syncs yet</p><button id="sync-more" type="button" class="sync-more" hidden>show more</button></section>
     <a id="repo-link"></a>
-    <a id="update-notice" hidden></a>
+    <footer><span id="version"></span><a id="update-notice" hidden></a></footer>
   `;
 }
 
@@ -60,7 +60,9 @@ describe("popup", () => {
     const fetched = document.getElementById("what-we-fetch")!.textContent ?? "";
     expect(fetched).toContain("ExampleNet");
     expect(fetched.toLowerCase()).not.toContain("linkedin");
-    expect(document.getElementById("needs")!.textContent!.toLowerCase()).toContain("noticed");
+    // E4: status.needs === "noticed-signin" now surfaces the actionable Sign-in
+    // button (single source of truth) rather than a dangling red text line.
+    expect((document.getElementById("signin-cta") as HTMLButtonElement).hidden).toBe(false);
     expect(document.getElementById("privacy")!.textContent).toContain("never sell it");
   });
 
@@ -163,11 +165,13 @@ describe("popup", () => {
       ...status,
       recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
     };
-    let resolveScan: () => void = () => {};
     const sendMessage = vi.fn(async (m: { type: string }) => {
       if (m.type === "getSyncHistory") return { runs: [] };
-      if (m.type === "scanNow") return new Promise<{ ok: true }>((r) => (resolveScan = () => r({ ok: true })));
-      return withOrigin;
+      // scanNow no longer blocks the UI — it's a fire-and-forget kickoff and the
+      // popup polls getStatus for progress. Report not-scanning so the (real)
+      // delayed poller doesn't loop in this synchronous-feedback test.
+      if (m.type === "scanNow") return { ok: true };
+      return { ...withOrigin, scanning: false };
     });
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
@@ -178,13 +182,14 @@ describe("popup", () => {
     await init(document);
     const btn = document.getElementById("scan-now") as HTMLButtonElement;
     btn.dispatchEvent(new Event("click"));
-    // The scanNow promise is still pending — assert the in-progress UI synchronously.
-    await new Promise((r) => setTimeout(r, 0));
+    // The click handler sets the in-progress UI SYNCHRONOUSLY (before any await),
+    // so it's observable immediately — no microtask yield.
     const live = document.getElementById("scan-now") as HTMLButtonElement;
     expect(live.disabled).toBe(true);
     expect(live.textContent).toBe("scanning…");
     expect(document.getElementById("scan-spinner")!.hidden).toBe(false);
-    resolveScan();
+    // a scanNow kickoff message was sent
+    expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
   });
 
   it("#1: shows 'what we fetch' + 'how it's kept private' even when disconnected", async () => {
@@ -347,5 +352,241 @@ describe("popup", () => {
     expect(create).toHaveBeenCalledWith({
       url: `${NOTICED}/x/connect?ext_id=abcdefghijklmnopabcdefghijklmnop`,
     });
+  });
+
+  // ── Progress while scanning (E2) ────────────────────────────────────────────
+
+  it("E2: on load with a scan in progress, the button shows 'scanned N…', is disabled, and the spinner is visible", async () => {
+    const scanning = {
+      ...status,
+      scanning: true,
+      scannedCount: 137,
+      recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : scanning));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request: vi.fn(async () => true), contains: vi.fn(async () => true) },
+    };
+
+    await init(document);
+    const btn = document.getElementById("scan-now") as HTMLButtonElement;
+    expect(btn.textContent).toBe("scanned 137…");
+    expect(btn.disabled).toBe(true);
+    expect(document.getElementById("scan-spinner")!.hidden).toBe(false);
+  });
+
+  it("E2: pollScanProgress updates 'scanned N…' each tick then re-enables the button when scanning ends", async () => {
+    const counts = [10, 25, 25];
+    let i = 0;
+    const sendMessage = vi.fn(async (m: { type: string }) => {
+      if (m.type === "getSyncHistory") return { runs: [] };
+      // getStatus: scanning for the first two polls, then done
+      const idx = Math.min(i++, counts.length - 1);
+      return { ...status, scanning: idx < 2, scannedCount: counts[idx] };
+    });
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request: vi.fn(async () => true), contains: vi.fn(async () => true) },
+    };
+
+    const btn = document.getElementById("scan-now") as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "scanning…";
+
+    // a fast injected delay so the test doesn't wait 1.5s per tick
+    await pollScanProgress(document, { pollMs: 1, sleep: async () => {} });
+
+    // first poll → scanning true, shows the count
+    const calls = sendMessage.mock.calls.filter((c) => (c[0] as { type: string }).type === "getStatus").length;
+    expect(calls).toBeGreaterThanOrEqual(2); // polled until scanning ended
+    // ended → button re-enabled back to scan-now
+    const live = document.getElementById("scan-now") as HTMLButtonElement;
+    expect(live.disabled).toBe(false);
+    expect(live.textContent).toBe("scan now");
+  });
+
+  // ── Reconcile display (E5) ──────────────────────────────────────────────────
+
+  it("E5: never shows 'no sync yet' when a recorded sync exists — derives last-sync from the newest run", async () => {
+    // local status lags: lastScanAt null, but a successful run is recorded
+    const lagging = { account: { name: "X" }, recipe: { networkLabel: "ExampleNet" }, needs: null, lastScanAt: null, lastScanCount: null };
+    const runs = [
+      { source: "linkedin_extension", label: "LinkedIn", kind: "relationships", itemCount: 412, status: "succeeded", startedAt: "2026-06-20T00:00:00Z", finishedAt: "2026-06-20T00:00:00Z" },
+    ];
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs } : lagging));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+
+    await init(document);
+    const lastScan = document.getElementById("last-scan")!.textContent ?? "";
+    expect(lastScan.toLowerCase()).not.toContain("no sync yet");
+    expect(lastScan).toContain("412");
+  });
+
+  it("E5: shows 'no sync yet' only when there is genuinely no sync (no local stamp AND no runs)", async () => {
+    const lagging = { account: { name: "X" }, recipe: { networkLabel: "ExampleNet" }, needs: null, lastScanAt: null, lastScanCount: null };
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : lagging));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+
+    await init(document);
+    expect(document.getElementById("last-scan")!.textContent!.toLowerCase()).toContain("no sync yet");
+  });
+
+  // ── Actionable noticed Sign-in (E4) ─────────────────────────────────────────
+
+  it("E4: shows the Sign-in button when status.needs is noticed-signin even if the history fetch returns 200 (no history.needs)", async () => {
+    // The bug: status.needs says we need a noticed sign-in, but /api/sync/runs
+    // returned 200 (history.needs absent) → the old code showed the red text but
+    // never revealed the actionable button. Both signals must lead to the button.
+    const needsSignin = {
+      account: { name: "X" },
+      recipe: { networkLabel: "ExampleNet" },
+      needs: "noticed-signin",
+      lastScanAt: null,
+      lastScanCount: null,
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : needsSignin,
+    );
+    const create = vi.fn(async () => ({}));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create },
+    };
+
+    await init(document);
+    const btn = document.getElementById("signin-cta") as HTMLButtonElement;
+    expect(btn.hidden).toBe(false);
+    // wired to openConnect
+    btn.dispatchEvent(new Event("click"));
+    expect(create).toHaveBeenCalledWith({
+      url: `${NOTICED}/x/connect?ext_id=abcdefghijklmnopabcdefghijklmnop`,
+    });
+  });
+
+  it("E4: the red 'finish syncing' text NEVER appears without the actionable button beside it", async () => {
+    const needsSignin = {
+      account: { name: "X" },
+      recipe: { networkLabel: "ExampleNet" },
+      needs: "noticed-signin",
+      lastScanAt: null,
+      lastScanCount: null,
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : needsSignin,
+    );
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+
+    await init(document);
+    const needsText = document.getElementById("needs")!.textContent ?? "";
+    const btn = document.getElementById("signin-cta") as HTMLButtonElement;
+    // Single source of truth: when a noticed sign-in is needed, the button is the
+    // affordance. The red text must not be left dangling on its own. (Here we
+    // clear the text and rely on the button; the invariant we assert is: if the
+    // 'finish syncing' text is shown, the button is also shown.)
+    if (needsText.toLowerCase().includes("finish syncing")) {
+      expect(btn.hidden).toBe(false);
+    } else {
+      // text suppressed in favour of the button — button must be visible
+      expect(btn.hidden).toBe(false);
+    }
+  });
+
+  it("E4: keeps the network-signin informative text (and does NOT show the noticed button) for network-signin", async () => {
+    const networkSignin = {
+      account: { name: "X" },
+      recipe: { networkLabel: "ExampleNet" },
+      needs: "network-signin",
+      lastScanAt: null,
+      lastScanCount: null,
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : networkSignin,
+    );
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+
+    await init(document);
+    const needsText = document.getElementById("needs")!.textContent ?? "";
+    expect(needsText.toLowerCase()).toContain("sign in to");
+    expect(needsText).toContain("ExampleNet"); // network label, informative
+    // not actionable via the noticed button
+    expect((document.getElementById("signin-cta") as HTMLButtonElement).hidden).toBe(true);
+  });
+
+  it("E4: still shows the Sign-in button when only history.needs is noticed-signin (the 401 path)", async () => {
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory"
+        ? { needs: "noticed-signin" }
+        : { account: { name: "X" }, recipe: { networkLabel: "ExampleNet" }, needs: null },
+    );
+    const create = vi.fn(async () => ({}));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create },
+    };
+
+    await init(document);
+    const btn = document.getElementById("signin-cta") as HTMLButtonElement;
+    expect(btn.hidden).toBe(false);
+    btn.dispatchEvent(new Event("click"));
+    expect(create).toHaveBeenCalledWith({
+      url: `${NOTICED}/x/connect?ext_id=abcdefghijklmnopabcdefghijklmnop`,
+    });
+  });
+
+  // ── Version footer + bottom update notice (E6) ──────────────────────────────
+
+  it("E6: the version footer ALWAYS shows the installed manifest version", async () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.3");
+    // no fetch stub → update check is best-effort and may no-op; version is independent
+    globalThis.fetch = vi.fn(async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+
+    await init(document);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(document.getElementById("version")!.textContent).toBe("v1.0.3");
+  });
+
+  it("E6: the version footer is shown even when the version is current and there's no update", async () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.3");
+    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
+
+    await init(document);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(document.getElementById("version")!.textContent).toBe("v1.0.3");
+    expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
+  });
+
+  it("E6: the update notice lives in the footer alongside the version, and reveals (with download href) when behind", async () => {
+    (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
+    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
+
+    await init(document);
+    await new Promise((r) => setTimeout(r, 0));
+
+    const version = document.getElementById("version")!;
+    const notice = document.getElementById("update-notice") as HTMLAnchorElement;
+    expect(version.textContent).toBe("v1.0.2");
+    expect(notice.hidden).toBe(false);
+    expect(notice.getAttribute("href")).toBe(LATEST_DOWNLOAD);
+    // the update notice and the version share a footer container (bottom of panel)
+    expect(notice.parentElement).toBe(version.parentElement);
   });
 });

@@ -54,6 +54,21 @@ async function checkForUpdate(root: Document | HTMLElement): Promise<void> {
   }
 }
 
+// E6: a persistent version indicator at the bottom of the panel that ALWAYS shows
+// the installed version (e.g. "v1.0.3"), independent of the best-effort update check.
+// Source: the manifest version. Guarded so it no-ops in non-extension/test contexts
+// without a manifest. Never throws.
+function setVersion(root: Document | HTMLElement): void {
+  if (typeof chrome === "undefined" || !chrome.runtime?.getManifest) return;
+  const el = root.querySelector<HTMLElement>("#version");
+  if (!el) return;
+  try {
+    el.textContent = `v${chrome.runtime.getManifest().version}`;
+  } catch {
+    // best-effort — leave the indicator empty on any error
+  }
+}
+
 const NOTICED_ORIGIN = "https://www.noticed.so";
 function openConnect(): void {
   const url = `${NOTICED_ORIGIN}/x/connect?ext_id=${chrome.runtime.id}`;
@@ -64,6 +79,25 @@ function wireOnce(el: HTMLElement | null, fn: () => void): void {
   if (el && el.dataset.wired !== "1") {
     el.dataset.wired = "1";
     el.addEventListener("click", fn);
+  }
+}
+
+// E4: a single source of truth for "show the noticed Sign-in button". A noticed
+// sign-in can be signalled from EITHER getStatus (`status.needs`) OR getSyncHistory
+// (`history.needs`, the /api/sync/runs 401 path); historically only the latter
+// revealed the button, so a user could see the red "finish syncing" text with no
+// way to act on it. When needed, we reveal + wire the actionable button (openConnect)
+// and clear the dangling red text — the button is the affordance. When not needed,
+// we hide the button and leave any other (e.g. network-signin) text in place.
+function applyNoticedSigninState(root: Document | HTMLElement, needsNoticedSignin: boolean): void {
+  const signin = root.querySelector<HTMLButtonElement>("#signin-cta");
+  if (needsNoticedSignin) {
+    if (signin) signin.hidden = false;
+    wireOnce(signin, openConnect);
+    // The button replaces the standalone red text so it never dangles alone.
+    setText(root, "needs", "");
+  } else if (signin) {
+    signin.hidden = true;
   }
 }
 
@@ -83,6 +117,9 @@ type Status = {
   lastScanCount?: number | null;
   needs?: string | null;
   testMode?: boolean | null;
+  // Progress (E2): set by the SW while a checkpoint-and-resume scan is running.
+  scanning?: boolean | null;
+  scannedCount?: number | null;
 };
 
 function setText(root: Document | HTMLElement, id: string, text: string): void {
@@ -92,6 +129,20 @@ function setText(root: Document | HTMLElement, id: string, text: string): void {
 
 function formatDate(ms: number): string {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(new Date(ms));
+}
+
+// The "last sync" line: a count + date when we have one, else "no sync yet".
+function setLastScanLine(
+  root: Document | HTMLElement,
+  lastScanAt: number | null,
+  lastScanCount: number | null,
+): void {
+  if (lastScanAt != null) {
+    const count = lastScanCount ?? 0;
+    setText(root, "last-scan", `${count} connections synced — ${formatDate(lastScanAt)}`);
+  } else {
+    setText(root, "last-scan", "no sync yet");
+  }
 }
 
 type SyncRun = {
@@ -168,6 +219,22 @@ function renderSyncs(root: Document | HTMLElement, runs: SyncRun[]): void {
   });
 }
 
+// E5: the newest recorded run's timestamp + count, so the popup can show a
+// "synced" line even when local lastScanAt diverged (the syncConfirmed message
+// was lost because the SW died / the tab closed). Returns null if no run has a
+// usable timestamp.
+function newestRunLastSync(runs: SyncRun[]): { at: number; count: number } | null {
+  let best: { at: number; count: number } | null = null;
+  for (const r of runs) {
+    const stamp = r.finishedAt ?? r.startedAt;
+    if (!stamp) continue;
+    const at = new Date(stamp).getTime();
+    if (Number.isNaN(at)) continue;
+    if (!best || at > best.at) best = { at, count: typeof r.itemCount === "number" ? r.itemCount : 0 };
+  }
+  return best;
+}
+
 function render(root: Document | HTMLElement, status: Status): void {
   setText(root, "account-name", status.account?.name ?? "your noticed account");
   setText(root, "account-email", status.account?.email ?? "");
@@ -178,12 +245,7 @@ function render(root: Document | HTMLElement, status: Status): void {
     setText(root, "next-scan", "next scan: after your first sync");
   }
 
-  if (status.lastScanAt) {
-    const count = status.lastScanCount ?? 0;
-    setText(root, "last-scan", `${count} connections synced — ${formatDate(status.lastScanAt)}`);
-  } else {
-    setText(root, "last-scan", "no sync yet");
-  }
+  setLastScanLine(root, status.lastScanAt ?? null, status.lastScanCount ?? null);
 
   const label = status.recipe?.networkLabel ?? "professional network";
   setText(
@@ -202,12 +264,15 @@ function render(root: Document | HTMLElement, status: Status): void {
       "password and no noticed login — it hands data to your own signed-in noticed tab.",
   );
 
+  // The noticed-signin case is handled in init() via a single source of truth
+  // (applyNoticedSigninState) so the red "finish syncing" text never appears
+  // without the actionable #signin-cta button beside it (E4). Here we only render
+  // the network-signin case — a sign-in to the user's professional network, which
+  // is informative-only (not actionable via this button).
   if (status.needs === "network-signin") {
     const label2 = status.recipe?.networkLabel ?? "your professional network";
     setText(root, "needs", `sign in to ${label2} so we can read your connections.`);
-  } else if (status.needs === "noticed-signin") {
-    setText(root, "needs", "sign in to noticed to finish syncing.");
-  } else {
+  } else if (status.needs !== "noticed-signin") {
     setText(root, "needs", "");
   }
 
@@ -215,12 +280,47 @@ function render(root: Document | HTMLElement, status: Status): void {
   if (repo) repo.href = REPO_URL;
 }
 
+const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// E2: show live scan progress. A checkpoint-and-resume scan can run for a
+// minute+ (and outlive the popup), so while it's in progress we poll getStatus
+// and update the button to "scanned N…". When scanning ends we re-render via
+// init() so the freshly-cached sync + "scan now" affordance appear. The poll
+// delay + sleep are injectable so tests don't wait real seconds.
+export async function pollScanProgress(
+  root: Document | HTMLElement = document,
+  opts: { pollMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<void> {
+  const pollMs = opts.pollMs ?? 1500;
+  const sleep = opts.sleep ?? realSleep;
+  const btn = root.querySelector<HTMLButtonElement>("#scan-now");
+  const spinner = root.querySelector<HTMLElement>("#scan-spinner");
+  // Bound the loop so a wedged SW can't spin forever (≈ the per-session cap of
+  // pages × pacing, with generous headroom): 1.5s × 800 ≈ 20 min.
+  for (let i = 0; i < 800; i++) {
+    const s = await getStatus();
+    if (!s.scanning) {
+      // Done (or never started) → re-render the full popup with fresh state.
+      await init(root);
+      return;
+    }
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = `scanned ${s.scannedCount ?? 0}…`;
+    }
+    if (spinner) spinner.hidden = false;
+    await sleep(pollMs);
+  }
+}
+
 export async function init(root: Document | HTMLElement = document): Promise<void> {
   // Bail when the extension API isn't available (e.g. module imported under test
   // before the chrome mock is installed, or any non-extension context).
   if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
 
-  // Best-effort update check — don't block render, has its own try/catch.
+  // Footer (E6): always stamp the installed version; best-effort update check
+  // (own try/catch) reveals the bottom "update available" notice when behind.
+  setVersion(root);
   void checkForUpdate(root);
 
   const status = await getStatus();
@@ -270,36 +370,59 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
           await init(root);
         })();
       });
+    } else if (status.scanning) {
+      // A scan is already in flight (it may have outlived a previous popup —
+      // the checkpoint-and-resume scan survives the SW being torn down). Show
+      // live progress and poll until it finishes (E2).
+      next.disabled = true;
+      next.textContent = `scanned ${status.scannedCount ?? 0}…`;
+      if (spinner) spinner.hidden = false;
+      void pollScanProgress(root);
     } else {
+      // cloneNode copies the disabled flag from a mid-scan button — reset it so
+      // the idle "scan now" state is always clickable, and hide any leftover
+      // spinner from a finished poll.
+      next.disabled = false;
       next.textContent = "scan now";
+      if (spinner) spinner.hidden = true;
       next.addEventListener("click", () => {
         void (async () => {
-          // Show progress: a real scan paces pagination over a minute+.
+          // Show progress synchronously: a real scan paces pagination over a
+          // minute+ and can outlive this popup, so we kick it off and then poll
+          // getStatus for "scanned N…" updates rather than blocking on the
+          // scanNow response (E1/E2).
           next.disabled = true;
           next.textContent = "scanning…";
           if (spinner) spinner.hidden = false;
-          try {
-            await chrome.runtime.sendMessage({ type: "scanNow" });
-            await init(root);
-          } finally {
-            next.disabled = false;
-            if (spinner) spinner.hidden = true;
-          }
+          void chrome.runtime.sendMessage({ type: "scanNow" });
+          await pollScanProgress(root);
         })();
       });
     }
   }
 
   const history = await getSyncHistory();
-  const signin = root.querySelector<HTMLButtonElement>("#signin-cta");
+  // E4: unify the two disagreeing sign-in signals. A noticed sign-in is needed if
+  // EITHER getStatus or the history fetch says so — both now route through the same
+  // actionable button (the red "finish syncing" text never shows without it).
+  const needsNoticedSignin = status.needs === "noticed-signin" || history?.needs === "noticed-signin";
+  applyNoticedSigninState(root, needsNoticedSignin);
+
   if (history?.needs === "noticed-signin") {
-    if (signin) signin.hidden = false;
-    wireOnce(signin, openConnect);
-    setText(root, "needs", "");
+    // 401 from /api/sync/runs — we have no usable run history to show.
     renderSyncs(root, []);
   } else {
-    if (signin) signin.hidden = true;
-    renderSyncs(root, history?.runs ?? []);
+    const runs = history?.runs ?? [];
+    renderSyncs(root, runs);
+    // E5: the SW reconciles local state from these runs, but the status we
+    // already rendered may predate that. If a recorded sync is newer than the
+    // local stamp, reflect it here so the popup never shows "no sync yet" while
+    // a run is listed.
+    const fromRuns = newestRunLastSync(runs);
+    const localAt = status.lastScanAt ?? null;
+    if (fromRuns && (localAt == null || fromRuns.at > localAt)) {
+      setLastScanLine(root, fromRuns.at, fromRuns.count);
+    }
   }
 
   // Test mode is a development-only affordance — reveal + wire it only in dev builds.
