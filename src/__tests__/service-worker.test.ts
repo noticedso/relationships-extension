@@ -152,7 +152,13 @@ describe("service worker", () => {
     expect(pending[0]).toMatchObject({ profileUrl: "a", firstName: "A" });
     expect(stored.needs).toBe("noticed-signin");
 
-    expect(tabSpy).toHaveBeenCalledWith({ url: `https://app.noticed.so/x/sync?ext_id=${getChrome().runtime.id}` });
+    // E7: the handoff tab opens in the BACKGROUND (active: false) so it never
+    // steals focus, and its id is persisted so syncConfirmed can close it.
+    expect(tabSpy).toHaveBeenCalledWith({
+      url: `https://app.noticed.so/x/sync?ext_id=${getChrome().runtime.id}`,
+      active: false,
+    });
+    expect(stored.syncTabId).toBe(1);
   });
 
   it("7. test mode caps the scan to exactly 2 page-fetches even when maxPagesPerSession is large", async () => {
@@ -260,6 +266,56 @@ describe("service worker", () => {
     expect(stored.needs ?? null).toBeNull();
     expect(stored.lastScanAt).not.toBeNull();
     expect(stored.lastScanCount).toBe(1);
+  });
+
+  it("6b. syncConfirmed closes the background handoff tab and clears syncTabId (E7)", async () => {
+    const chrome = getChrome();
+    await pair();
+    const removeSpy = vi.spyOn(chrome.tabs, "remove");
+    await chrome.storage.local.set({ pendingScan: [{ profileUrl: "a" }], needs: "noticed-signin", syncTabId: 42 });
+
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+      string,
+      unknown
+    >;
+    expect(confirmed).toMatchObject({ ok: true });
+
+    // closed the background tab by its stored id, then cleared the id
+    expect(removeSpy).toHaveBeenCalledWith(42);
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.syncTabId ?? null).toBeNull();
+  });
+
+  it("6c. syncConfirmed with no syncTabId does NOT call tabs.remove (no stored handoff tab)", async () => {
+    const chrome = getChrome();
+    await pair();
+    const removeSpy = vi.spyOn(chrome.tabs, "remove");
+    await chrome.storage.local.set({ pendingScan: [{ profileUrl: "a" }], needs: "noticed-signin" });
+
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+      string,
+      unknown
+    >;
+    expect(confirmed).toMatchObject({ ok: true });
+    expect(removeSpy).not.toHaveBeenCalled();
+  });
+
+  it("6d. syncConfirmed still acks when the handoff tab is already gone (tabs.remove rejects)", async () => {
+    const chrome = getChrome();
+    await pair();
+    vi.spyOn(chrome.tabs, "remove").mockRejectedValue(new Error("No tab with id: 42"));
+    await chrome.storage.local.set({ pendingScan: [{ profileUrl: "a" }], needs: "noticed-signin", syncTabId: 42 });
+
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+      string,
+      unknown
+    >;
+    // a rejected remove must not break confirmation
+    expect(confirmed).toMatchObject({ ok: true });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScan ?? null).toBeNull();
+    expect(stored.lastScanCount).toBe(1);
+    expect(stored.syncTabId ?? null).toBeNull();
   });
 
   it("10. getSyncHistory fetches /api/sync/runs and filters out the excluded source", async () => {

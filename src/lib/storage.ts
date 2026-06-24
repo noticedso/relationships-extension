@@ -49,6 +49,11 @@ export type State = {
   scanItems?: ScanConnection[] | null;
   /** When the current scan began — drives the stale-zombie guard. */
   scanStartedAt?: number | null;
+  /**
+   * The id of the background handoff tab opened at finalize (the /x/sync page).
+   * Closed on syncConfirmed so the silent background tab doesn't linger.
+   */
+  syncTabId?: number | null;
 };
 
 const KEYS: (keyof State)[] = [
@@ -65,6 +70,7 @@ const KEYS: (keyof State)[] = [
   "scanCursor",
   "scanItems",
   "scanStartedAt",
+  "syncTabId",
 ];
 
 /** Typed read of the full stored state (any unset key is simply absent). */

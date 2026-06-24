@@ -250,7 +250,14 @@ async function finalizeScan(
     scanStartedAt: null,
   });
 
-  await chrome.tabs.create({ url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}` });
+  // E7 silent handoff: open the /x/sync page in a BACKGROUND tab (active: false)
+  // so it never steals focus on a monthly auto-scan, and persist its id so the
+  // syncConfirmed handler can close it once the POST + recipe refresh are done.
+  const tab = await chrome.tabs.create({
+    url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}`,
+    active: false,
+  });
+  await setState({ syncTabId: tab?.id ?? null });
   // lastScanAt is stamped on syncConfirmed, not here — the POST may not have happened yet.
   return { ok: true, count: connections.length };
 }
@@ -316,7 +323,7 @@ async function handleExternal(
       return;
     }
     case "syncConfirmed": {
-      const { pendingScan } = await getState();
+      const { pendingScan, syncTabId } = await getState();
       const count = pendingScan?.length ?? 0;
       await setState({
         pendingScan: null,
@@ -324,6 +331,13 @@ async function handleExternal(
         lastScanAt: Date.now(),
         lastScanCount: count,
       });
+      // E7: the handoff is done — close the silent background /x/sync tab. Guarded
+      // (only if we opened one) and best-effort (the tab may already be gone, e.g.
+      // the user closed it), then clear the stored id so a later scan starts clean.
+      if (syncTabId != null) {
+        await chrome.tabs.remove(syncTabId).catch(() => {});
+        await setState({ syncTabId: null });
+      }
       sendResponse({ ok: true });
       return;
     }
