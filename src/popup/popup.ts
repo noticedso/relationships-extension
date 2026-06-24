@@ -54,6 +54,21 @@ async function checkForUpdate(root: Document | HTMLElement): Promise<void> {
   }
 }
 
+// E6: a persistent version indicator at the bottom of the panel that ALWAYS shows
+// the installed version (e.g. "v1.0.3"), independent of the best-effort update check.
+// Source: the manifest version. Guarded so it no-ops in non-extension/test contexts
+// without a manifest. Never throws.
+function setVersion(root: Document | HTMLElement): void {
+  if (typeof chrome === "undefined" || !chrome.runtime?.getManifest) return;
+  const el = root.querySelector<HTMLElement>("#version");
+  if (!el) return;
+  try {
+    el.textContent = `v${chrome.runtime.getManifest().version}`;
+  } catch {
+    // best-effort — leave the indicator empty on any error
+  }
+}
+
 const NOTICED_ORIGIN = "https://www.noticed.so";
 function openConnect(): void {
   const url = `${NOTICED_ORIGIN}/x/connect?ext_id=${chrome.runtime.id}`;
@@ -64,6 +79,25 @@ function wireOnce(el: HTMLElement | null, fn: () => void): void {
   if (el && el.dataset.wired !== "1") {
     el.dataset.wired = "1";
     el.addEventListener("click", fn);
+  }
+}
+
+// E4: a single source of truth for "show the noticed Sign-in button". A noticed
+// sign-in can be signalled from EITHER getStatus (`status.needs`) OR getSyncHistory
+// (`history.needs`, the /api/sync/runs 401 path); historically only the latter
+// revealed the button, so a user could see the red "finish syncing" text with no
+// way to act on it. When needed, we reveal + wire the actionable button (openConnect)
+// and clear the dangling red text — the button is the affordance. When not needed,
+// we hide the button and leave any other (e.g. network-signin) text in place.
+function applyNoticedSigninState(root: Document | HTMLElement, needsNoticedSignin: boolean): void {
+  const signin = root.querySelector<HTMLButtonElement>("#signin-cta");
+  if (needsNoticedSignin) {
+    if (signin) signin.hidden = false;
+    wireOnce(signin, openConnect);
+    // The button replaces the standalone red text so it never dangles alone.
+    setText(root, "needs", "");
+  } else if (signin) {
+    signin.hidden = true;
   }
 }
 
@@ -230,12 +264,15 @@ function render(root: Document | HTMLElement, status: Status): void {
       "password and no noticed login — it hands data to your own signed-in noticed tab.",
   );
 
+  // The noticed-signin case is handled in init() via a single source of truth
+  // (applyNoticedSigninState) so the red "finish syncing" text never appears
+  // without the actionable #signin-cta button beside it (E4). Here we only render
+  // the network-signin case — a sign-in to the user's professional network, which
+  // is informative-only (not actionable via this button).
   if (status.needs === "network-signin") {
     const label2 = status.recipe?.networkLabel ?? "your professional network";
     setText(root, "needs", `sign in to ${label2} so we can read your connections.`);
-  } else if (status.needs === "noticed-signin") {
-    setText(root, "needs", "sign in to noticed to finish syncing.");
-  } else {
+  } else if (status.needs !== "noticed-signin") {
     setText(root, "needs", "");
   }
 
@@ -281,7 +318,9 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
   // before the chrome mock is installed, or any non-extension context).
   if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return;
 
-  // Best-effort update check — don't block render, has its own try/catch.
+  // Footer (E6): always stamp the installed version; best-effort update check
+  // (own try/catch) reveals the bottom "update available" notice when behind.
+  setVersion(root);
   void checkForUpdate(root);
 
   const status = await getStatus();
@@ -363,14 +402,16 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
   }
 
   const history = await getSyncHistory();
-  const signin = root.querySelector<HTMLButtonElement>("#signin-cta");
+  // E4: unify the two disagreeing sign-in signals. A noticed sign-in is needed if
+  // EITHER getStatus or the history fetch says so — both now route through the same
+  // actionable button (the red "finish syncing" text never shows without it).
+  const needsNoticedSignin = status.needs === "noticed-signin" || history?.needs === "noticed-signin";
+  applyNoticedSigninState(root, needsNoticedSignin);
+
   if (history?.needs === "noticed-signin") {
-    if (signin) signin.hidden = false;
-    wireOnce(signin, openConnect);
-    setText(root, "needs", "");
+    // 401 from /api/sync/runs — we have no usable run history to show.
     renderSyncs(root, []);
   } else {
-    if (signin) signin.hidden = true;
     const runs = history?.runs ?? [];
     renderSyncs(root, runs);
     // E5: the SW reconciles local state from these runs, but the status we

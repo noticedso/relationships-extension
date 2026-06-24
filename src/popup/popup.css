@@ -182,19 +182,26 @@ body {
   margin: 0;
 }
 
-/* update-available notice */
+/* version footer (E6): a persistent, unobtrusive bottom row — the installed
+   version on the left, the "update available" link (when behind) on the right. */
+.version-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 2px;
+}
+.version {
+  font-size: var(--text-micro);
+  color: var(--content-tertiary);
+}
+/* update-available notice — inline within the version footer */
 .update-notice {
-  display: block;
   font-size: var(--text-micro);
   color: var(--brand-text);
-  background: var(--muted);
-  border: 0.5px solid var(--border);
-  border-radius: calc(var(--radius) * 0.8);
-  padding: 7px 12px;
   text-decoration: none;
 }
 .update-notice:hover {
-  filter: brightness(0.98);
   text-decoration: underline;
 }
 
