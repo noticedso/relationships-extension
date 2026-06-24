@@ -40,6 +40,15 @@ export type State = {
   lastScanStartedAt: number | null;
   needs: Needs;
   testMode?: boolean;
+  // ── Checkpoint-and-resume scan state (MV3 resilience) ─────────────────────
+  /** A scan is mid-flight (set at scanNow, cleared on finalize/abort). */
+  scanInProgress?: boolean;
+  /** The `start` cursor of the next page to fetch (resume point). */
+  scanCursor?: number | null;
+  /** Connections accumulated so far across checkpointed pages. */
+  scanItems?: ScanConnection[] | null;
+  /** When the current scan began — drives the stale-zombie guard. */
+  scanStartedAt?: number | null;
 };
 
 const KEYS: (keyof State)[] = [
@@ -52,6 +61,10 @@ const KEYS: (keyof State)[] = [
   "lastScanStartedAt",
   "needs",
   "testMode",
+  "scanInProgress",
+  "scanCursor",
+  "scanItems",
+  "scanStartedAt",
 ];
 
 /** Typed read of the full stored state (any unset key is simply absent). */

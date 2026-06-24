@@ -43,6 +43,7 @@ export interface ChromeMock {
   };
   alarms: {
     create: (name: string, alarmInfo?: unknown) => void;
+    clear: (name: string) => Promise<boolean>;
     onAlarm: FakeEvent<[{ name: string }]>;
   };
   cookies: {
@@ -90,6 +91,9 @@ function createChromeMock(): ChromeMock {
     storage: { local },
     alarms: {
       create(_name: string, _alarmInfo?: unknown): void {},
+      async clear(_name: string): Promise<boolean> {
+        return true;
+      },
       onAlarm: createEvent(),
     },
     cookies: {

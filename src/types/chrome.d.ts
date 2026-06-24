@@ -26,6 +26,7 @@ declare const chrome: {
   };
   alarms: {
     create(name: string, alarmInfo?: { periodInMinutes?: number; delayInMinutes?: number }): void;
+    clear(name: string): Promise<boolean>;
     onAlarm: ChromeEvent<[{ name: string }]>;
   };
   cookies: {

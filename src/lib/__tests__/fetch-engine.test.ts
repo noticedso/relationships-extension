@@ -48,4 +48,72 @@ describe("scanConnections", () => {
     expect(fetchPage).toHaveBeenCalledTimes(3);
     expect(out.length).toBe(45);
   });
+
+  // ── Checkpoint + resume (E1/E3) ────────────────────────────────────────────
+
+  it("invokes onPage after EACH page with the accumulated items and the next cursor", async () => {
+    const pages = [
+      { items: [{ id: "a" }, { id: "b" }], rawCount: 2 },
+      { items: [{ id: "c" }, { id: "d" }], rawCount: 2 },
+      { items: [{ id: "e" }], rawCount: 1 }, // short raw page → stop
+    ];
+    let i = 0;
+    const fetchPage = vi.fn().mockImplementation(async () => pages[i++] ?? { items: [], rawCount: 0 });
+    const onPage = vi.fn();
+    const out = await scanConnections<{ id: string }>({
+      fetchPage,
+      pageSize: 2,
+      maxPages: 60,
+      sleep: async () => {},
+      jitter: () => 0,
+      onPage,
+    });
+    expect(out.map((c) => c.id)).toEqual(["a", "b", "c", "d", "e"]);
+    // a checkpoint after every page (3 pages), each carrying the running total
+    // and the cursor for the NEXT page-fetch
+    expect(onPage).toHaveBeenCalledTimes(3);
+    expect(onPage).toHaveBeenNthCalledWith(1, [{ id: "a" }, { id: "b" }], 2);
+    expect(onPage).toHaveBeenNthCalledWith(2, [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }], 4);
+    expect(onPage).toHaveBeenNthCalledWith(3, [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }, { id: "e" }], 6);
+  });
+
+  it("resumes from startAt + an initial accumulator without re-fetching earlier pages", async () => {
+    // We already fetched start=0 and start=40 (80 items) before the worker died.
+    // Resume must continue at start=80 and prepend the recovered items.
+    const recovered = Array(80).fill(0).map((_, n) => ({ n }));
+    const pages = [
+      { items: [{ n: 80 }, { n: 81 }], rawCount: 40 }, // start=80 (still full → keep going)
+      { items: [{ n: 82 }], rawCount: 1 }, // short → stop
+    ];
+    let i = 0;
+    const fetchPage = vi.fn().mockImplementation(async () => pages[i++] ?? { items: [], rawCount: 0 });
+    const out = await scanConnections<{ n: number }>({
+      fetchPage,
+      pageSize: 40,
+      maxPages: 60,
+      sleep: async () => {},
+      jitter: () => 0,
+      startAt: 80,
+      initialItems: recovered,
+    });
+    // first resumed fetch hits start=80, not 0
+    expect(fetchPage).toHaveBeenNthCalledWith(1, 80);
+    expect(fetchPage).toHaveBeenNthCalledWith(2, 120);
+    // no lost/duplicated items: 80 recovered + 3 new
+    expect(out.length).toBe(83);
+    expect(out[0]).toEqual({ n: 0 });
+    expect(out[80]).toEqual({ n: 80 });
+    expect(out[82]).toEqual({ n: 82 });
+  });
+
+  it("checkpoints the cap-reached page too, so a resume sees the full accumulator", async () => {
+    const fetchPage = vi.fn().mockResolvedValue({ items: [{ x: 1 }, { x: 1 }], rawCount: 40 });
+    const onPage = vi.fn();
+    await scanConnections({ fetchPage, pageSize: 40, maxPages: 2, sleep: async () => {}, jitter: () => 0, onPage });
+    expect(fetchPage).toHaveBeenCalledTimes(2);
+    // both pages checkpointed (including the last/cap-reached one)
+    expect(onPage).toHaveBeenCalledTimes(2);
+    // last checkpoint carries all 4 items
+    expect(onPage.mock.calls[1][0].length).toBe(4);
+  });
 });

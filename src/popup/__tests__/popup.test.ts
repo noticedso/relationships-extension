@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { init } from "../popup";
+import { init, pollScanProgress } from "../popup";
 
 const popupSrcPath = resolve(process.cwd(), "src/popup/popup.ts");
 
@@ -163,11 +163,13 @@ describe("popup", () => {
       ...status,
       recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
     };
-    let resolveScan: () => void = () => {};
     const sendMessage = vi.fn(async (m: { type: string }) => {
       if (m.type === "getSyncHistory") return { runs: [] };
-      if (m.type === "scanNow") return new Promise<{ ok: true }>((r) => (resolveScan = () => r({ ok: true })));
-      return withOrigin;
+      // scanNow no longer blocks the UI — it's a fire-and-forget kickoff and the
+      // popup polls getStatus for progress. Report not-scanning so the (real)
+      // delayed poller doesn't loop in this synchronous-feedback test.
+      if (m.type === "scanNow") return { ok: true };
+      return { ...withOrigin, scanning: false };
     });
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
@@ -178,13 +180,14 @@ describe("popup", () => {
     await init(document);
     const btn = document.getElementById("scan-now") as HTMLButtonElement;
     btn.dispatchEvent(new Event("click"));
-    // The scanNow promise is still pending — assert the in-progress UI synchronously.
-    await new Promise((r) => setTimeout(r, 0));
+    // The click handler sets the in-progress UI SYNCHRONOUSLY (before any await),
+    // so it's observable immediately — no microtask yield.
     const live = document.getElementById("scan-now") as HTMLButtonElement;
     expect(live.disabled).toBe(true);
     expect(live.textContent).toBe("scanning…");
     expect(document.getElementById("scan-spinner")!.hidden).toBe(false);
-    resolveScan();
+    // a scanNow kickoff message was sent
+    expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
   });
 
   it("#1: shows 'what we fetch' + 'how it's kept private' even when disconnected", async () => {
@@ -347,5 +350,91 @@ describe("popup", () => {
     expect(create).toHaveBeenCalledWith({
       url: `${NOTICED}/x/connect?ext_id=abcdefghijklmnopabcdefghijklmnop`,
     });
+  });
+
+  // ── Progress while scanning (E2) ────────────────────────────────────────────
+
+  it("E2: on load with a scan in progress, the button shows 'scanned N…', is disabled, and the spinner is visible", async () => {
+    const scanning = {
+      ...status,
+      scanning: true,
+      scannedCount: 137,
+      recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : scanning));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request: vi.fn(async () => true), contains: vi.fn(async () => true) },
+    };
+
+    await init(document);
+    const btn = document.getElementById("scan-now") as HTMLButtonElement;
+    expect(btn.textContent).toBe("scanned 137…");
+    expect(btn.disabled).toBe(true);
+    expect(document.getElementById("scan-spinner")!.hidden).toBe(false);
+  });
+
+  it("E2: pollScanProgress updates 'scanned N…' each tick then re-enables the button when scanning ends", async () => {
+    const counts = [10, 25, 25];
+    let i = 0;
+    const sendMessage = vi.fn(async (m: { type: string }) => {
+      if (m.type === "getSyncHistory") return { runs: [] };
+      // getStatus: scanning for the first two polls, then done
+      const idx = Math.min(i++, counts.length - 1);
+      return { ...status, scanning: idx < 2, scannedCount: counts[idx] };
+    });
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request: vi.fn(async () => true), contains: vi.fn(async () => true) },
+    };
+
+    const btn = document.getElementById("scan-now") as HTMLButtonElement;
+    btn.disabled = true;
+    btn.textContent = "scanning…";
+
+    // a fast injected delay so the test doesn't wait 1.5s per tick
+    await pollScanProgress(document, { pollMs: 1, sleep: async () => {} });
+
+    // first poll → scanning true, shows the count
+    const calls = sendMessage.mock.calls.filter((c) => (c[0] as { type: string }).type === "getStatus").length;
+    expect(calls).toBeGreaterThanOrEqual(2); // polled until scanning ended
+    // ended → button re-enabled back to scan-now
+    const live = document.getElementById("scan-now") as HTMLButtonElement;
+    expect(live.disabled).toBe(false);
+    expect(live.textContent).toBe("scan now");
+  });
+
+  // ── Reconcile display (E5) ──────────────────────────────────────────────────
+
+  it("E5: never shows 'no sync yet' when a recorded sync exists — derives last-sync from the newest run", async () => {
+    // local status lags: lastScanAt null, but a successful run is recorded
+    const lagging = { account: { name: "X" }, recipe: { networkLabel: "ExampleNet" }, needs: null, lastScanAt: null, lastScanCount: null };
+    const runs = [
+      { source: "linkedin_extension", label: "LinkedIn", kind: "relationships", itemCount: 412, status: "succeeded", startedAt: "2026-06-20T00:00:00Z", finishedAt: "2026-06-20T00:00:00Z" },
+    ];
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs } : lagging));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+
+    await init(document);
+    const lastScan = document.getElementById("last-scan")!.textContent ?? "";
+    expect(lastScan.toLowerCase()).not.toContain("no sync yet");
+    expect(lastScan).toContain("412");
+  });
+
+  it("E5: shows 'no sync yet' only when there is genuinely no sync (no local stamp AND no runs)", async () => {
+    const lagging = { account: { name: "X" }, recipe: { networkLabel: "ExampleNet" }, needs: null, lastScanAt: null, lastScanCount: null };
+    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : lagging));
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+    };
+
+    await init(document);
+    expect(document.getElementById("last-scan")!.textContent!.toLowerCase()).toContain("no sync yet");
   });
 });
