@@ -7,6 +7,8 @@ type CookiesApi = {
 export type CsrfRecipe = {
   targetOrigin: string;
   csrfRule: { header: string; cookie: string };
+  /** Extra static headers merged onto every request (e.g. X's public bearer). */
+  staticHeaders?: Record<string, string>;
 };
 
 function stripWrappingQuotes(value: string): string {
@@ -29,5 +31,8 @@ export async function buildCsrfHeaders(
     return null;
   }
 
-  return { [recipe.csrfRule.header]: stripWrappingQuotes(cookie.value) };
+  return {
+    ...recipe.staticHeaders,
+    [recipe.csrfRule.header]: stripWrappingQuotes(cookie.value),
+  };
 }

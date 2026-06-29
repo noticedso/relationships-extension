@@ -5,6 +5,8 @@ export type ScanConnection = {
   headline: string | null;
   connectedOn: string | null;
   pictureUrl: string | null;
+  /** A stable external id (X rest_id) when profileUrl is a handle. Null elsewhere. */
+  externalId?: string | null;
 };
 
 export type FieldMap = {
@@ -16,6 +18,7 @@ export type FieldMap = {
   connectedOn?: string;
   pictureRootUrl?: string;
   pictureArtifactsPath?: string;
+  externalId?: string;
 };
 
 export function getByPath(obj: unknown, path: string): unknown {
@@ -178,6 +181,9 @@ export function applyFieldMap(page: unknown, fieldMap: FieldMap): ScanConnection
         ? toConnectedOn(getByPath(element, fieldMap.connectedOn))
         : null,
       pictureUrl: composePictureUrl(element, fieldMap),
+      externalId: fieldMap.externalId
+        ? toStringOrNull(getByPath(element, fieldMap.externalId))
+        : null,
     });
   }
   return out;

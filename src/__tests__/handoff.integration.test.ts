@@ -7,6 +7,8 @@ function getChrome(): ChromeMock {
 }
 
 const recipe = {
+  source: "linkedin_extension",
+  ingestPath: "/api/linkedin/import/extension",
   targetOrigin: "https://network.example.com",
   listPathTemplate: "/api/connections?start={start}&count={count}",
   paginationParams: { pageSize: 2 },
@@ -21,6 +23,18 @@ const recipe = {
     connectedOn: "createdAt",
   },
 };
+
+// The handoff payload's connections live at pendingScans[source].payload.connections;
+// getCachedScan returns { ingestPath, payload }.
+function pendingConns(stored: Record<string, unknown>): Array<Record<string, unknown>> {
+  const ps = stored.pendingScans as
+    | Record<string, { payload?: { connections?: Array<Record<string, unknown>> } }>
+    | undefined;
+  return ps?.linkedin_extension?.payload?.connections ?? [];
+}
+function cachedConns(cached: Record<string, unknown>): Array<Record<string, unknown>> {
+  return (cached.payload as { connections?: Array<Record<string, unknown>> })?.connections ?? [];
+}
 
 const account = { id: "acct-1", displayName: "Test User" };
 
@@ -68,7 +82,7 @@ function makeFakeFetch() {
 async function runFullScan() {
   const chrome = getChrome();
   vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
-  return sw.runScan({
+  return sw.runScan(undefined, {
     fetchImpl: makeFakeFetch() as unknown as typeof fetch,
     sleep: async () => {},
     jitter: () => 0,
@@ -92,36 +106,33 @@ describe("SW ↔ /x/sync handoff integration", () => {
     expect(res.count).toBe(2);
 
     let stored = await chrome.storage.local.get(null);
-    expect((stored.pendingScan as unknown[]).length).toBe(2);
+    expect(pendingConns(stored).length).toBe(2);
     expect(stored.needs).toBe("noticed-signin");
 
     // 3. /x/sync page pulls the cached scan
-    const cached = (await dispatchExternal({ type: "getCachedScan" }, noticedSender)) as Record<
+    const cached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
-    expect((cached.connections as unknown[]).length).toBe(2);
-    expect((cached.connections as Array<Record<string, unknown>>)[0]).toMatchObject({
-      profileUrl: "a",
-      firstName: "A",
-    });
+    expect(cachedConns(cached).length).toBe(2);
+    expect(cachedConns(cached)[0]).toMatchObject({ profileUrl: "a", firstName: "A" });
 
     // 4. /x/sync confirms
-    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
     expect(confirmed).toMatchObject({ ok: true });
 
-    // pendingScan cleared via getCachedScan
-    const afterCached = (await dispatchExternal({ type: "getCachedScan" }, noticedSender)) as Record<
+    // pending cleared via getCachedScan
+    const afterCached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
-    expect(afterCached.connections ?? null).toBeNull();
+    expect(cachedConns(afterCached).length).toBe(0);
 
     stored = await chrome.storage.local.get(null);
-    expect(stored.pendingScan ?? null).toBeNull();
+    expect((stored.pendingScans as Record<string, unknown>).linkedin_extension ?? null).toBeNull();
     expect(stored.needs ?? null).toBeNull();
     expect(typeof stored.lastScanAt).toBe("number");
     expect(stored.lastScanAt as number).toBeGreaterThan(0);
@@ -137,22 +148,22 @@ describe("SW ↔ /x/sync handoff integration", () => {
     expect(res.ok).toBe(true);
 
     let stored = await chrome.storage.local.get(null);
-    expect((stored.pendingScan as unknown[]).length).toBe(2);
+    expect(pendingConns(stored).length).toBe(2);
     expect(stored.needs).toBe("noticed-signin");
 
     // 2. do NOT dispatch syncConfirmed (user not signed into noticed)
 
-    // 3. pendingScan still present, getStatus reports noticed-signin
-    const cached = (await dispatchExternal({ type: "getCachedScan" }, noticedSender)) as Record<
+    // 3. pending still present, getStatus reports noticed-signin
+    const cached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
-    expect((cached.connections as unknown[]).length).toBe(2);
+    expect(cachedConns(cached).length).toBe(2);
 
     const status = (await dispatchInternal({ type: "getStatus" })) as Record<string, unknown>;
     expect(status.needs).toBe("noticed-signin");
 
     stored = await chrome.storage.local.get(null);
-    expect((stored.pendingScan as unknown[]).length).toBe(2);
+    expect(pendingConns(stored).length).toBe(2);
   });
 });
