@@ -16,8 +16,9 @@
  * alarm re-drives the stepper, and on SW startup an interrupted scan auto-resumes.
  */
 import { buildCsrfHeaders } from "./lib/cookies";
-import { applyFieldMap, applyMessageFieldMap, getByPath } from "./lib/recipe";
+import { applyFieldMap, getByPath } from "./lib/recipe";
 import type { ScanConnection, ScanMessage } from "./lib/recipe";
+import { extractMessages } from "./lib/message-extract";
 import { planPhases, assembleScanPayload, type Phase } from "./lib/scan-plan";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
@@ -133,12 +134,31 @@ function defaultStart(phase: Phase): number | string {
   return phase.kind === "connections" && phase.cursorPath ? "-1" : 0;
 }
 
-function substituteCursor(template: string, recipe: ScanRecipe, cursor: number | string): string {
+function substituteCursor(
+  template: string,
+  recipe: ScanRecipe,
+  cursor: number | string,
+  selfId = "",
+): string {
   return recipe.targetOrigin +
     template
       .replaceAll("{start}", String(cursor))
       .replaceAll("{cursor}", String(cursor))
-      .replaceAll("{count}", String(recipe.paginationParams.pageSize));
+      .replaceAll("{count}", String(recipe.paginationParams.pageSize))
+      .replaceAll("{self}", selfId);
+}
+
+/** Raw item count on a messages page (for short-page detection) — the entries
+ *  array (dmEntries) or the conversation list (else), array or keyed object. */
+function countMessageRaw(json: unknown, fieldMap: NonNullable<ScanRecipe["messages"]>["messageFieldMap"]): number {
+  const path =
+    "mode" in fieldMap && fieldMap.mode === "dmEntries"
+      ? fieldMap.entriesPath
+      : (fieldMap as { elementsPath: string }).elementsPath;
+  const raw = getByPath(json, path);
+  if (Array.isArray(raw)) return raw.length;
+  if (raw && typeof raw === "object") return Object.keys(raw).length;
+  return 0;
 }
 
 let scanRunning = false;
@@ -154,21 +174,45 @@ function isScanStale(startedAt: number | null | undefined, now: number): boolean
   return now - startedAt > SCAN_STALE_CUTOFF_MS;
 }
 
-/** Resolve the owner's own id for the messages pass (for direction). */
+/**
+ * Resolve the owner's own id for the messages pass (for direction). From a
+ * cookie (X `twid` → `u=<id>`) or a pre-fetch (LinkedIn `/voyager/api/me`,
+ * `extract`-trimmed to the bare id). Returns "" when neither is configured (the
+ * `selfIdPath` case is resolved lazily from the first page).
+ */
 async function resolveSelfId(
   recipe: ScanRecipe,
   headers: Record<string, string>,
   fetchImpl: typeof fetch,
 ): Promise<string> {
   const m = recipe.messages;
-  if (!m?.selfIdSource) return ""; // selfIdPath case is resolved lazily from the page
-  const res = await fetchImpl(recipe.targetOrigin + m.selfIdSource.listPathTemplate, {
-    credentials: "include",
-    headers,
-  });
-  if (!res.ok) return "";
-  const json = await res.json();
-  return String(getByPath(json, m.selfIdSource.idPath) ?? "");
+  if (!m) return "";
+  if (m.selfIdCookie) {
+    try {
+      const c = await chrome.cookies.get({ url: recipe.targetOrigin, name: m.selfIdCookie.name });
+      const val = c?.value ? decodeURIComponent(c.value) : "";
+      const match = val.match(new RegExp(m.selfIdCookie.pattern));
+      if (match && match[1]) return match[1];
+    } catch {
+      // ignore — fall through
+    }
+  }
+  if (m.selfIdSource) {
+    const res = await fetchImpl(recipe.targetOrigin + m.selfIdSource.listPathTemplate, {
+      credentials: "include",
+      headers,
+    });
+    if (res.ok) {
+      const json = await res.json();
+      let v = String(getByPath(json, m.selfIdSource.idPath) ?? "");
+      if (m.selfIdSource.extract) {
+        const match = v.match(new RegExp(m.selfIdSource.extract));
+        if (match && match[1]) v = match[1];
+      }
+      return v;
+    }
+  }
+  return "";
 }
 
 /**
@@ -223,19 +267,20 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
       if (phase.kind === "messages") {
         const m = recipe.messages!;
-        if (!selfId && m.selfIdSource) selfId = await resolveSelfId(recipe, headers, fetchImpl);
+        // Resolve the owner id once (cookie or pre-fetch) so direction works AND
+        // {self} can be interpolated into the URL (LinkedIn mailboxUrn).
+        if (!selfId) selfId = await resolveSelfId(recipe, headers, fetchImpl);
         const items = await scanConnections<ScanMessage>({
           fetchPage: async (cursor) => {
-            const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor), {
+            const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor, selfId), {
               credentials: "include",
               headers,
             });
             if (!res.ok) throw new Error(`messages page fetch failed: ${res.status}`);
             const json = await res.json();
             if (!selfId && m.selfIdPath) selfId = String(getByPath(json, m.selfIdPath) ?? "");
-            const items = applyMessageFieldMap(json, m.messageFieldMap, selfId, m.excludeUnreplied ?? false);
-            const raw = getByPath(json, m.messageFieldMap.elementsPath);
-            const rawCount = Array.isArray(raw) ? raw.length : 0;
+            const items = extractMessages(json, m.messageFieldMap, selfId, m.excludeUnreplied ?? false);
+            const rawCount = countMessageRaw(json, m.messageFieldMap);
             const nextCursor = m.cursorPath ? normalizeCursor(getByPath(json, m.cursorPath)) : undefined;
             return { items, rawCount, nextCursor };
           },

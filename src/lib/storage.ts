@@ -1,16 +1,20 @@
-import type { ScanConnection, ScanMessage, MessageFieldMap } from "./recipe";
+import type { ScanConnection, ScanMessage } from "./recipe";
+import type { AnyMessageFieldMap } from "./message-extract";
 
 /** A "messages" pass appended after the connection pass(es). Metadata only. */
 export type MessagesTarget = {
+  /** Supports `{self}` (owner id) + `{cursor}`/`{start}`/`{count}`. */
   listPathTemplate: string;
   pageSize: number;
   /** Path to the next-page cursor token. Absent → numeric offset pagination. */
   cursorPath?: string;
-  /** Pre-fetch to learn the owner's own id (for direction). */
-  selfIdSource?: { listPathTemplate: string; idPath: string };
+  /** Owner id from a cookie (X `twid` → `u=<id>`): read it, extract via pattern (group 1). */
+  selfIdCookie?: { name: string; pattern: string };
+  /** Or pre-fetch to learn the owner's own id; `extract` (regex group 1) trims a urn → bare id. */
+  selfIdSource?: { listPathTemplate: string; idPath: string; extract?: string };
   /** Or the owner id is in the list response itself, at this path. */
   selfIdPath?: string;
-  messageFieldMap: MessageFieldMap;
+  messageFieldMap: AnyMessageFieldMap;
   /** Drop conversations that are only un-replied first message(s) (X). */
   excludeUnreplied?: boolean;
 };

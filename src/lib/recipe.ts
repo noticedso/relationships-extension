@@ -106,7 +106,7 @@ export type MessageFieldMap = {
 };
 
 /** Epoch-ms (number or numeric string) or an ISO/date string → ISO 8601, or null. */
-function toIso(value: unknown): string | null {
+export function toIso(value: unknown): string | null {
   if (typeof value === "number") {
     if (!Number.isFinite(value)) return null;
     const d = new Date(value);
