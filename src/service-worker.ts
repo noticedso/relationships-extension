@@ -97,9 +97,10 @@ function makeJitter(recipe: ScanRecipe): () => number {
   return () => minDelayMs + Math.random() * Math.max(0, maxDelayMs - minDelayMs);
 }
 
-function buildPageUrl(recipe: ScanRecipe, start: number): string {
+function buildPageUrl(recipe: ScanRecipe, start: number | string): string {
   const path = recipe.listPathTemplate
     .replaceAll("{start}", String(start))
+    .replaceAll("{cursor}", String(start))
     .replaceAll("{count}", String(recipe.paginationParams.pageSize));
   return recipe.targetOrigin + path;
 }
@@ -162,7 +163,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     const jitter = deps.jitter ?? makeJitter(recipe);
 
     const fetchPage = async (
-      start: number,
+      start: number | string,
     ): Promise<{ items: ScanConnection[]; rawCount: number }> => {
       const res = await fetchImpl(buildPageUrl(recipe, start), {
         credentials: "include",

@@ -75,6 +75,91 @@ function composePictureUrl(element: unknown, fieldMap: FieldMap): string | null 
   return root && seg ? root + seg : null;
 }
 
+// ── Message metadata (NT-44/NT-45) ───────────────────────────────────────────
+
+/**
+ * 1:1 conversation METADATA — the only message shape that ever leaves the
+ * extension. There is no content field, so message text cannot be captured.
+ */
+export type ScanMessage = {
+  counterpartProfileUrl: string;
+  lastMessageAt: string; // ISO 8601
+  direction: "sent" | "received";
+};
+
+/**
+ * Element-relative paths into a conversation-list response. NO content path
+ * exists by design. `lastSenderIdPath` + the owner's `selfId` derive direction;
+ * `participantIdsPath` (distinct senders in the conversation) drives the
+ * "never replied" exclusion.
+ */
+export type MessageFieldMap = {
+  elementsPath: string;
+  counterpartIdPath: string;
+  lastMessageAtPath: string;
+  lastSenderIdPath: string;
+  participantIdsPath?: string;
+  counterpartUrlPrefix?: string;
+};
+
+/** Epoch-ms (number or numeric string) or an ISO/date string → ISO 8601, or null. */
+function toIso(value: unknown): string | null {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  if (typeof value === "string" && value.trim() !== "") {
+    const t = value.trim();
+    const d = /^\d+$/.test(t) ? new Date(Number(t)) : new Date(t);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  return null;
+}
+
+/**
+ * Map a conversation-list page → ScanMessage[]. `selfId` is the owner's own id
+ * (so direction can be derived); `excludeUnreplied` drops one-sided
+ * conversations (only one participant ever sent — the X "never replied" rule).
+ */
+export function applyMessageFieldMap(
+  page: unknown,
+  fieldMap: MessageFieldMap,
+  selfId: string,
+  excludeUnreplied: boolean,
+): ScanMessage[] {
+  const elements = getByPath(page, fieldMap.elementsPath);
+  if (!Array.isArray(elements)) return [];
+
+  const out: ScanMessage[] = [];
+  for (const el of elements) {
+    const counterpartId = toStringOrNull(getByPath(el, fieldMap.counterpartIdPath));
+    if (!counterpartId) continue;
+    const lastMessageAt = toIso(getByPath(el, fieldMap.lastMessageAtPath));
+    if (!lastMessageAt) continue;
+
+    if (excludeUnreplied && fieldMap.participantIdsPath) {
+      const senders = getByPath(el, fieldMap.participantIdsPath);
+      const unique = Array.isArray(senders)
+        ? new Set(senders.map((s) => String(s)))
+        : new Set<string>();
+      if (unique.size < 2) continue; // one-sided → never replied, exclude
+    }
+
+    const lastSenderId = toStringOrNull(getByPath(el, fieldMap.lastSenderIdPath));
+    const direction: "sent" | "received" =
+      lastSenderId !== null && lastSenderId === selfId ? "sent" : "received";
+    out.push({
+      counterpartProfileUrl: fieldMap.counterpartUrlPrefix
+        ? fieldMap.counterpartUrlPrefix + counterpartId
+        : counterpartId,
+      lastMessageAt,
+      direction,
+    });
+  }
+  return out;
+}
+
 export function applyFieldMap(page: unknown, fieldMap: FieldMap): ScanConnection[] {
   const elements = getByPath(page, fieldMap.elementsPath);
   if (!Array.isArray(elements)) return [];
