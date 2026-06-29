@@ -131,8 +131,15 @@ export function applyMessageFieldMap(
   selfId: string,
   excludeUnreplied: boolean,
 ): ScanMessage[] {
-  const elements = getByPath(page, fieldMap.elementsPath);
-  if (!Array.isArray(elements)) return [];
+  // Conversation lists come as arrays (LinkedIn) OR a keyed object/map (X's
+  // inbox_initial_state.conversations) — normalize both to a list of elements.
+  const raw = getByPath(page, fieldMap.elementsPath);
+  const elements = Array.isArray(raw)
+    ? raw
+    : raw && typeof raw === "object"
+      ? Object.values(raw as Record<string, unknown>)
+      : null;
+  if (!elements) return [];
 
   const out: ScanMessage[] = [];
   for (const el of elements) {

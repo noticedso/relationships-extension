@@ -77,6 +77,20 @@ describe("applyMessageFieldMap", () => {
     expect(applyMessageFieldMap(page, fieldMap, "999", false)).toHaveLength(1);
   });
 
+  it("accepts a keyed object/map of conversations (X inbox_initial_state shape)", () => {
+    const page = {
+      conversations: {
+        "100-999": { counterpart: { id: "100" }, lastAt: 1750412400000, lastSenderId: "100", senderIds: ["999", "100"] },
+        "200-999": { counterpart: { id: "200" }, lastAt: 1750412400000, lastSenderId: "999", senderIds: ["999", "200"] },
+      },
+    };
+    const out = applyMessageFieldMap(page, fieldMap, "999", false);
+    expect(out.map((m) => m.counterpartProfileUrl).sort()).toEqual([
+      "https://x.com/i/user/100",
+      "https://x.com/i/user/200",
+    ]);
+  });
+
   it("parses ISO-string timestamps as well as epoch ms", () => {
     const page = { conversations: [{ counterpart: { id: "100" }, lastAt: "2025-06-20T11:00:00.000Z", lastSenderId: "100", senderIds: ["999", "100"] }] };
     expect(applyMessageFieldMap(page, fieldMap, "999", false)[0]!.lastMessageAt).toBe("2025-06-20T11:00:00.000Z");
