@@ -7,7 +7,12 @@ describe("manifest", () => {
     const json = JSON.stringify(manifest).toLowerCase();
     expect(json).not.toContain("voyager");
     expect(manifest.host_permissions).toEqual(["https://*.noticed.so/*"]);
-    expect(manifest.optional_host_permissions).toEqual(["*://*.linkedin.com/*"]);
+    // Optional host permissions are runtime-requested per network (NT-45 adds X).
+    expect(manifest.optional_host_permissions).toEqual([
+      "*://*.linkedin.com/*",
+      "*://*.x.com/*",
+      "*://*.twitter.com/*",
+    ]);
     expect(manifest.externally_connectable.matches).toEqual(["https://*.noticed.so/*"]);
     expect(manifest.permissions).toEqual(expect.arrayContaining(["storage", "alarms", "cookies"]));
   });

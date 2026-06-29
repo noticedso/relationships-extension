@@ -109,9 +109,18 @@ function isDevBuild(): boolean {
   return typeof __DEV__ !== "undefined" && __DEV__ === true;
 }
 
+type SourceStatus = {
+  source: string;
+  networkLabel?: string;
+  targetOrigin?: string;
+  granted?: boolean;
+};
+
 type Status = {
   account?: { name?: string; email?: string } | null;
   recipe?: { networkLabel?: string; targetOrigin?: string } | null;
+  // Per-source view (NT-45 multi-network). Absent on legacy SWs → fall back to recipe.
+  sources?: SourceStatus[] | null;
   nextScanAt?: number | null;
   lastScanAt?: number | null;
   lastScanCount?: number | null;
@@ -121,6 +130,14 @@ type Status = {
   scanning?: boolean | null;
   scannedCount?: number | null;
 };
+
+/** Origins of every paired source, or just the recipe's (legacy single-source). */
+function sourceOrigins(status: Status): string[] {
+  if (status.sources && status.sources.length > 0) {
+    return status.sources.map((s) => s.targetOrigin).filter((o): o is string => Boolean(o));
+  }
+  return status.recipe?.targetOrigin ? [status.recipe.targetOrigin] : [];
+}
 
 function setText(root: Document | HTMLElement, id: string, text: string): void {
   const el = root.querySelector<HTMLElement>(`#${id}`);
@@ -157,11 +174,15 @@ type SyncRun = {
 
 type SyncHistory = { runs?: SyncRun[]; needs?: string };
 
+// These can be reached by a polling tick (pollScanProgress) that outlives the
+// page/context, so guard against the extension API having gone away.
 async function getStatus(): Promise<Status> {
+  if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return {};
   return (await chrome.runtime.sendMessage({ type: "getStatus" })) as Status;
 }
 
 async function getSyncHistory(): Promise<SyncHistory> {
+  if (typeof chrome === "undefined" || !chrome.runtime?.sendMessage) return { runs: [] };
   return (await chrome.runtime.sendMessage({ type: "getSyncHistory" })) as SyncHistory;
 }
 
@@ -343,14 +364,20 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
 
   if (!connected) return;
 
-  // Two explicit scan-now states, gated on whether the host permission is
+  // Two explicit scan-now states, gated on whether the host permission(s) are
   // already granted. Requesting a host permission from a popup CLOSES the popup,
   // so we never request-then-scan in one click: that scan would never run.
-  const origin = status.recipe?.targetOrigin;
+  // Multi-network (NT-45): grant covers EVERY paired source origin at once.
+  const origins = sourceOrigins(status);
+  const grantPatterns = origins.map((o) => `${o}/*`);
   const granted =
-    origin && chrome.permissions?.contains
-      ? await chrome.permissions.contains({ origins: [`${origin}/*`] })
-      : true; // no origin / no API → don't gate
+    grantPatterns.length === 0 || !chrome.permissions?.contains
+      ? true // no origin / no API → don't gate
+      : (
+          await Promise.all(
+            grantPatterns.map((p) => chrome.permissions.contains({ origins: [p] })),
+          )
+        ).every(Boolean);
 
   const scanBtn = root.querySelector<HTMLButtonElement>("#scan-now");
   if (scanBtn) {
@@ -358,7 +385,7 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     const next = scanBtn.cloneNode(true) as HTMLButtonElement;
     scanBtn.replaceWith(next);
     const spinner = root.querySelector<HTMLElement>("#scan-spinner");
-    if (!granted && origin) {
+    if (!granted && grantPatterns.length > 0) {
       next.textContent = "grant access";
       next.addEventListener("click", () => {
         void (async () => {
@@ -366,7 +393,7 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
           // (it can't in the service worker). Requesting may close the popup; on
           // re-open the user lands in the "scan now" state. If it stays open and
           // permission was granted, init() re-renders into the scan state.
-          await chrome.permissions.request({ origins: [`${origin}/*`] });
+          await chrome.permissions.request({ origins: grantPatterns });
           await init(root);
         })();
       });

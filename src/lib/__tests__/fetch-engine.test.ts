@@ -116,4 +116,50 @@ describe("scanConnections", () => {
     // last checkpoint carries all 4 items
     expect(onPage.mock.calls[1][0].length).toBe(4);
   });
+
+  it("follows opaque cursor tokens and stops when nextCursor is null (X)", async () => {
+    const pages: Record<string, { items: { id: number }[]; rawCount: number; nextCursor: string | null }> = {
+      "0": { items: [{ id: 1 }, { id: 2 }], rawCount: 2, nextCursor: "CURSOR_A" },
+      CURSOR_A: { items: [{ id: 3 }, { id: 4 }], rawCount: 2, nextCursor: "CURSOR_B" },
+      CURSOR_B: { items: [{ id: 5 }], rawCount: 1, nextCursor: null }, // end
+    };
+    const seen: (number | string)[] = [];
+    const fetchPage = vi.fn(async (cursor: number | string) => {
+      seen.push(cursor);
+      return pages[String(cursor)]!;
+    });
+    const onPage = vi.fn();
+    const out = await scanConnections({
+      fetchPage,
+      pageSize: 2,
+      maxPages: 50,
+      sleep: async () => {},
+      jitter: () => 0,
+      startAt: "0",
+      onPage,
+    });
+    expect(seen).toEqual(["0", "CURSOR_A", "CURSOR_B"]);
+    expect(out.map((o) => (o as { id: number }).id)).toEqual([1, 2, 3, 4, 5]);
+    // checkpoints record the NEXT token to resume from. The last page ends
+    // (nextCursor null) so the scan finalizes; its checkpoint cursor is moot and
+    // falls back to the just-fetched token (consistent with the offset path,
+    // which records start+pageSize even on the final page).
+    expect(onPage.mock.calls.map((c) => c[1])).toEqual(["CURSOR_A", "CURSOR_B", "CURSOR_B"]);
+  });
+
+  it("stops on a null cursor even when the page was full (no over-fetch)", async () => {
+    const fetchPage = vi
+      .fn()
+      .mockResolvedValueOnce({ items: [{ x: 1 }, { x: 1 }], rawCount: 2, nextCursor: null });
+    const out = await scanConnections({
+      fetchPage,
+      pageSize: 2,
+      maxPages: 50,
+      sleep: async () => {},
+      jitter: () => 0,
+      startAt: "0",
+    });
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    expect(out.length).toBe(2);
+  });
 });

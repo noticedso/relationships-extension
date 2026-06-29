@@ -8,6 +8,9 @@ function getChrome(): ChromeMock {
 }
 
 const recipe = {
+  source: "linkedin_extension",
+  ingestPath: "/api/linkedin/import/extension",
+  networkLabel: "LinkedIn",
   targetOrigin: "https://network.example.com",
   listPathTemplate: "/api/connections?start={start}&count={count}",
   paginationParams: { pageSize: 2 },
@@ -23,6 +26,29 @@ const recipe = {
   },
   excludeSources: ["linkedin_export"],
 };
+
+// The finished payload for the (messages-free) LinkedIn fixture is
+// pendingScans.linkedin_extension.payload.connections.
+function pendingConns(stored: Record<string, unknown>): Array<Record<string, unknown>> {
+  const ps = stored.pendingScans as
+    | Record<string, { payload?: { connections?: Array<Record<string, unknown>> } }>
+    | undefined;
+  return ps?.linkedin_extension?.payload?.connections ?? [];
+}
+
+// In-flight checkpoint as runScan would initialize it (single connection phase).
+function inProgress(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    scanInProgress: true,
+    scanSource: "linkedin_extension",
+    scanPhaseIndex: 0,
+    scanCursor: 0,
+    scanItems: [],
+    scanPhaseResults: { connLists: [], messages: [] },
+    scanStartedAt: Date.now(),
+    ...extra,
+  };
+}
 
 const account = { id: "acct-1", displayName: "Test User" };
 
@@ -136,7 +162,7 @@ describe("service worker", () => {
       return { ok: true, json: async () => ({ elements }) } as Response;
     });
 
-    const res = await sw.runScan({
+    const res = await sw.runScan(undefined, {
       fetchImpl: fakeFetch as unknown as typeof fetch,
       sleep: async () => {},
       jitter: () => 0,
@@ -147,15 +173,16 @@ describe("service worker", () => {
     expect(res.count).toBe(2);
 
     const stored = await chrome.storage.local.get(null);
-    const pending = stored.pendingScan as Array<Record<string, unknown>>;
+    const pending = pendingConns(stored);
     expect(pending).toHaveLength(2);
     expect(pending[0]).toMatchObject({ profileUrl: "a", firstName: "A" });
     expect(stored.needs).toBe("noticed-signin");
 
     // E7: the handoff tab opens in the BACKGROUND (active: false) so it never
-    // steals focus, and its id is persisted so syncConfirmed can close it.
+    // steals focus, carries the source it scanned, and its id is persisted so
+    // syncConfirmed can close it.
     expect(tabSpy).toHaveBeenCalledWith({
-      url: `https://app.noticed.so/x/sync?ext_id=${getChrome().runtime.id}`,
+      url: `https://app.noticed.so/x/sync?ext_id=${getChrome().runtime.id}&source=linkedin_extension`,
       active: false,
     });
     expect(stored.syncTabId).toBe(1);
@@ -182,7 +209,7 @@ describe("service worker", () => {
       } as Response;
     });
 
-    const res = await sw.runScan({
+    const res = await sw.runScan(undefined, {
       fetchImpl: fakeFetch as unknown as typeof fetch,
       sleep: async () => {},
       jitter: () => 0,
@@ -209,7 +236,7 @@ describe("service worker", () => {
       } as Response;
     });
 
-    const res = await sw.runScan({
+    const res = await sw.runScan(undefined, {
       fetchImpl: fakeFetch as unknown as typeof fetch,
       sleep: async () => {},
       jitter: () => 0,
@@ -223,6 +250,8 @@ describe("service worker", () => {
     const chrome = getChrome();
     await pair();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    // The monthly alarm auto-scans every source whose host permission is granted.
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     const fetchSpy = vi.fn(
       async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response,
     );
@@ -243,26 +272,41 @@ describe("service worker", () => {
     expect(fetchSpy).toHaveBeenCalled();
   });
 
-  it("6. getCachedScan returns pendingScan; syncConfirmed clears it + stamps lastScan", async () => {
+  // A finished, source-shaped pending scan as finalizeScan would store it.
+  function pending(payloadConns: Array<Record<string, unknown>>, count = payloadConns.length) {
+    return {
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: "/api/linkedin/import/extension",
+          payload: { source: "linkedin_extension", connections: payloadConns, messages: [] },
+          count,
+        },
+      },
+    };
+  }
+
+  it("6. getCachedScan returns {ingestPath, payload}; syncConfirmed clears it + stamps lastScan", async () => {
     const chrome = getChrome();
     await pair();
     const conns = [{ profileUrl: "a", firstName: "A", lastName: null, headline: null, connectedOn: null }];
-    await chrome.storage.local.set({ pendingScan: conns, needs: null });
+    await chrome.storage.local.set({ ...pending(conns), needs: null });
 
-    const cached = (await dispatchExternal({ type: "getCachedScan" }, noticedSender)) as Record<
-      string,
-      unknown
-    >;
-    expect(cached.connections).toEqual(conns);
+    const cached = (await dispatchExternal(
+      { type: "getCachedScan", source: "linkedin_extension" },
+      noticedSender,
+    )) as Record<string, unknown>;
+    expect(cached.ingestPath).toBe("/api/linkedin/import/extension");
+    expect((cached.payload as { connections: unknown }).connections).toEqual(conns);
 
     const confirmed = (await dispatchExternal(
-      { type: "syncConfirmed" },
+      { type: "syncConfirmed", source: "linkedin_extension" },
       noticedSender,
     )) as Record<string, unknown>;
     expect(confirmed).toMatchObject({ ok: true });
 
     const stored = await chrome.storage.local.get(null);
-    expect(stored.pendingScan ?? null).toBeNull();
+    expect((stored.pendingScans as Record<string, unknown>).linkedin_extension ?? null).toBeNull();
     expect(stored.needs ?? null).toBeNull();
     expect(stored.lastScanAt).not.toBeNull();
     expect(stored.lastScanCount).toBe(1);
@@ -272,9 +316,9 @@ describe("service worker", () => {
     const chrome = getChrome();
     await pair();
     const removeSpy = vi.spyOn(chrome.tabs, "remove");
-    await chrome.storage.local.set({ pendingScan: [{ profileUrl: "a" }], needs: "noticed-signin", syncTabId: 42 });
+    await chrome.storage.local.set({ ...pending([{ profileUrl: "a" }]), needs: "noticed-signin", syncTabId: 42 });
 
-    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
@@ -290,9 +334,9 @@ describe("service worker", () => {
     const chrome = getChrome();
     await pair();
     const removeSpy = vi.spyOn(chrome.tabs, "remove");
-    await chrome.storage.local.set({ pendingScan: [{ profileUrl: "a" }], needs: "noticed-signin" });
+    await chrome.storage.local.set({ ...pending([{ profileUrl: "a" }]), needs: "noticed-signin" });
 
-    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
@@ -304,16 +348,16 @@ describe("service worker", () => {
     const chrome = getChrome();
     await pair();
     vi.spyOn(chrome.tabs, "remove").mockRejectedValue(new Error("No tab with id: 42"));
-    await chrome.storage.local.set({ pendingScan: [{ profileUrl: "a" }], needs: "noticed-signin", syncTabId: 42 });
+    await chrome.storage.local.set({ ...pending([{ profileUrl: "a" }]), needs: "noticed-signin", syncTabId: 42 });
 
-    const confirmed = (await dispatchExternal({ type: "syncConfirmed" }, noticedSender)) as Record<
+    const confirmed = (await dispatchExternal({ type: "syncConfirmed", source: "linkedin_extension" }, noticedSender)) as Record<
       string,
       unknown
     >;
     // a rejected remove must not break confirmation
     expect(confirmed).toMatchObject({ ok: true });
     const stored = await chrome.storage.local.get(null);
-    expect(stored.pendingScan ?? null).toBeNull();
+    expect((stored.pendingScans as Record<string, unknown>).linkedin_extension ?? null).toBeNull();
     expect(stored.lastScanCount).toBe(1);
     expect(stored.syncTabId ?? null).toBeNull();
   });
@@ -404,8 +448,8 @@ describe("service worker", () => {
     expect(createAlarm).toHaveBeenCalledWith("scan-tick", { periodInMinutes: 0.5 });
 
     const stored = await chrome.storage.local.get(null);
-    // finished → pendingScan set, scan state cleared, handoff state set
-    expect((stored.pendingScan as unknown[]).length).toBe(3);
+    // finished → pendingScans set, scan state cleared, handoff state set
+    expect(pendingConns(stored).length).toBe(3);
     expect(stored.scanInProgress ?? false).toBe(false);
     expect(stored.scanItems ?? null).toBeNull();
     expect(stored.scanCursor ?? null).toBeNull();
@@ -430,12 +474,7 @@ describe("service worker", () => {
     }) as unknown as typeof fetch;
 
     // initialize scan state as scanNow would, then drive continueScan directly
-    await chrome.storage.local.set({
-      scanInProgress: true,
-      scanCursor: 0,
-      scanItems: [],
-      scanStartedAt: Date.now(),
-    });
+    await chrome.storage.local.set(inProgress());
     await sw.continueScan({ sleep: async () => {}, jitter: () => 0, nowMs: () => 1000 }).catch(() => {});
 
     const stored = await chrome.storage.local.get(null);
@@ -455,12 +494,7 @@ describe("service worker", () => {
       { profileUrl: "a", firstName: "A", lastName: null, headline: null, connectedOn: null, pictureUrl: null },
       { profileUrl: "b", firstName: "B", lastName: null, headline: null, connectedOn: null, pictureUrl: null },
     ];
-    await chrome.storage.local.set({
-      scanInProgress: true,
-      scanCursor: 2,
-      scanItems: recovered,
-      scanStartedAt: Date.now(),
-    });
+    await chrome.storage.local.set(inProgress({ scanCursor: 2, scanItems: recovered }));
 
     // Resume: the next fetch must be for start=2; one more full page, then short.
     const starts: number[] = [];
@@ -480,7 +514,7 @@ describe("service worker", () => {
     expect(starts).not.toContain(0);
 
     const stored = await chrome.storage.local.get(null);
-    const pending = stored.pendingScan as Array<{ profileUrl: string }>;
+    const pending = pendingConns(stored) as Array<{ profileUrl: string }>;
     // 2 recovered + 3 new, in order, no dupes
     expect(pending.map((c) => c.profileUrl)).toEqual(["a", "b", "c", "d", "e"]);
     expect(stored.scanInProgress ?? false).toBe(false);
@@ -502,7 +536,7 @@ describe("service worker", () => {
     }) as unknown as typeof fetch;
 
     // arm scan state, then fire two continueScan calls "simultaneously"
-    await chrome.storage.local.set({ scanInProgress: true, scanCursor: 0, scanItems: [], scanStartedAt: Date.now() });
+    await chrome.storage.local.set(inProgress());
     const a = sw.continueScan({ sleep: async () => {}, jitter: () => 0 });
     const b = sw.continueScan({ sleep: async () => {}, jitter: () => 0 });
     await Promise.all([a, b]);
@@ -516,7 +550,7 @@ describe("service worker", () => {
     await pair();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue(null);
     const clearAlarm = vi.spyOn(chrome.alarms, "clear");
-    await chrome.storage.local.set({ scanInProgress: true, scanCursor: 0, scanItems: [], scanStartedAt: Date.now() });
+    await chrome.storage.local.set(inProgress());
 
     const res = await sw.continueScan({ sleep: async () => {}, jitter: () => 0 });
     expect(res.needs).toBe("network-signin");
@@ -535,12 +569,7 @@ describe("service worker", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
     const settle = () => new Promise((r) => setTimeout(r, 25));
 
-    await chrome.storage.local.set({
-      scanInProgress: true,
-      scanCursor: 0,
-      scanItems: [],
-      scanStartedAt: Date.now(),
-    });
+    await chrome.storage.local.set(inProgress());
     chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
     await settle();
 
@@ -559,12 +588,9 @@ describe("service worker", () => {
     const settle = () => new Promise((r) => setTimeout(r, 25));
 
     // started > 1h ago → stale zombie
-    await chrome.storage.local.set({
-      scanInProgress: true,
-      scanCursor: 4,
-      scanItems: [],
-      scanStartedAt: Date.now() - 2 * 60 * 60 * 1000,
-    });
+    await chrome.storage.local.set(
+      inProgress({ scanCursor: 4, scanStartedAt: Date.now() - 2 * 60 * 60 * 1000 }),
+    );
     chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
     await settle();
 
@@ -578,12 +604,7 @@ describe("service worker", () => {
     const chrome = getChrome();
     // simulate the SW being torn down mid-scan: state persisted, but a fresh
     // SW instance boots (registered flag reset via a brand-new chrome mock).
-    await chrome.storage.local.set({
-      scanInProgress: true,
-      scanCursor: 2,
-      scanItems: [],
-      scanStartedAt: Date.now(),
-    });
+    await chrome.storage.local.set(inProgress({ scanCursor: 2 }));
     const createAlarm = vi.spyOn(chrome.alarms, "create");
 
     sw.registerListenersForTest(); // force re-registration against this chrome
@@ -596,16 +617,12 @@ describe("service worker", () => {
   it("23. getStatus exposes scanning + scannedCount while a scan is in progress (E2)", async () => {
     const chrome = getChrome();
     await pair();
-    await chrome.storage.local.set({
-      scanInProgress: true,
-      scanCursor: 6,
-      scanItems: [
-        { profileUrl: "a" },
-        { profileUrl: "b" },
-        { profileUrl: "c" },
-      ],
-      scanStartedAt: Date.now(),
-    });
+    await chrome.storage.local.set(
+      inProgress({
+        scanCursor: 6,
+        scanItems: [{ profileUrl: "a" }, { profileUrl: "b" }, { profileUrl: "c" }],
+      }),
+    );
     const res = (await dispatchInternal({ type: "getStatus" })) as Record<string, unknown>;
     expect(res.scanning).toBe(true);
     expect(res.scannedCount).toBe(3);
