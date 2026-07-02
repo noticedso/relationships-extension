@@ -108,6 +108,32 @@ describe("assembleScanPayload", () => {
     expect(out.payload.ownerAccountId).toBe("owner-99");
     expect(out.payload.mutuals).toEqual([{ accountId: "2", handle: "bob" }]);
     expect(out.payload.messages).toEqual([{ counterpartAccountId: "2", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "received" }]);
+    // mentions is always present (empty by default) so the X ingest shape is stable
+    expect(out.payload.mentions).toEqual([]);
     expect(out.count).toBe(2); // 1 mutual + 1 message
+  });
+
+  // ── NT-63 side-pass extras (owner profile + tweet edges) ──────────────────────
+
+  it("LinkedIn: threads ownerProfile raw JSON through when provided, omits the key otherwise", () => {
+    const conns = [conn("janedoe")];
+    const owner = { profileView: { profile: { firstName: "Jane" } } };
+    const withOwner = assembleScanPayload(liRecipe, [conns], [], "self-li", { ownerProfile: owner });
+    expect(withOwner.payload.ownerProfile).toEqual(owner);
+    // no extras → the LinkedIn payload shape is unchanged (no ownerProfile key)
+    const without = assembleScanPayload(liRecipe, [conns], [], "self-li");
+    expect("ownerProfile" in without.payload).toBe(false);
+  });
+
+  it("X: includes owner tweet edges as `mentions`, without inflating the count", () => {
+    const following = [conn("alice", "1"), conn("bob", "2")];
+    const followers = [conn("bob", "2"), conn("dave", "4")];
+    const edges = [
+      { tweetId: "20", createdAt: "2026-06-20T10:30:00.000Z", isReply: false, mentionedUserId: "77", mentionedScreenName: "kate", mentionedName: "Kate" },
+    ];
+    const out = assembleScanPayload(xRecipe, [following, followers], [], "owner-99", { tweetEdges: edges });
+    expect(out.payload.mentions).toEqual(edges);
+    // mentions are supplementary edges — the "synced" count stays connections+messages
+    expect(out.count).toBe(1); // 1 mutual (bob), 0 messages
   });
 });

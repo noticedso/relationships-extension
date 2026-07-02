@@ -18,8 +18,9 @@
 import { buildCsrfHeaders } from "./lib/cookies";
 import { applyFieldMap, getByPath } from "./lib/recipe";
 import type { ScanConnection, ScanMessage } from "./lib/recipe";
-import { extractMessages } from "./lib/message-extract";
-import { planPhases, assembleScanPayload, type Phase } from "./lib/scan-plan";
+import { extractMessages, extractTweetEdges, tweetsArrayOf } from "./lib/message-extract";
+import type { XTweetEdgeRow } from "./lib/message-extract";
+import { planPhases, assembleScanPayload, type Phase, type ScanExtras } from "./lib/scan-plan";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
 
@@ -215,6 +216,131 @@ async function resolveSelfId(
   return "";
 }
 
+/** Read the owner id from a cookie (X `twid` → `u=<id>`), regex group 1. */
+async function resolveSelfIdFromCookie(
+  targetOrigin: string,
+  spec: { name: string; pattern: string },
+): Promise<string> {
+  try {
+    const c = await chrome.cookies.get({ url: targetOrigin, name: spec.name });
+    const val = c?.value ? decodeURIComponent(c.value) : "";
+    const match = val.match(new RegExp(spec.pattern));
+    if (match && match[1]) return match[1];
+  } catch {
+    // ignore — treat as unresolved
+  }
+  return "";
+}
+
+/**
+ * NT-63 owner-profile pass (LinkedIn). Resolve the owner's own id, then GET each
+ * recipe endpoint (with `{self}` interpolated) and collect its raw JSON keyed by
+ * `endpoint.key`. The server maps the raw JSON — the extension stays
+ * source-agnostic. Best-effort: any failure yields `undefined` (or a partial
+ * object) and never blocks the connections import.
+ */
+async function runOwnerProfilePass(
+  recipe: ScanRecipe,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+): Promise<Record<string, unknown> | undefined> {
+  const op = recipe.ownerProfile;
+  if (!op) return undefined;
+
+  const res = await fetchImpl(recipe.targetOrigin + op.selfIdSource.listPathTemplate, {
+    credentials: "include",
+    headers,
+  });
+  if (!res.ok) return undefined;
+  const meJson = await res.json();
+  let self = String(getByPath(meJson, op.selfIdSource.idPath) ?? "");
+  if (op.selfIdSource.extract) {
+    const match = self.match(new RegExp(op.selfIdSource.extract));
+    if (match && match[1]) self = match[1];
+  }
+  if (!self) return undefined;
+
+  const out: Record<string, unknown> = {};
+  for (const ep of op.endpoints) {
+    try {
+      const r = await fetchImpl(recipe.targetOrigin + ep.pathTemplate.replaceAll("{self}", self), {
+        credentials: "include",
+        headers,
+      });
+      if (!r.ok) continue;
+      out[ep.key] = await r.json();
+    } catch {
+      // best-effort per endpoint — skip a failing one
+    }
+  }
+  return out;
+}
+
+/**
+ * Twitter max_id backward pagination: the next page ends just before the oldest
+ * id on this page (`min(id) - 1`). Returns null when no numeric id is present so
+ * the paginator stops. Kept for user_timeline, which carries no cursor token.
+ */
+function nextMaxIdCursor(rawTweets: unknown[], tweetIdPath: string): string | null {
+  let min: bigint | null = null;
+  for (const tw of rawTweets) {
+    try {
+      const id = BigInt(String(getByPath(tw, tweetIdPath)));
+      if (min === null || id < min) min = id;
+    } catch {
+      // non-numeric id — can't derive max_id from it
+    }
+  }
+  return min === null ? null : (min - 1n).toString();
+}
+
+/**
+ * NT-63 owner-tweets pass (X). Resolve the owner id (the `twid` cookie, as the
+ * messages pass does), then page the owner's recent tweets into mention/reply
+ * EDGE rows via `extractTweetEdges` — metadata only, never the tweet text.
+ * Best-effort: any failure yields the rows gathered so far and never blocks the
+ * connections import.
+ */
+async function runTweetsPass(
+  recipe: ScanRecipe,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  selfId: string,
+  sleep: (ms: number) => Promise<void>,
+  jitter: () => number,
+  maxPages: number,
+): Promise<XTweetEdgeRow[]> {
+  const t = recipe.tweets;
+  if (!t) return [];
+  let self = selfId;
+  if (!self && t.selfIdCookie) self = await resolveSelfIdFromCookie(recipe.targetOrigin, t.selfIdCookie);
+  if (!self) return [];
+
+  const cap = Math.max(1, Math.min(maxPages, t.maxPagesPerSession ?? maxPages));
+  const { scanConnections } = await import("./lib/fetch-engine");
+  return scanConnections<XTweetEdgeRow>({
+    fetchPage: async (cursor) => {
+      const res = await fetchImpl(substituteCursor(t.listPathTemplate, recipe, cursor, self), {
+        credentials: "include",
+        headers,
+      });
+      if (!res.ok) throw new Error(`tweets page fetch failed: ${res.status}`);
+      const json = await res.json();
+      const raw = tweetsArrayOf(json, t.tweetFieldMap);
+      const items = extractTweetEdges(json, t.tweetFieldMap);
+      const nextCursor = t.cursorPath
+        ? normalizeCursor(getByPath(json, t.cursorPath))
+        : nextMaxIdCursor(raw, t.tweetFieldMap.tweetIdPath);
+      return { items, rawCount: raw.length, nextCursor };
+    },
+    pageSize: t.pageSize,
+    maxPages: cap,
+    sleep,
+    jitter,
+    startAt: "", // first page: empty max_id → the latest tweets
+  });
+}
+
 /**
  * Resumable phase stepper. Reads the persisted checkpoint, walks the recipe's
  * phases (connection list(s) then messages), checkpoints to storage after EACH
@@ -334,7 +460,34 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       });
     }
 
-    return finalizeScan(recipe, results.connLists, results.messages, selfId, noticedOrigin ?? null, now());
+    // NT-63 best-effort owner side-passes, AFTER the connection/message phases so
+    // a failure here can never abort a completed connections scan. Each is wrapped
+    // so a throw degrades to "no extra" rather than wedging the scan.
+    const extras: ScanExtras = {};
+    if (recipe.ownerProfile) {
+      extras.ownerProfile = await runOwnerProfilePass(recipe, headers, fetchImpl).catch(() => undefined);
+    }
+    if (recipe.tweets) {
+      extras.tweetEdges = await runTweetsPass(
+        recipe,
+        headers,
+        fetchImpl,
+        selfId,
+        sleep,
+        jitter,
+        effectiveMaxPages,
+      ).catch(() => []);
+    }
+
+    return finalizeScan(
+      recipe,
+      results.connLists,
+      results.messages,
+      selfId,
+      noticedOrigin ?? null,
+      now(),
+      extras,
+    );
   } finally {
     scanRunning = false;
   }
@@ -363,10 +516,11 @@ async function finalizeScan(
   selfId: string,
   noticedOrigin: string | null,
   startedAt: number,
+  extras: ScanExtras = {},
 ): Promise<RunScanResult> {
   clearScanTick();
   const source = sourceOf(recipe);
-  const { ingestPath, payload, count } = assembleScanPayload(recipe, connLists, messages, selfId);
+  const { ingestPath, payload, count } = assembleScanPayload(recipe, connLists, messages, selfId, extras);
   const pending: PendingScan = { source, ingestPath, payload, count };
 
   const state = await getState();
@@ -458,6 +612,14 @@ async function handleExternal(
       });
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
       sendResponse({ ok: true });
+      // NT-66 auto-scan on pair: import the already-granted sources immediately so
+      // a reconnect syncs with no manual click (mirrors the monthly-alarm path).
+      // First-time users (no host permission yet) can't be scanned from the SW —
+      // no user gesture here — so the popup's grant handler kicks that off. Fire-
+      // and-forget so the connect page's ack isn't blocked on the scan.
+      void (async () => {
+        for (const src of await grantedSources(recipes)) await runScan(src);
+      })();
       return;
     }
     case "getCachedScan": {
@@ -541,11 +703,36 @@ async function handleInternal(
       const state = await getState();
       const recipes = recipesOf(state);
       const targets = message.source ? [message.source] : await grantedSources(recipes);
-      let last: RunScanResult = { ok: true };
-      for (const src of targets.length > 0 ? targets : [state.recipe?.source ?? DEFAULT_SOURCE]) {
-        last = await runScan(src);
+      const list = targets.length > 0 ? targets : [state.recipe?.source ?? DEFAULT_SOURCE];
+      const first = list[0]!;
+
+      // Cause B (scan-twice): set the in-flight scan state + arm the keepalive tick
+      // SYNCHRONOUSLY — before the CSRF cookie round-trip in runScan — and ack
+      // immediately, so the popup's first getStatus after this ack already reads
+      // scanning:true and its poller doesn't bail to idle while the scan runs.
+      if (recipes[first]) {
+        await setState({
+          scanInProgress: true,
+          scanSource: first,
+          scanPhaseIndex: 0,
+          scanCursor: null,
+          scanItems: [],
+          scanPhaseResults: { connLists: [], messages: [] },
+          scanSelfId: null,
+          scanStartedAt: Date.now(),
+          needs: null,
+        });
+        armScanTick();
       }
-      sendResponse(last.ok ? { ok: true } : last);
+      sendResponse({ ok: true });
+
+      // Drive the scan(s) WITHOUT blocking the ack. continueScan picks up the state
+      // set above (and self-clears + sets needs:network-signin on a missing session);
+      // any remaining sources scan sequentially after it.
+      void (async () => {
+        if (recipes[first]) await continueScan();
+        for (const src of list.slice(1)) await runScan(src);
+      })();
       return;
     }
     case "setTestMode": {

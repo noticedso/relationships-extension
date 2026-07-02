@@ -334,6 +334,25 @@ export async function pollScanProgress(
   }
 }
 
+// Kick off a scan and show live progress. Sets the in-progress UI SYNCHRONOUSLY
+// (before the first await, so it's observable immediately) and AWAITS the scanNow
+// ack so the service worker has set scanning:true before we start polling — Cause
+// B of the scan-twice bug, where the poller could read scanning:false on its first
+// tick and bail to idle while the scan ran invisibly. Then polls until it finishes.
+async function startScan(
+  root: Document | HTMLElement,
+  btn: HTMLButtonElement,
+  spinner: HTMLElement | null,
+): Promise<void> {
+  btn.disabled = true;
+  btn.textContent = "scanning…";
+  if (spinner) spinner.hidden = false;
+  if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
+    await chrome.runtime.sendMessage({ type: "scanNow" });
+  }
+  await pollScanProgress(root);
+}
+
 export async function init(root: Document | HTMLElement = document): Promise<void> {
   // Bail when the extension API isn't available (e.g. module imported under test
   // before the chrome mock is installed, or any non-extension context).
@@ -390,11 +409,14 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
       next.addEventListener("click", () => {
         void (async () => {
           // A popup click is a user gesture, so chrome.permissions.request works
-          // (it can't in the service worker). Requesting may close the popup; on
-          // re-open the user lands in the "scan now" state. If it stays open and
-          // permission was granted, init() re-renders into the scan state.
-          await chrome.permissions.request({ origins: grantPatterns });
-          await init(root);
+          // (it can't in the service worker). Cause A of the scan-twice bug: when
+          // the grant resolves while the popup is still open, KICK OFF the scan
+          // right away ("1 open + 1 click → grant + import") instead of only
+          // re-rendering and making the user click a second time. If the prompt
+          // closed the popup, the SW's pair/alarm path covers the scan on re-open.
+          const ok = await chrome.permissions.request({ origins: grantPatterns });
+          if (ok) await startScan(root, next, spinner);
+          else await init(root);
         })();
       });
     } else if (status.scanning) {
@@ -413,17 +435,10 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
       next.textContent = "scan now";
       if (spinner) spinner.hidden = true;
       next.addEventListener("click", () => {
-        void (async () => {
-          // Show progress synchronously: a real scan paces pagination over a
-          // minute+ and can outlive this popup, so we kick it off and then poll
-          // getStatus for "scanned N…" updates rather than blocking on the
-          // scanNow response (E1/E2).
-          next.disabled = true;
-          next.textContent = "scanning…";
-          if (spinner) spinner.hidden = false;
-          void chrome.runtime.sendMessage({ type: "scanNow" });
-          await pollScanProgress(root);
-        })();
+        // A real scan paces pagination over a minute+ and can outlive this popup:
+        // startScan sets the in-progress UI synchronously, awaits the scanNow ack
+        // (Cause B), then polls getStatus for "scanned N…" updates (E1/E2).
+        void startScan(root, next, spinner);
       });
     }
   }

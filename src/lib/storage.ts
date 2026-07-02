@@ -1,5 +1,5 @@
 import type { ScanConnection, ScanMessage } from "./recipe";
-import type { AnyMessageFieldMap } from "./message-extract";
+import type { AnyMessageFieldMap, TweetEdgesFieldMap } from "./message-extract";
 
 /** A "messages" pass appended after the connection pass(es). Metadata only. */
 export type MessagesTarget = {
@@ -54,6 +54,31 @@ export type ScanRecipe = {
   intersectConnections?: boolean;
   /** Optional second "messages" pass (1:1 DM metadata). */
   messages?: MessagesTarget;
+  /**
+   * Optional owner-profile pass (NT-63, LinkedIn): resolve the owner's own id,
+   * then GET each endpoint and pass its raw JSON through as `ownerProfile`. The
+   * server maps the raw JSON — the extension stays source-agnostic. Best-effort.
+   */
+  ownerProfile?: {
+    selfIdSource: { listPathTemplate: string; idPath: string; extract?: string };
+    endpoints: Array<{ key: string; pathTemplate: string }>;
+  };
+  /**
+   * Optional owner-tweets pass (NT-63, X): scan the owner's recent tweets into
+   * mention/reply EDGE rows (metadata only, never the text). Best-effort.
+   */
+  tweets?: {
+    /** Supports `{self}` (owner id) + `{cursor}`/`{start}`/`{count}`. */
+    listPathTemplate: string;
+    pageSize: number;
+    /** Path to a next-page cursor token; absent → derive max_id from the page. */
+    cursorPath?: string;
+    /** Owner id from a cookie (X `twid` → `u=<id>`): read it, extract via pattern. */
+    selfIdCookie?: { name: string; pattern: string };
+    /** Per-session page cap for this pass (falls back to the scan-wide cap). */
+    maxPagesPerSession?: number;
+    tweetFieldMap: TweetEdgesFieldMap;
+  };
   /** Source values to hide from the sync history (recipe-driven, set at pair time). */
   excludeSources?: string[];
 };

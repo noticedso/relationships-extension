@@ -3,8 +3,10 @@ import {
   extractDmEntries,
   extractParticipantConversations,
   extractMessages,
+  extractTweetEdges,
   type DmEntriesFieldMap,
   type ParticipantConversationsFieldMap,
+  type TweetEdgesFieldMap,
 } from "../message-extract";
 
 // ── X DM entries (mirrors /i/api/1.1/dm/inbox_initial_state.json) ─────────────
@@ -122,6 +124,98 @@ describe("extractParticipantConversations (LinkedIn)", () => {
       liConv({ selfUrn: "urn:li:fsd_profile:ACoAACself", otherUrn: "urn:li:fsd_profile:ACoAAAg", otherHandle: "in/g", lastAt: 1, groupChat: true }),
     ]);
     expect(extractParticipantConversations(page, liFieldMap, SELF)).toHaveLength(0);
+  });
+});
+
+// ── X owner-timeline tweet edges (NT-63; mirrors statuses/user_timeline.json) ──
+const tweetFieldMap: TweetEdgesFieldMap = {
+  mode: "tweetEdges",
+  tweetIdPath: "id_str",
+  createdAtPath: "created_at",
+  inReplyToUserIdPath: "in_reply_to_user_id_str",
+  inReplyToScreenNamePath: "in_reply_to_screen_name",
+  userMentionsPath: "entities.user_mentions",
+  mentionIdPath: "id_str",
+  mentionScreenNamePath: "screen_name",
+  mentionNamePath: "name",
+};
+function tweet(opts: {
+  id: string;
+  createdAt: string;
+  inReplyToUserId?: string;
+  inReplyToScreenName?: string;
+  mentions?: Array<{ id: string; screen: string; name: string }>;
+}) {
+  // full_text deliberately present to prove the extractor never reads the body.
+  return {
+    id_str: opts.id,
+    created_at: opts.createdAt,
+    full_text: "SECRET TWEET BODY",
+    in_reply_to_user_id_str: opts.inReplyToUserId ?? null,
+    in_reply_to_screen_name: opts.inReplyToScreenName ?? null,
+    entities: {
+      user_mentions: (opts.mentions ?? []).map((m) => ({ id_str: m.id, screen_name: m.screen, name: m.name })),
+    },
+  };
+}
+
+describe("extractTweetEdges (X)", () => {
+  it("emits one edge per @-mention (isReply=false) and never the tweet text", () => {
+    const page = [
+      tweet({
+        id: "1",
+        createdAt: "2026-06-20T10:30:00.000Z",
+        mentions: [
+          { id: "100", screen: "alice", name: "Alice" },
+          { id: "200", screen: "bob", name: "Bob" },
+        ],
+      }),
+    ];
+    const out = extractTweetEdges(page, tweetFieldMap);
+    expect(out).toEqual([
+      { tweetId: "1", createdAt: "2026-06-20T10:30:00.000Z", isReply: false, mentionedUserId: "100", mentionedScreenName: "alice", mentionedName: "Alice" },
+      { tweetId: "1", createdAt: "2026-06-20T10:30:00.000Z", isReply: false, mentionedUserId: "200", mentionedScreenName: "bob", mentionedName: "Bob" },
+    ]);
+    expect(JSON.stringify(out)).not.toContain("SECRET");
+  });
+
+  it("adds a reply-marker row (isReply=true, empty mention fields) for a reply tweet", () => {
+    const page = [
+      tweet({
+        id: "2",
+        createdAt: "2026-06-20T11:00:00.000Z",
+        inReplyToUserId: "300",
+        inReplyToScreenName: "carol",
+        mentions: [{ id: "300", screen: "carol", name: "Carol" }],
+      }),
+    ];
+    const out = extractTweetEdges(page, tweetFieldMap);
+    expect(out).toHaveLength(2);
+    expect(out).toContainEqual({ tweetId: "2", createdAt: "2026-06-20T11:00:00.000Z", isReply: false, mentionedUserId: "300", mentionedScreenName: "carol", mentionedName: "Carol" });
+    expect(out).toContainEqual({ tweetId: "2", createdAt: "2026-06-20T11:00:00.000Z", isReply: true, inReplyToUserId: "300", inReplyToScreenName: "carol", mentionedUserId: "", mentionedScreenName: "", mentionedName: "" });
+  });
+
+  it("a reply with no mentions still yields exactly the reply-marker", () => {
+    const page = [tweet({ id: "3", createdAt: "2026-06-20T12:00:00.000Z", inReplyToUserId: "400", inReplyToScreenName: "dave" })];
+    expect(extractTweetEdges(page, tweetFieldMap)).toEqual([
+      { tweetId: "3", createdAt: "2026-06-20T12:00:00.000Z", isReply: true, inReplyToUserId: "400", inReplyToScreenName: "dave", mentionedUserId: "", mentionedScreenName: "", mentionedName: "" },
+    ]);
+  });
+
+  it("skips tweets missing id or created_at, and non-reply tweets with no mentions", () => {
+    const page = [
+      { id_str: "", created_at: "2026-06-20T10:30:00.000Z" }, // no id
+      { id_str: "5", created_at: "" }, // no timestamp
+      tweet({ id: "6", createdAt: "2026-06-20T10:30:00.000Z" }), // no mentions, not a reply
+    ];
+    expect(extractTweetEdges(page, tweetFieldMap)).toEqual([]);
+  });
+
+  it("reads the tweets array at tweetsPath when the page is not a bare array", () => {
+    const nested = { data: { tweets: [tweet({ id: "7", createdAt: "2026-06-20T10:30:00.000Z", mentions: [{ id: "700", screen: "erin", name: "Erin" }] })] } };
+    expect(extractTweetEdges(nested, { ...tweetFieldMap, tweetsPath: "data.tweets" })).toEqual([
+      { tweetId: "7", createdAt: "2026-06-20T10:30:00.000Z", isReply: false, mentionedUserId: "700", mentionedScreenName: "erin", mentionedName: "Erin" },
+    ]);
   });
 });
 

@@ -116,12 +116,14 @@ describe("popup", () => {
     expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
   });
 
-  it("when the host permission is NOT granted: button says 'grant access' and clicking requests permission (does not scan)", async () => {
+  it("when the host permission is NOT granted: button says 'grant access'; granting kicks off the scan in the same click (Cause A)", async () => {
     const withOrigin = {
       ...status,
       recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
     };
-    const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : withOrigin));
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : m.type === "scanNow" ? { ok: true } : withOrigin,
+    );
     const request = vi.fn(async () => true);
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
@@ -131,6 +133,31 @@ describe("popup", () => {
 
     await init(document);
     expect(document.getElementById("scan-now")!.textContent).toBe("grant access");
+    sendMessage.mockClear();
+    document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(request).toHaveBeenCalledWith({ origins: ["https://network.example.com/*"] });
+    // Cause A: a granted permission now triggers the scan immediately — no second
+    // click needed ("1 open + 1 click → grant + import").
+    expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
+  });
+
+  it("grant-access that is DENIED does not scan — only re-renders", async () => {
+    const withOrigin = {
+      ...status,
+      recipe: { networkLabel: "ExampleNet", targetOrigin: "https://network.example.com" },
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : m.type === "scanNow" ? { ok: true } : withOrigin,
+    );
+    const request = vi.fn(async () => false); // user dismissed the prompt
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { request, contains: vi.fn(async () => false) },
+    };
+
+    await init(document);
     sendMessage.mockClear();
     document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
     await new Promise((r) => setTimeout(r, 0));
