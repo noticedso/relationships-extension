@@ -134,19 +134,25 @@ describe("service worker", () => {
     expect(res.lastScanAt).toBeNull();
   });
 
-  it("4. scanNow with no cookie -> needs network-signin, fetch not called", async () => {
+  it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
     const chrome = getChrome();
     await pair();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue(null);
     const fetchSpy = vi.fn();
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
 
+    // Cause B: scanNow sets the scan state synchronously + acks {ok:true}, then
+    // drives continueScan without blocking; a missing network session resolves in
+    // the background (clears state, sets needs:network-signin), never fetching.
     const res = (await dispatchInternal({ type: "scanNow" })) as Record<string, unknown>;
-    expect(res.needs).toBe("network-signin");
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ ok: true });
+    await settle();
 
+    expect(fetchSpy).not.toHaveBeenCalled();
     const stored = await chrome.storage.local.get(null);
     expect(stored.needs).toBe("network-signin");
+    expect(stored.scanInProgress ?? false).toBe(false);
   });
 
   it("5. runScan with cookie caches pendingScan + opens handoff tab", async () => {
@@ -440,12 +446,15 @@ describe("service worker", () => {
     const clearAlarm = vi.spyOn(chrome.alarms, "clear");
     (globalThis as unknown as { fetch: typeof fetch }).fetch =
       makeFullThenShortFetch(1) as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
 
     const res = (await dispatchInternal({ type: "scanNow" })) as Record<string, unknown>;
     expect(res).toMatchObject({ ok: true });
 
-    // armed a short keepalive tick alarm
+    // armed a short keepalive tick alarm SYNCHRONOUSLY (before the ack, Cause B)
     expect(createAlarm).toHaveBeenCalledWith("scan-tick", { periodInMinutes: 0.5 });
+    // the scan drives async after the ack — let it run to completion
+    await settle();
 
     const stored = await chrome.storage.local.get(null);
     // finished → pendingScans set, scan state cleared, handoff state set
@@ -689,5 +698,237 @@ describe("service worker", () => {
     // local is newer → keep it
     expect(stored.lastScanAt).toBe(newer);
     expect(stored.lastScanCount).toBe(500);
+  });
+
+  // ── NT-66 auto-scan on pair + scan-twice fix (Cause B) ──────────────────────
+
+  it("26. pair auto-scans every source whose host permission is already granted (reconnect needs no click)", async () => {
+    const chrome = getChrome();
+    // permission already granted + a valid network session BEFORE pairing
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = makeFullThenShortFetch(1);
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    await pair();
+    await settle(); // let the fire-and-forget auto-scan run
+
+    // the granted source was scanned with no manual click → a pending scan exists
+    expect(fetchSpy).toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(pendingConns(stored).length).toBeGreaterThan(0);
+    expect(stored.needs).toBe("noticed-signin");
+  });
+
+  it("26b. pair does NOT auto-scan when no host permission is granted (first-time user)", async () => {
+    const chrome = getChrome();
+    // contains defaults to false in the mock; cookies present but irrelevant
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn();
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    await pair();
+    await settle();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans ?? null).toBeNull();
+  });
+
+  it("27. scanNow sets scanInProgress + arms the tick SYNCHRONOUSLY and acks before the CSRF cookie round-trip (Cause B)", async () => {
+    const chrome = getChrome();
+    await pair();
+    // freeze the scan at buildCsrfHeaders so we can observe the state set BEFORE it.
+    let releaseCookie: () => void = () => {};
+    vi.spyOn(chrome.cookies, "get").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          releaseCookie = () => resolve({ name: "tok", value: "abc" });
+        }),
+    );
+    const createAlarm = vi.spyOn(chrome.alarms, "create");
+    (globalThis as unknown as { fetch: typeof fetch }).fetch =
+      makeFullThenShortFetch(1) as unknown as typeof fetch;
+
+    const res = (await dispatchInternal({ type: "scanNow" })) as Record<string, unknown>;
+    expect(res).toMatchObject({ ok: true });
+    // armed synchronously — before the (still-pending) cookie read resolves
+    expect(createAlarm).toHaveBeenCalledWith("scan-tick", { periodInMinutes: 0.5 });
+
+    // a getStatus right after the ack already sees scanning:true (poller won't bail)
+    const mid = (await dispatchInternal({ type: "getStatus" })) as Record<string, unknown>;
+    expect(mid.scanning).toBe(true);
+    expect(mid.scanningSource).toBe("linkedin_extension");
+
+    // now let the frozen scan proceed to completion
+    releaseCookie();
+    await new Promise((r) => setTimeout(r, 25));
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress ?? false).toBe(false);
+    expect(pendingConns(stored).length).toBeGreaterThan(0);
+  });
+
+  // ── NT-63 owner-profile pass (LinkedIn) + tweets pass (X) ────────────────────
+
+  it("28. LinkedIn owner-profile pass fetches the recipe endpoints ({self} interpolated) and threads raw JSON as ownerProfile", async () => {
+    const chrome = getChrome();
+    const opRecipe = {
+      ...recipe,
+      ownerProfile: {
+        selfIdSource: { listPathTemplate: "/voyager/api/me", idPath: "miniProfile.publicIdentifier" },
+        endpoints: [{ key: "profileView", pathTemplate: "/voyager/api/identity/profiles/{self}/profileView" }],
+      },
+    };
+    await dispatchExternal({ type: "pair", recipe: opRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { publicIdentifier: "me-vanity" } }) } as Response;
+      if (url.includes("/profileView"))
+        return { ok: true, json: async () => ({ profile: { firstName: "Jane" } }) } as Response;
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const payload = (stored.pendingScans as Record<string, { payload: Record<string, unknown> }>).linkedin_extension.payload;
+    expect(payload.ownerProfile).toEqual({ profileView: { profile: { firstName: "Jane" } } });
+    // {self} was interpolated with the id resolved from selfIdSource.idPath
+    expect(fetchImpl).toHaveBeenCalledWith(
+      expect.stringContaining("/profiles/me-vanity/profileView"),
+      expect.anything(),
+    );
+    // connections still imported normally alongside the best-effort owner pass
+    expect(pendingConns(stored).length).toBe(2);
+  });
+
+  it("28b. a failing owner-profile pass does NOT fail the connections import (best-effort)", async () => {
+    const chrome = getChrome();
+    const opRecipe = {
+      ...recipe,
+      ownerProfile: {
+        selfIdSource: { listPathTemplate: "/voyager/api/me", idPath: "miniProfile.publicIdentifier" },
+        endpoints: [{ key: "profileView", pathTemplate: "/voyager/api/identity/profiles/{self}/profileView" }],
+      },
+    };
+    await dispatchExternal({ type: "pair", recipe: opRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me")) throw new Error("me endpoint down");
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+    const stored = await chrome.storage.local.get(null);
+    const payload = (stored.pendingScans as Record<string, { payload: Record<string, unknown> }>).linkedin_extension.payload;
+    expect(pendingConns(stored).length).toBe(2); // connections survived
+    expect("ownerProfile" in payload).toBe(false); // failed pass → key omitted
+  });
+
+  it("29. X tweets pass resolves self from the twid cookie, pages via max_id, and rides along as `mentions` (no text)", async () => {
+    const chrome = getChrome();
+    const xRecipe = {
+      source: "x",
+      ingestPath: "/api/x/import/extension",
+      networkLabel: "X",
+      targetOrigin: "https://x.com",
+      listPathTemplate: "/friends?cursor={cursor}",
+      paginationParams: { pageSize: 2 },
+      cursorPath: "next_cursor_str",
+      pacing: { maxPagesPerSession: 5, minDelayMs: 0, maxDelayMs: 0 },
+      csrfRule: { header: "x-csrf-token", cookie: "ct0" },
+      staticHeaders: { authorization: "Bearer x" },
+      fieldMap: { elementsPath: "users", firstName: "name", lastName: "", profileUrl: "screen_name", headline: "d", externalId: "id_str" },
+      connectionLists: [
+        { listPathTemplate: "/friends?cursor={cursor}", cursorPath: "next_cursor_str" },
+        { listPathTemplate: "/followers?cursor={cursor}", cursorPath: "next_cursor_str" },
+      ],
+      intersectConnections: true,
+      tweets: {
+        listPathTemplate: "/statuses/user_timeline.json?user_id={self}&count=2&max_id={cursor}",
+        pageSize: 2,
+        selfIdCookie: { name: "twid", pattern: "u=([0-9]+)" },
+        maxPagesPerSession: 5,
+        tweetFieldMap: {
+          mode: "tweetEdges",
+          tweetIdPath: "id_str",
+          createdAtPath: "created_at",
+          inReplyToUserIdPath: "in_reply_to_user_id_str",
+          inReplyToScreenNamePath: "in_reply_to_screen_name",
+          userMentionsPath: "entities.user_mentions",
+          mentionIdPath: "id_str",
+          mentionScreenNamePath: "screen_name",
+          mentionNamePath: "name",
+        },
+      },
+    };
+    await dispatchExternal({ type: "pair", recipe: xRecipe, account }, noticedSender);
+
+    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }: { url: string; name: string }) => {
+      if (name === "ct0") return { name, value: "csrf" };
+      if (name === "twid") return { name, value: "u=555" };
+      return null;
+    });
+
+    const timelineUrls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/friends") || url.includes("/followers"))
+        return { ok: true, json: async () => ({ users: [{ id_str: "2", name: "Bob", screen_name: "bob", d: "" }], next_cursor_str: "0" }) } as Response;
+      if (url.includes("/user_timeline")) {
+        timelineUrls.push(url);
+        if (timelineUrls.length === 1)
+          return {
+            ok: true,
+            json: async () => [
+              { id_str: "20", created_at: "2026-06-20T10:30:00.000Z", full_text: "SECRET", in_reply_to_user_id_str: null, entities: { user_mentions: [{ id_str: "77", screen_name: "kate", name: "Kate" }] } },
+              { id_str: "10", created_at: "2026-06-20T09:00:00.000Z", full_text: "SECRET", in_reply_to_user_id_str: "88", in_reply_to_screen_name: "leo", entities: { user_mentions: [] } },
+            ],
+          } as Response;
+        return { ok: true, json: async () => [] } as Response; // short page → stop
+      }
+      return { ok: false } as Response;
+    });
+
+    const res = await sw.runScan("x", {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const payload = (stored.pendingScans as Record<string, { payload: Record<string, unknown> }>).x.payload;
+    expect(payload.mentions).toEqual([
+      { tweetId: "20", createdAt: "2026-06-20T10:30:00.000Z", isReply: false, mentionedUserId: "77", mentionedScreenName: "kate", mentionedName: "Kate" },
+      { tweetId: "10", createdAt: "2026-06-20T09:00:00.000Z", isReply: true, inReplyToUserId: "88", inReplyToScreenName: "leo", mentionedUserId: "", mentionedScreenName: "", mentionedName: "" },
+    ]);
+    // self resolved from twid (u=555); page 2 paginated via max_id = min(id)-1 = 9
+    expect(timelineUrls[0]).toContain("user_id=555");
+    expect(timelineUrls[1]).toContain("max_id=9");
+    expect(JSON.stringify(payload.mentions)).not.toContain("SECRET");
   });
 });

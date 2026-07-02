@@ -5,7 +5,18 @@
  * parts (X mutual-follow intersection, per-source payload shape) are unit-tested.
  */
 import type { ScanConnection, ScanMessage } from "./recipe";
+import type { XTweetEdgeRow } from "./message-extract";
 import type { ScanRecipe } from "./storage";
+
+/**
+ * Best-effort side-pass outputs threaded into the final payload (NT-63):
+ * the owner's own profile JSON (LinkedIn) and the owner's tweet edge rows (X).
+ * Both are optional — a failed side-pass never blocks the connections import.
+ */
+export type ScanExtras = {
+  ownerProfile?: Record<string, unknown>;
+  tweetEdges?: XTweetEdgeRow[];
+};
 
 /** One step of a scan: a connection list to walk, or the messages pass. */
 export type Phase =
@@ -67,6 +78,7 @@ export function assembleScanPayload(
   connLists: ScanConnection[][],
   messages: ScanMessage[],
   selfId: string,
+  extras: ScanExtras = {},
 ): { ingestPath: string; payload: Record<string, unknown>; count: number } {
   const connections =
     recipe.intersectConnections && connLists.length >= 2
@@ -85,16 +97,27 @@ export function assembleScanPayload(
       lastMessageAt: m.lastMessageAt,
       direction: m.direction,
     }));
+    // Owner-tweet mention/reply edges (NT-63) ride along as `mentions` — the
+    // server maps them into interaction signal. Always present (empty by default)
+    // so the ingest shape is stable.
+    const mentions = extras.tweetEdges ?? [];
     return {
       ingestPath,
-      payload: { source, mutuals, messages: msgs, ownerAccountId: selfId },
+      payload: { source, mutuals, messages: msgs, mentions, ownerAccountId: selfId },
       count: mutuals.length + msgs.length,
     };
   }
 
+  // Owner-profile raw JSON (NT-63) rides along only when the pass produced it,
+  // so the LinkedIn ingest shape is unchanged when the recipe has no ownerProfile.
   return {
     ingestPath,
-    payload: { source, connections, messages },
+    payload: {
+      source,
+      connections,
+      messages,
+      ...(extras.ownerProfile !== undefined ? { ownerProfile: extras.ownerProfile } : {}),
+    },
     count: connections.length,
   };
 }

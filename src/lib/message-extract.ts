@@ -54,13 +54,117 @@ export type ParticipantConversationsFieldMap = {
   counterpartUrlPrefix?: string;
 };
 
+/**
+ * Owner-timeline EDGE extraction (NT-63, X). A tweet carries who the owner
+ * @-mentioned and who they replied to — relationship signal, never the text.
+ * Paths are tweet-relative (`userMentionsPath` points at the mentions array,
+ * the `mention*Path`s are mention-relative).
+ */
+export type TweetEdgesFieldMap = {
+  mode: "tweetEdges";
+  /** Path to the tweets array; absent → the page IS the array (user_timeline). */
+  tweetsPath?: string;
+  tweetIdPath: string;
+  createdAtPath: string;
+  inReplyToUserIdPath: string;
+  inReplyToScreenNamePath: string;
+  userMentionsPath: string;
+  mentionIdPath: string;
+  mentionScreenNamePath: string;
+  mentionNamePath: string;
+};
+
 export type AnyMessageFieldMap =
   | MessageFieldMap
   | DmEntriesFieldMap
   | ParticipantConversationsFieldMap;
 
+/**
+ * A single owner→other EDGE derived from one of the owner's tweets. METADATA
+ * ONLY — the tweet text is never read or returned. One row per @-mention, plus
+ * a reply-marker row per reply tweet (isReply=true, empty mention fields).
+ */
+export type XTweetEdgeRow = {
+  tweetId: string;
+  createdAt: string; // ISO 8601
+  isReply: boolean;
+  inReplyToUserId?: string;
+  inReplyToScreenName?: string;
+  mentionedUserId: string;
+  mentionedScreenName: string;
+  mentionedName: string;
+};
+
 function str(v: unknown): string {
   return v === null || v === undefined ? "" : String(v);
+}
+
+/** The raw tweet array on a timeline page: the page itself, or `tweetsPath`. */
+export function tweetsArrayOf(page: unknown, fieldMap: TweetEdgesFieldMap): unknown[] {
+  if (Array.isArray(page)) return page;
+  if (fieldMap.tweetsPath) {
+    const raw = getByPath(page, fieldMap.tweetsPath);
+    if (Array.isArray(raw)) return raw;
+  }
+  return [];
+}
+
+/**
+ * X owner timeline → mention/reply EDGE rows (NT-63). For every tweet: one row
+ * per `user_mentions[]` entry (isReply=false), plus — when the tweet is a reply
+ * — a reply-marker row (isReply=true) carrying the in-reply-to ids with the
+ * mention fields left empty. Never reads or returns the tweet body.
+ */
+export function extractTweetEdges(
+  page: unknown,
+  fieldMap: TweetEdgesFieldMap,
+): XTweetEdgeRow[] {
+  const tweets = tweetsArrayOf(page, fieldMap);
+  const out: XTweetEdgeRow[] = [];
+  for (const tw of tweets) {
+    const tweetId = str(getByPath(tw, fieldMap.tweetIdPath));
+    if (tweetId === "") continue;
+    const createdAt = toIso(getByPath(tw, fieldMap.createdAtPath));
+    if (!createdAt) continue;
+
+    const inReplyToUserId = str(getByPath(tw, fieldMap.inReplyToUserIdPath));
+    const inReplyToScreenName = str(getByPath(tw, fieldMap.inReplyToScreenNamePath));
+    const isReply = inReplyToUserId !== "" || inReplyToScreenName !== "";
+
+    // One edge per @-mention.
+    const mentionsRaw = getByPath(tw, fieldMap.userMentionsPath);
+    const mentions = Array.isArray(mentionsRaw) ? mentionsRaw : [];
+    for (const mention of mentions) {
+      const mentionedUserId = str(getByPath(mention, fieldMap.mentionIdPath));
+      const mentionedScreenName = str(getByPath(mention, fieldMap.mentionScreenNamePath));
+      const mentionedName = str(getByPath(mention, fieldMap.mentionNamePath));
+      if (mentionedUserId === "" && mentionedScreenName === "") continue;
+      out.push({
+        tweetId,
+        createdAt,
+        isReply: false,
+        mentionedUserId,
+        mentionedScreenName,
+        mentionedName,
+      });
+    }
+
+    // A reply-marker so the owner→repliedTo edge is explicit even if the
+    // replied-to account is absent from user_mentions.
+    if (isReply) {
+      out.push({
+        tweetId,
+        createdAt,
+        isReply: true,
+        inReplyToUserId,
+        inReplyToScreenName,
+        mentionedUserId: "",
+        mentionedScreenName: "",
+        mentionedName: "",
+      });
+    }
+  }
+  return out;
 }
 
 /** X DM inbox: group message events by conversation; last message per convo. */
