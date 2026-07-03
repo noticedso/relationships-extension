@@ -166,11 +166,7 @@ function networkList(status: Status): string {
 // actually does, naming the paired networks.
 function grantExplainerText(status: Status): string {
   const list = networkList(status);
-  return (
-    `“grant access” lets this extension read your ${list} connections and profiles — ` +
-    `names, headlines, and profile links — and hand them to your signed-in noticed tab. ` +
-    `it's a one-time browser permission, and you can revoke it anytime.`
-  );
+  return `“grant access” lets this extension read your ${list} connections and profiles: names, headlines, and profile links.`;
 }
 
 function setText(root: Document | HTMLElement, id: string, text: string): void {
@@ -439,11 +435,21 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     const next = scanBtn.cloneNode(true) as HTMLButtonElement;
     scanBtn.replaceWith(next);
     const spinner = root.querySelector<HTMLElement>("#scan-spinner");
-    // The grant-access explainer is shown ONLY in the grant state; default it hidden.
+    // The grant state leads with a prominent CTA + explainer and hides the
+    // "next scan / no sync yet" status lines (noise before the first sync). Reset
+    // to the default (lines shown, no CTA emphasis, explainer hidden) each render.
     const explainer = root.querySelector<HTMLElement>("#grant-explainer");
+    const nextScan = root.querySelector<HTMLElement>("#next-scan");
+    const lastScan = root.querySelector<HTMLElement>("#last-scan");
     if (explainer) explainer.hidden = true;
+    if (nextScan) nextScan.hidden = false;
+    if (lastScan) lastScan.hidden = false;
+    next.classList.remove("grant-cta");
     if (!granted && grantPatterns.length > 0) {
       next.textContent = "grant access";
+      next.classList.add("grant-cta");
+      if (nextScan) nextScan.hidden = true;
+      if (lastScan) lastScan.hidden = true;
       if (explainer) {
         explainer.textContent = grantExplainerText(status);
         explainer.hidden = false;

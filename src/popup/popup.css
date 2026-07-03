@@ -281,12 +281,21 @@ body {
   margin-top: 4px;
 }
 
-/* grant-access explainer — spells out the one-time permission in the status card */
+/* grant-access explainer — spells out the one-time permission, shown below the
+   prominent CTA in the status card */
 .grant-explainer:empty {
   display: none;
 }
 .grant-explainer {
-  margin-top: 4px;
+  margin-top: 8px;
+}
+
+/* prominent "grant access" CTA: full-width, taller, larger label — the primary
+   action in the grant stage (where the status lines are hidden). */
+.btn-brand.grant-cta {
+  width: 100%;
+  padding: 11px 16px;
+  font-size: var(--text-title-sm);
 }
 
 /* recent syncs */

@@ -31,10 +31,6 @@
       <section class="card status">
         <p id="next-scan" class="status-line"></p>
         <p id="last-scan" class="status-sub"></p>
-        <!-- Shown ONLY in the "grant access" state (populated by popup.ts): spells
-             out what the one-time host permission actually lets the extension do,
-             naming the paired networks from runtime status (never hard-coded). -->
-        <p id="grant-explainer" class="status-sub grant-explainer" hidden></p>
         <div class="actions">
           <button id="scan-now" type="button" class="btn-brand">scan now</button>
           <span id="scan-spinner" class="spinner" hidden aria-hidden="true"></span>
@@ -45,6 +41,10 @@
             <span>test mode — only 2 requests</span>
           </label>
         </div>
+        <!-- Shown ONLY in the "grant access" state (populated by popup.ts), BELOW
+             the CTA: spells out what the one-time host permission lets the
+             extension do, naming the paired networks from runtime status. -->
+        <p id="grant-explainer" class="status-sub grant-explainer" hidden></p>
       </section>
 
       <p id="needs" class="needs"></p>
