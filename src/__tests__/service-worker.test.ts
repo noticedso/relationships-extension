@@ -931,4 +931,62 @@ describe("service worker", () => {
     expect(timelineUrls[1]).toContain("max_id=9");
     expect(JSON.stringify(payload.mentions)).not.toContain("SECRET");
   });
+
+  // ── Grant → scan via permissions.onAdded (popup dismissed by the prompt) ──────
+
+  it("30. permissions.onAdded auto-scans the newly-granted source so grant → sync completes even when the prompt dismissed the popup (no scanNow)", async () => {
+    const chrome = getChrome();
+    await pair(); // first-time user: no host permission yet → pair does NOT auto-scan (26b)
+    // The user approves "grant access": the network session is present and the
+    // host permission now contains — but the popup that requested it was closed
+    // by the permission prompt, so it never sent scanNow.
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const fetchSpy = makeFullThenShortFetch(1);
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    // Chrome fires onAdded on the grant regardless of the popup's fate.
+    chrome.permissions.onAdded.dispatch({ origins: [recipe.targetOrigin + "/*"] });
+    await settle();
+
+    // the service worker (durable context) picked it up and ran the scan
+    expect(fetchSpy).toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(pendingConns(stored).length).toBeGreaterThan(0);
+    expect(stored.needs).toBe("noticed-signin");
+  });
+
+  it("31. permissions.onAdded ignores an origin that matches no paired source", async () => {
+    const chrome = getChrome();
+    await pair();
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn();
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    chrome.permissions.onAdded.dispatch({ origins: ["https://unrelated.example/*"] });
+    await settle();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans ?? null).toBeNull();
+  });
+
+  it("32. permissions.onAdded does not start a second scan when one is already in progress (popup path already ran scanNow)", async () => {
+    const chrome = getChrome();
+    await pair();
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = makeFullThenShortFetch(1);
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    // A scan is already mid-flight (the popup survived and sent scanNow).
+    await chrome.storage.local.set(inProgress());
+    chrome.permissions.onAdded.dispatch({ origins: [recipe.targetOrigin + "/*"] });
+    await settle();
+
+    // onAdded must not clobber the in-flight checkpoint by re-initializing a scan.
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
 });

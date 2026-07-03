@@ -52,6 +52,7 @@ export interface ChromeMock {
   permissions: {
     request: (permissions: unknown) => Promise<boolean>;
     contains: (permissions: unknown) => Promise<boolean>;
+    onAdded: FakeEvent<[{ origins?: string[]; permissions?: string[] }]>;
   };
   tabs: {
     create: (createProperties: { url?: string; active?: boolean }) => Promise<{ id: number; url?: string }>;
@@ -109,6 +110,7 @@ function createChromeMock(): ChromeMock {
       async contains(_permissions: unknown): Promise<boolean> {
         return false;
       },
+      onAdded: createEvent(),
     },
     tabs: {
       async create(createProperties: { url?: string; active?: boolean }): Promise<{ id: number; url?: string }> {
