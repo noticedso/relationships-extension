@@ -254,7 +254,6 @@ describe("service worker", () => {
 
   it("9. alarm is throttled within the period and runs once the period has elapsed", async () => {
     const chrome = getChrome();
-    await pair();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     // The monthly alarm auto-scans every source whose host permission is granted.
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
@@ -264,8 +263,13 @@ describe("service worker", () => {
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
     const settle = () => new Promise((r) => setTimeout(r, 25));
 
-    // a scan ran moments ago → an alarm fire is a duplicate/catch-up → skip it
+    // A scan ran moments ago → pairing is itself throttled (shared with the alarm).
     await chrome.storage.local.set({ lastScanStartedAt: Date.now() });
+    await pair();
+    await settle();
+    fetchSpy.mockClear(); // isolate the alarm from any pair-path activity
+
+    // an alarm fire is now a duplicate/catch-up within the period → skip it
     chrome.alarms.onAlarm.dispatch({ name: "scan" });
     await settle();
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -735,6 +739,32 @@ describe("service worker", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     const stored = await chrome.storage.local.get(null);
     expect(stored.pendingScans ?? null).toBeNull();
+  });
+
+  it("26c. pair auto-scan respects the scan throttle — a recipe-refresh re-pair right after a scan does NOT re-scan (prevents the /x/sync → re-pair → scan loop)", async () => {
+    const chrome = getChrome();
+    // Host granted + a valid session, exactly as when the /x/sync handoff page
+    // (SyncBroker) re-pairs after a finished scan to refresh the served recipe.
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    // A valid (empty) response so the buggy path fully scans rather than throwing
+    // — the only signal we assert on is whether fetch was called at all.
+    const fetchSpy = vi.fn(
+      async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response,
+    );
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    // A scan finalized moments ago (finalizeScan stamps lastScanStartedAt).
+    await chrome.storage.local.set({ lastScanStartedAt: Date.now() });
+
+    await pair(); // the SyncBroker recipe-refresh re-pair
+    await settle();
+
+    // Throttled just like the monthly alarm → no re-scan. Otherwise the re-pair
+    // scans → finalizes → opens another /x/sync tab → re-pairs → scans …, an
+    // unbounded loop that hammers LinkedIn/X (account-ban risk).
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("27. scanNow sets scanInProgress + arms the tick SYNCHRONOUSLY and acks before the CSRF cookie round-trip (Cause B)", async () => {

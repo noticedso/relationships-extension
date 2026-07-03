@@ -605,6 +605,24 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
   return continueScan(deps);
 }
 
+/**
+ * Auto-scan every source whose host permission is already granted, at most once
+ * per throttle window. The SHARED path for the monthly alarm AND auto-scan-on-
+ * pair (NT-66) — a single implementation so the two can never drift.
+ *
+ * The `lastScanStartedAt` throttle is load-bearing for the pair path: the /x/sync
+ * handoff page (SyncBroker) re-pairs after EVERY finished scan to refresh the
+ * served recipe. Without the throttle that re-pair re-runs a full scan, which
+ * finalizes → opens another /x/sync tab → re-pairs → scans …, an unbounded loop
+ * that continuously hammers LinkedIn/X (account-ban risk). A user gesture
+ * (scanNow) deliberately bypasses this.
+ */
+async function autoScanGrantedSources(): Promise<void> {
+  const state = await getState();
+  if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
+  for (const src of await grantedSources(recipesOf(state))) await runScan(src);
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async function handleExternal(
@@ -631,13 +649,13 @@ async function handleExternal(
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
       sendResponse({ ok: true });
       // NT-66 auto-scan on pair: import the already-granted sources immediately so
-      // a reconnect syncs with no manual click (mirrors the monthly-alarm path).
-      // First-time users (no host permission yet) can't be scanned from the SW —
-      // no user gesture here — so the popup's grant handler kicks that off. Fire-
-      // and-forget so the connect page's ack isn't blocked on the scan.
-      void (async () => {
-        for (const src of await grantedSources(recipes)) await runScan(src);
-      })();
+      // a reconnect syncs with no manual click. This TRULY mirrors the monthly-
+      // alarm path — including its throttle — via the shared helper, so the
+      // /x/sync recipe-refresh re-pair (SyncBroker) can't re-trigger a scan loop.
+      // First-time users (no host permission yet) are scanned by the popup's grant
+      // gesture / permissions.onAdded instead. Fire-and-forget so the connect
+      // page's ack isn't blocked on the scan.
+      void autoScanGrantedSources();
       return;
     }
     case "getCachedScan": {
@@ -859,13 +877,7 @@ export function registerListeners(): void {
       return;
     }
     if (alarm.name !== SCAN_ALARM) return;
-    void (async () => {
-      const state = await getState();
-      if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
-      // Auto-scan every source whose host permission is already granted.
-      const granted = await grantedSources(recipesOf(state));
-      for (const src of granted) await runScan(src);
-    })();
+    void autoScanGrantedSources();
   });
 
   // Grant → scan. When the user approves "grant access", Chrome commonly
