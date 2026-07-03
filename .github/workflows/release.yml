@@ -1,11 +1,29 @@
 name: release
 
-# Tag a version (v1.0.0) to build a verifiable release: tests → deterministic
-# build → zip → SHA-256 → GitHub Release with the .zip + hash attached.
+# Three ways in:
+#   1. Push a version tag (v1.0.0) by hand — the explicit release path.
+#   2. Called by auto-tag.yml (workflow_call) right after it pushes the tag for a
+#      manifest.json version bump merged to main — the automatic path.
+#   3. workflow_dispatch with a tag — manual recovery lever (re-release an existing
+#      tag from the Actions UI if a run failed after the tag was created).
+# Either way: tests -> deterministic build -> zip -> SHA-256 -> GitHub Release with
+# the .zip + hash attached -> publish to the Chrome Web Store.
 on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Version tag to release (e.g. v1.2.0)"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to release (e.g. v1.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -18,13 +36,29 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - name: Resolve release tag + version
+        id: meta
+        run: |
+          # workflow_call / workflow_dispatch pass the tag as an input; a manual tag
+          # push carries it in GITHUB_REF_NAME.
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "Refusing to release: '$TAG' is not a v-prefixed tag"; exit 1 ;;
+          esac
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
       - run: npm ci
       - run: npx vitest run
       - run: node build.mjs
       - name: Package + hash
         id: pkg
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           ZIP="noticed-relationships-${VERSION}.zip"
           (cd dist && zip -rqX "../${ZIP}" .)
           # Stable-named copy so releases/latest/download/noticed-relationships.zip
@@ -37,7 +71,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
           body: |
             Reproducible build of the noticed Relationships extension.
 

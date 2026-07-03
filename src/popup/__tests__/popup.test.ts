@@ -234,8 +234,8 @@ describe("popup", () => {
     expect(document.getElementById("what-we-fetch")!.textContent).toContain("professional network");
   });
 
-  const LATEST_DOWNLOAD =
-    "https://github.com/noticedso/relationships-extension/releases/latest/download/noticed-relationships.zip";
+  const WEB_STORE_URL =
+    "https://chromewebstore.google.com/detail/noticed%20Relationships/hjckpjgbhjichgkbmgjfbbdibchghdaf";
 
   function chromeWithManifest(version: string) {
     const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : status));
@@ -249,7 +249,7 @@ describe("popup", () => {
     };
   }
 
-  it("#1: reveals the update notice (with download href) when a newer release exists", async () => {
+  it("#1: reveals the update notice (linking to the Chrome Web Store) when a newer release exists", async () => {
     (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
     globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
 
@@ -258,7 +258,7 @@ describe("popup", () => {
 
     const notice = document.getElementById("update-notice") as HTMLAnchorElement;
     expect(notice.hidden).toBe(false);
-    expect(notice.getAttribute("href")).toBe(LATEST_DOWNLOAD);
+    expect(notice.getAttribute("href")).toBe(WEB_STORE_URL);
   });
 
   it("#1: keeps the update notice hidden when the installed version is current", async () => {
@@ -601,7 +601,7 @@ describe("popup", () => {
     expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
   });
 
-  it("E6: the update notice lives in the footer alongside the version, and reveals (with download href) when behind", async () => {
+  it("E6: the update notice lives in the footer alongside the version, and reveals (linking to the Chrome Web Store) when behind", async () => {
     (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
     globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
 
@@ -612,7 +612,7 @@ describe("popup", () => {
     const notice = document.getElementById("update-notice") as HTMLAnchorElement;
     expect(version.textContent).toBe("v1.0.2");
     expect(notice.hidden).toBe(false);
-    expect(notice.getAttribute("href")).toBe(LATEST_DOWNLOAD);
+    expect(notice.getAttribute("href")).toBe(WEB_STORE_URL);
     // the update notice and the version share a footer container (bottom of panel)
     expect(notice.parentElement).toBe(version.parentElement);
   });

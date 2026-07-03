@@ -1,0 +1,53 @@
+name: auto-tag
+
+# When a manifest.json version bump lands on main, tag it v<version> and run the
+# release. Closes the gap where a merged version sat un-submitted because nobody
+# pushed the tag by hand (v1.1.0 and v1.2.0 both slipped through that way).
+#
+# The tag is created with the default GITHUB_TOKEN, which by GitHub's anti-recursion
+# rule does NOT re-fire release.yml's tag-push trigger — so we invoke release.yml
+# directly as a reusable workflow (secrets: inherit). No PAT, exactly one release.
+on:
+  push:
+    branches: [main]
+    paths: ["manifest.json"]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.tag.outputs.created }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Tag the manifest version if it has no tag yet
+        id: tag
+        run: |
+          VERSION="$(node -p "require('./manifest.json').version")"
+          TAG="v${VERSION}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists — nothing to do."
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push origin "${TAG}"
+          echo "Created and pushed ${TAG}."
+          echo "created=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: tag
+    if: ${{ needs.tag.outputs.created == 'true' }}
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    secrets: inherit
