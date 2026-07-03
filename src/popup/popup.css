@@ -249,6 +249,46 @@ body {
   color: var(--content-tertiary);
 }
 
+/* collapsible disclaimers (native <details>): the summary is the tappable title
+   with a caret that rotates open; the body reveals below when expanded. */
+.disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.disclosure > summary::after {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 2px;
+  border-right: 1.5px solid var(--content-tertiary);
+  border-bottom: 1.5px solid var(--content-tertiary);
+  transform: rotate(45deg);
+  transition: transform var(--transition);
+}
+.disclosure[open] > summary::after {
+  transform: rotate(-135deg);
+}
+.disclosure[open] > .block-body {
+  margin-top: 4px;
+}
+
+/* grant-access explainer — spells out the one-time permission in the status card */
+.grant-explainer:empty {
+  display: none;
+}
+.grant-explainer {
+  margin-top: 4px;
+}
+
 /* recent syncs */
 .sync-list {
   list-style: none;

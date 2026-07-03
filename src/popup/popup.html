@@ -31,6 +31,10 @@
       <section class="card status">
         <p id="next-scan" class="status-line"></p>
         <p id="last-scan" class="status-sub"></p>
+        <!-- Shown ONLY in the "grant access" state (populated by popup.ts): spells
+             out what the one-time host permission actually lets the extension do,
+             naming the paired networks from runtime status (never hard-coded). -->
+        <p id="grant-explainer" class="status-sub grant-explainer" hidden></p>
         <div class="actions">
           <button id="scan-now" type="button" class="btn-brand">scan now</button>
           <span id="scan-spinner" class="spinner" hidden aria-hidden="true"></span>
@@ -46,15 +50,18 @@
       <p id="needs" class="needs"></p>
       <button id="signin-cta" type="button" class="btn-brand" hidden>sign in to noticed</button>
 
-      <section class="block">
-        <h2 class="block-title">what we fetch</h2>
+      <!-- The two trust disclaimers are collapsed by default (native <details>) so
+           they don't dominate the panel — but stay one click away, fully present
+           for transparency. popup.ts still fills the bodies by id every render. -->
+      <details class="block disclosure">
+        <summary class="block-title">what we fetch</summary>
         <p id="what-we-fetch" class="block-body"></p>
-      </section>
+      </details>
 
-      <section class="block">
-        <h2 class="block-title">how it's kept private</h2>
+      <details class="block disclosure">
+        <summary class="block-title">how it's kept private</summary>
         <p id="privacy" class="block-body"></p>
-      </section>
+      </details>
 
       <section id="syncs" class="block">
         <h2 class="block-title">recent syncs</h2>

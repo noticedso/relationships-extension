@@ -142,6 +142,37 @@ function sourceOrigins(status: Status): string[] {
   return status.recipe?.targetOrigin ? [status.recipe.targetOrigin] : [];
 }
 
+/** Human network labels of every paired source, or the recipe's (legacy single). */
+function sourceLabels(status: Status): string[] {
+  if (status.sources && status.sources.length > 0) {
+    return status.sources.map((s) => s.networkLabel).filter((l): l is string => Boolean(l));
+  }
+  return status.recipe?.networkLabel ? [status.recipe.networkLabel] : [];
+}
+
+// A human, localized "A and B" join of the paired network labels, with a generic
+// fallback when none are known. Used by both the fetch disclosure and the grant
+// explainer so they name the same networks — always from runtime status (their
+// networkLabel), never a hard-coded platform literal, so the purity guard stays
+// green.
+function networkList(status: Status): string {
+  const labels = sourceLabels(status);
+  return labels.length > 0
+    ? new Intl.ListFormat(undefined, { style: "long", type: "conjunction" }).format(labels)
+    : "professional network";
+}
+
+// The "grant access" explainer: spell out what the one-time host permission
+// actually does, naming the paired networks.
+function grantExplainerText(status: Status): string {
+  const list = networkList(status);
+  return (
+    `“grant access” lets this extension read your ${list} connections and profiles — ` +
+    `names, headlines, and profile links — and hand them to your signed-in noticed tab. ` +
+    `it's a one-time browser permission, and you can revoke it anytime.`
+  );
+}
+
 function setText(root: Document | HTMLElement, id: string, text: string): void {
   const el = root.querySelector<HTMLElement>(`#${id}`);
   if (el) el.textContent = text;
@@ -271,11 +302,12 @@ function render(root: Document | HTMLElement, status: Status): void {
 
   setLastScanLine(root, status.lastScanAt ?? null, status.lastScanCount ?? null);
 
-  const label = status.recipe?.networkLabel ?? "professional network";
+  const list = networkList(status);
+  const listWord = sourceLabels(status).length > 1 ? "lists" : "list";
   setText(
     root,
     "what-we-fetch",
-    `we read your ${label} connection list — name, headline, profile link, ` +
+    `we read your ${list} connection ${listWord} — name, headline, profile link, ` +
       `connection date — as you, paced like a human, about once a month. ` +
       `we never read messages or anything else.`,
   );
@@ -407,8 +439,15 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     const next = scanBtn.cloneNode(true) as HTMLButtonElement;
     scanBtn.replaceWith(next);
     const spinner = root.querySelector<HTMLElement>("#scan-spinner");
+    // The grant-access explainer is shown ONLY in the grant state; default it hidden.
+    const explainer = root.querySelector<HTMLElement>("#grant-explainer");
+    if (explainer) explainer.hidden = true;
     if (!granted && grantPatterns.length > 0) {
       next.textContent = "grant access";
+      if (explainer) {
+        explainer.textContent = grantExplainerText(status);
+        explainer.hidden = false;
+      }
       next.addEventListener("click", () => {
         void (async () => {
           // A popup click is a user gesture, so chrome.permissions.request works
