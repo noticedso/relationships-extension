@@ -88,6 +88,24 @@ function sourceOf(recipe: ScanRecipe): string {
   return recipe.source ?? DEFAULT_SOURCE;
 }
 
+/**
+ * Does a just-granted host pattern (e.g. "https://www.linkedin.com/*" or the
+ * broader optional "*://*.linkedin.com/*") cover a source's target origin? Host
+ * suffix match, tolerant of a leading "*." wildcard — so a permissions.onAdded
+ * event can be mapped back to the paired source it unlocks.
+ */
+export function grantCovers(pattern: string, targetOrigin: string): boolean {
+  try {
+    const host = new URL(targetOrigin).hostname;
+    const patHost = /^[^:]+:\/\/([^/]+)/.exec(pattern)?.[1] ?? "";
+    const bare = patHost.replace(/^\*\./, "").replace(/^\*/, "");
+    if (!bare) return false;
+    return host === bare || host.endsWith("." + bare);
+  } catch {
+    return false;
+  }
+}
+
 /** Sources whose optional host permission the user has already granted. */
 async function grantedSources(
   recipes: Record<string, ScanRecipe>,
@@ -847,6 +865,27 @@ export function registerListeners(): void {
       // Auto-scan every source whose host permission is already granted.
       const granted = await grantedSources(recipesOf(state));
       for (const src of granted) await runScan(src);
+    })();
+  });
+
+  // Grant → scan. When the user approves "grant access", Chrome commonly
+  // DISMISSES the extension popup as the permission prompt appears, so the
+  // popup's own post-grant scanNow never runs — the grant would then sync
+  // nothing until the 30-day alarm. The service worker is the durable context:
+  // scan the newly-granted source(s) here so grant always completes a sync.
+  // Skip if a scan is already in flight (the popup survived and sent scanNow) so
+  // we never clobber an in-progress checkpoint.
+  chrome.permissions.onAdded.addListener((perms) => {
+    const added = perms?.origins ?? [];
+    if (added.length === 0) return;
+    void (async () => {
+      const state = await getState();
+      if (state.scanInProgress) return;
+      const recipes = recipesOf(state);
+      const targets = Object.entries(recipes)
+        .filter(([, r]) => added.some((o) => grantCovers(o, r.targetOrigin)))
+        .map(([src]) => src);
+      for (const src of targets) await runScan(src);
     })();
   });
 

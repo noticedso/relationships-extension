@@ -35,6 +35,7 @@ declare const chrome: {
   permissions: {
     request(permissions: { origins?: string[]; permissions?: string[] }): Promise<boolean>;
     contains(permissions: { origins?: string[]; permissions?: string[] }): Promise<boolean>;
+    onAdded: ChromeEvent<[{ origins?: string[]; permissions?: string[] }]>;
   };
   tabs: {
     create(createProperties: { url?: string; active?: boolean }): Promise<{ id?: number; url?: string }>;
