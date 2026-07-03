@@ -7,8 +7,11 @@
 
 const REPO_URL = "https://github.com/noticedso/relationships-extension";
 const LATEST_RELEASE_API = "https://api.github.com/repos/noticedso/relationships-extension/releases/latest";
-const LATEST_DOWNLOAD_URL =
-  "https://github.com/noticedso/relationships-extension/releases/latest/download/noticed-relationships.zip";
+// The "update available" notice sends users to the Chrome Web Store listing (the
+// canonical install/update surface), not the raw GitHub .zip — store installs
+// auto-update, and anyone behind gets the one-click store update from here.
+const WEB_STORE_URL =
+  "https://chromewebstore.google.com/detail/noticed%20Relationships/hjckpjgbhjichgkbmgjfbbdibchghdaf";
 
 // Numeric semver compare. Strips a leading "v", splits on ".", compares parts.
 // Returns >0 if a is newer than b, <0 if older, 0 if equal.
@@ -46,7 +49,7 @@ async function checkForUpdate(root: Document | HTMLElement): Promise<void> {
     const latest = data?.tag_name;
     if (!latest || typeof latest !== "string") return;
     if (compareSemver(latest, installed) > 0) {
-      notice.href = LATEST_DOWNLOAD_URL;
+      notice.href = WEB_STORE_URL;
       notice.hidden = false;
     }
   } catch {
