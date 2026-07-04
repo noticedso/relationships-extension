@@ -1,6 +1,6 @@
 {
   "name": "relationships-extension",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "private": true,
   "type": "module",
   "description": "Import your own professional connections into your relationships app.",

@@ -18,9 +18,9 @@
         <span class="product">Relationships</span>
       </header>
 
-      <section id="connect" class="connect" hidden>
-        <p class="connect-copy">connect to start importing your connections</p>
-        <button id="connect-cta" type="button" class="btn-brand">connect to noticed</button>
+      <section id="connect" class="card connect" hidden>
+        <button id="connect-cta" type="button" class="btn-brand btn-cta">connect to noticed</button>
+        <p class="status-sub">connect to start importing your connections</p>
       </section>
 
       <section id="account" class="card account">
@@ -29,10 +29,10 @@
       </section>
 
       <section class="card status">
-        <p id="next-scan" class="status-line"></p>
-        <p id="last-scan" class="status-sub"></p>
+        <!-- CTA leads the card (consistent with the connect + grant states); the
+             supporting copy sits BELOW it. -->
         <div class="actions">
-          <button id="scan-now" type="button" class="btn-brand">scan now</button>
+          <button id="scan-now" type="button" class="btn-brand btn-cta">scan now</button>
           <span id="scan-spinner" class="spinner" hidden aria-hidden="true"></span>
           <!-- Dev-only affordance: hidden by default; revealed by popup.ts only in
                local-development builds (__DEV__). Never shown in the published extension. -->
@@ -41,27 +41,39 @@
             <span>test mode — only 2 requests</span>
           </label>
         </div>
+        <!-- Both lines share the status-sub style; shown in the granted "scan now"
+             state, hidden in the grant stage. -->
+        <p id="next-scan" class="status-sub"></p>
+        <p id="last-scan" class="status-sub"></p>
+        <!-- Shown ONLY in the "grant access" state (populated by popup.ts), BELOW
+             the CTA: spells out what the one-time host permission lets the
+             extension do, naming the paired networks from runtime status. -->
+        <p id="grant-explainer" class="status-sub grant-explainer" hidden></p>
       </section>
 
       <p id="needs" class="needs"></p>
       <button id="signin-cta" type="button" class="btn-brand" hidden>sign in to noticed</button>
 
-      <section class="block">
-        <h2 class="block-title">what we fetch</h2>
-        <p id="what-we-fetch" class="block-body"></p>
-      </section>
-
-      <section class="block">
-        <h2 class="block-title">how it's kept private</h2>
-        <p id="privacy" class="block-body"></p>
-      </section>
-
-      <section id="syncs" class="block">
-        <h2 class="block-title">recent syncs</h2>
+      <!-- Recent syncs leads the disclosures and is OPEN by default (the most
+           useful "did it work?" info); the two trust disclaimers below are
+           collapsed by default but one click away. All three are native
+           <details>; popup.ts still fills them by id every render. -->
+      <details id="syncs" class="block disclosure" open>
+        <summary class="block-title">recent syncs</summary>
         <ul id="sync-list" class="sync-list"></ul>
         <p id="sync-empty" class="block-body" hidden>no syncs yet</p>
         <button id="sync-more" type="button" class="sync-more" hidden>show more</button>
-      </section>
+      </details>
+
+      <details class="block disclosure">
+        <summary class="block-title">what we fetch</summary>
+        <p id="what-we-fetch" class="block-body"></p>
+      </details>
+
+      <details class="block disclosure">
+        <summary class="block-title">how it's kept private</summary>
+        <p id="privacy" class="block-body"></p>
+      </details>
 
       <footer class="pop-footer">
         <a class="footer-link" href="https://noticed.so" target="_blank" rel="noreferrer noopener">noticed.so</a>

@@ -116,11 +116,7 @@ body {
 .status {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-}
-.status-line {
-  font-size: var(--text-row);
-  color: var(--content-secondary);
+  gap: 6px;
 }
 .status-sub {
   font-size: var(--text-label);
@@ -131,7 +127,6 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-top: 8px;
 }
 
 .btn-brand {
@@ -209,12 +204,7 @@ body {
 .connect {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 4px 0;
-}
-.connect-copy {
-  font-size: var(--text-row);
-  color: var(--content-secondary);
+  gap: 6px;
 }
 #signin-cta {
   align-self: flex-start;
@@ -247,6 +237,58 @@ body {
 .block-body {
   font-size: var(--text-row);
   color: var(--content-tertiary);
+}
+
+/* collapsible disclaimers (native <details>): the summary is the tappable title
+   with a caret that rotates open; the body reveals below when expanded. */
+.disclosure > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.disclosure > summary::after {
+  content: "";
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-right: 2px;
+  border-right: 1.5px solid var(--content-tertiary);
+  border-bottom: 1.5px solid var(--content-tertiary);
+  transform: rotate(45deg);
+  transition: transform var(--transition);
+}
+.disclosure[open] > summary::after {
+  transform: rotate(-135deg);
+}
+.disclosure[open] > .block-body {
+  margin-top: 4px;
+}
+
+/* grant-access explainer — spells out the one-time permission, shown below the
+   prominent CTA in the status card */
+.grant-explainer:empty {
+  display: none;
+}
+
+/* prominent primary CTA: full-width, taller, larger label. Shared by the
+   connect, scan, and grant-access buttons so they read identically. */
+.btn-brand.btn-cta {
+  width: 100%;
+  padding: 11px 16px;
+  font-size: var(--text-title-sm);
+}
+/* In the status card's action row the button fills the width but yields room
+   for the inline scan spinner when a scan is running. */
+.actions .btn-brand.btn-cta {
+  flex: 1;
+  width: auto;
 }
 
 /* recent syncs */
