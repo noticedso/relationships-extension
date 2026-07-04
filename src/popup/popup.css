@@ -116,11 +116,7 @@ body {
 .status {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-}
-.status-line {
-  font-size: var(--text-row);
-  color: var(--content-secondary);
+  gap: 6px;
 }
 .status-sub {
   font-size: var(--text-label);
@@ -131,7 +127,6 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-top: 8px;
 }
 
 .btn-brand {
@@ -209,12 +204,7 @@ body {
 .connect {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 4px 0;
-}
-.connect-copy {
-  font-size: var(--text-row);
-  color: var(--content-secondary);
+  gap: 6px;
 }
 #signin-cta {
   align-self: flex-start;
@@ -285,9 +275,6 @@ body {
    prominent CTA in the status card */
 .grant-explainer:empty {
   display: none;
-}
-.grant-explainer {
-  margin-top: 8px;
 }
 
 /* prominent primary CTA: full-width, taller, larger label. Shared by the

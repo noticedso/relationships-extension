@@ -18,9 +18,9 @@
         <span class="product">Relationships</span>
       </header>
 
-      <section id="connect" class="connect" hidden>
-        <p class="connect-copy">connect to start importing your connections</p>
+      <section id="connect" class="card connect" hidden>
         <button id="connect-cta" type="button" class="btn-brand btn-cta">connect to noticed</button>
+        <p class="status-sub">connect to start importing your connections</p>
       </section>
 
       <section id="account" class="card account">
@@ -29,8 +29,8 @@
       </section>
 
       <section class="card status">
-        <p id="next-scan" class="status-line"></p>
-        <p id="last-scan" class="status-sub"></p>
+        <!-- CTA leads the card (consistent with the connect + grant states); the
+             supporting copy sits BELOW it. -->
         <div class="actions">
           <button id="scan-now" type="button" class="btn-brand btn-cta">scan now</button>
           <span id="scan-spinner" class="spinner" hidden aria-hidden="true"></span>
@@ -41,6 +41,10 @@
             <span>test mode — only 2 requests</span>
           </label>
         </div>
+        <!-- Both lines share the status-sub style; shown in the granted "scan now"
+             state, hidden in the grant stage. -->
+        <p id="next-scan" class="status-sub"></p>
+        <p id="last-scan" class="status-sub"></p>
         <!-- Shown ONLY in the "grant access" state (populated by popup.ts), BELOW
              the CTA: spells out what the one-time host permission lets the
              extension do, naming the paired networks from runtime status. -->
