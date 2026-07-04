@@ -290,12 +290,18 @@ body {
   margin-top: 8px;
 }
 
-/* prominent "grant access" CTA: full-width, taller, larger label — the primary
-   action in the grant stage (where the status lines are hidden). */
-.btn-brand.grant-cta {
+/* prominent primary CTA: full-width, taller, larger label. Shared by the
+   connect, scan, and grant-access buttons so they read identically. */
+.btn-brand.btn-cta {
   width: 100%;
   padding: 11px 16px;
   font-size: var(--text-title-sm);
+}
+/* In the status card's action row the button fills the width but yields room
+   for the inline scan spinner when a scan is running. */
+.actions .btn-brand.btn-cta {
+  flex: 1;
+  width: auto;
 }
 
 /* recent syncs */

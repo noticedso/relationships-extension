@@ -20,7 +20,7 @@
 
       <section id="connect" class="connect" hidden>
         <p class="connect-copy">connect to start importing your connections</p>
-        <button id="connect-cta" type="button" class="btn-brand">connect to noticed</button>
+        <button id="connect-cta" type="button" class="btn-brand btn-cta">connect to noticed</button>
       </section>
 
       <section id="account" class="card account">
@@ -32,7 +32,7 @@
         <p id="next-scan" class="status-line"></p>
         <p id="last-scan" class="status-sub"></p>
         <div class="actions">
-          <button id="scan-now" type="button" class="btn-brand">scan now</button>
+          <button id="scan-now" type="button" class="btn-brand btn-cta">scan now</button>
           <span id="scan-spinner" class="spinner" hidden aria-hidden="true"></span>
           <!-- Dev-only affordance: hidden by default; revealed by popup.ts only in
                local-development builds (__DEV__). Never shown in the published extension. -->
@@ -50,9 +50,17 @@
       <p id="needs" class="needs"></p>
       <button id="signin-cta" type="button" class="btn-brand" hidden>sign in to noticed</button>
 
-      <!-- The two trust disclaimers are collapsed by default (native <details>) so
-           they don't dominate the panel — but stay one click away, fully present
-           for transparency. popup.ts still fills the bodies by id every render. -->
+      <!-- Recent syncs leads the disclosures and is OPEN by default (the most
+           useful "did it work?" info); the two trust disclaimers below are
+           collapsed by default but one click away. All three are native
+           <details>; popup.ts still fills them by id every render. -->
+      <details id="syncs" class="block disclosure" open>
+        <summary class="block-title">recent syncs</summary>
+        <ul id="sync-list" class="sync-list"></ul>
+        <p id="sync-empty" class="block-body" hidden>no syncs yet</p>
+        <button id="sync-more" type="button" class="sync-more" hidden>show more</button>
+      </details>
+
       <details class="block disclosure">
         <summary class="block-title">what we fetch</summary>
         <p id="what-we-fetch" class="block-body"></p>
@@ -62,13 +70,6 @@
         <summary class="block-title">how it's kept private</summary>
         <p id="privacy" class="block-body"></p>
       </details>
-
-      <section id="syncs" class="block">
-        <h2 class="block-title">recent syncs</h2>
-        <ul id="sync-list" class="sync-list"></ul>
-        <p id="sync-empty" class="block-body" hidden>no syncs yet</p>
-        <button id="sync-more" type="button" class="sync-more" hidden>show more</button>
-      </section>
 
       <footer class="pop-footer">
         <a class="footer-link" href="https://noticed.so" target="_blank" rel="noreferrer noopener">noticed.so</a>

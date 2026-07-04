@@ -435,19 +435,18 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     const next = scanBtn.cloneNode(true) as HTMLButtonElement;
     scanBtn.replaceWith(next);
     const spinner = root.querySelector<HTMLElement>("#scan-spinner");
-    // The grant state leads with a prominent CTA + explainer and hides the
-    // "next scan / no sync yet" status lines (noise before the first sync). Reset
-    // to the default (lines shown, no CTA emphasis, explainer hidden) each render.
+    // The grant state adds the explainer and hides the "next scan / no sync yet"
+    // status lines (noise before the first sync). Reset to the default (lines
+    // shown, explainer hidden) each render. The button itself always carries the
+    // prominent .btn-cta style (in markup), matching the connect button.
     const explainer = root.querySelector<HTMLElement>("#grant-explainer");
     const nextScan = root.querySelector<HTMLElement>("#next-scan");
     const lastScan = root.querySelector<HTMLElement>("#last-scan");
     if (explainer) explainer.hidden = true;
     if (nextScan) nextScan.hidden = false;
     if (lastScan) lastScan.hidden = false;
-    next.classList.remove("grant-cta");
     if (!granted && grantPatterns.length > 0) {
       next.textContent = "grant access";
-      next.classList.add("grant-cta");
       if (nextScan) nextScan.hidden = true;
       if (lastScan) lastScan.hidden = true;
       if (explainer) {
