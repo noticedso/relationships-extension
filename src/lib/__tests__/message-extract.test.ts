@@ -6,6 +6,7 @@ import {
   extractTweetEdges,
   computeHadReplyFromEvents,
   extractConversationEventTargets,
+  encodeRestliValue,
   type DmEntriesFieldMap,
   type ParticipantConversationsFieldMap,
   type TweetEdgesFieldMap,
@@ -325,5 +326,42 @@ describe("extractConversationEventTargets (LinkedIn)", () => {
       SELF,
     );
     expect(out.map((t) => t.conversationUrn)).toEqual(["urn:li:msg_conversation:(x,ok)"]);
+  });
+});
+
+// ── Rest.li-safe URL encoding (the v1.2.5 HTTP-400 bug) ──────────────────────
+describe("encodeRestliValue", () => {
+  // The real shape sniffed from a live session (fact 4 of the 2026-07-13 calibration).
+  const REAL_URN =
+    "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAABc123XYZ,2-N2QwMTIzNDU2Nzg5YWJjZGVm==)";
+
+  it("escapes the Rest.li sub-delimiters that encodeURIComponent leaves raw", () => {
+    const out = encodeRestliValue(REAL_URN);
+    // The bug: encodeURIComponent leaves ( and ) literal → Rest.li parses the
+    // value as a nested object → HTTP 400. Measured live: this is the fix.
+    expect(out).not.toMatch(/[()]/);
+    expect(out).toContain("%28"); // (
+    expect(out).toContain("%29"); // )
+    expect(out).toContain("%3A"); // :
+    expect(out).toContain("%2C"); // ,
+    expect(out).toContain("%3D"); // =
+    expect(out).toBe(
+      "urn%3Ali%3Amsg_conversation%3A%28urn%3Ali%3Afsd_profile%3AACoAABc123XYZ%2C2-N2QwMTIzNDU2Nzg5YWJjZGVm%3D%3D%29",
+    );
+  });
+
+  it("also escapes the other characters encodeURIComponent leaves ( ! ' * )", () => {
+    expect(encodeRestliValue("a!b'c*d")).toBe("a%21b%27c%2Ad");
+  });
+
+  it("does not double-encode: a literal % survives one round-trip", () => {
+    // encodeURIComponent already escapes a literal `%` to `%25`; we must not
+    // re-escape the `%` of our OWN escapes.
+    expect(encodeRestliValue("100%(x)")).toBe("100%25%28x%29");
+    expect(decodeURIComponent(encodeRestliValue("100%(x)"))).toBe("100%(x)");
+  });
+
+  it("round-trips the real urn exactly", () => {
+    expect(decodeURIComponent(encodeRestliValue(REAL_URN))).toBe(REAL_URN);
   });
 });

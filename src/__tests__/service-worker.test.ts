@@ -1013,6 +1013,76 @@ describe("service worker", () => {
     expect(pendingConns(stored).length).toBe(2);
   });
 
+  it("29-li-c. Rest.li-encodes the urn VALUE while leaving the template's structural parens intact (the v1.2.5 HTTP-400 bug)", async () => {
+    const chrome = getChrome();
+    // The REAL served template: `variables=(conversationUrn:…)` — those OUTER
+    // parens are Rest.li grammar and must stay literal. Only the substituted
+    // value may be encoded. (This is why we can't just encode the whole URL.)
+    const realTemplateRecipe = {
+      ...liMessagesRecipe,
+      messages: {
+        ...liMessagesRecipe.messages,
+        messageEvents: {
+          ...liMessagesRecipe.messages.messageEvents,
+          urlTemplate:
+            "/msg/events/graphql?queryId=messengerMessages.abc123&variables=(conversationUrn:{conversationUrn})",
+        },
+      },
+    };
+    await dispatchExternal({ type: "pair", recipe: realTemplateRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    // The REAL urn shape from a live session: the id is itself parenthesised.
+    // encodeURIComponent leaves ( and ) raw → Rest.li 400s on every probe.
+    const realUrn = "urn:li:msg_conversation:(urn:li:fsd_profile:ACoAAAjane,2-N2Qw==)";
+    const page = {
+      data: {
+        messengerConversationsBySyncToken: {
+          elements: [{ ...convo("x", "jane", 1750000900000), entityUrn: realUrn }],
+        },
+      },
+    };
+    const probeUrls: string[] = [];
+    const connCallRef = { n: 0 };
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events")) {
+        probeUrls.push(url);
+        return { ok: true, json: async () => eventsFor("jane") } as Response;
+      }
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => page } as Response;
+      connCallRef.n += 1;
+      const elements = connCallRef.n === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    expect(probeUrls.length).toBe(1);
+    const url = probeUrls[0]!;
+    // The template's structural Rest.li parens survive verbatim...
+    expect(url).toContain("&variables=(conversationUrn:");
+    expect(url.endsWith(")")).toBe(true);
+    // ...and the VALUE between them carries no raw sub-delimiter — the bug.
+    const value = url.slice(url.indexOf("(conversationUrn:") + "(conversationUrn:".length, -1);
+    expect(value).not.toMatch(/[()]/);
+    expect(value).toContain("%28");
+    expect(value).toContain("%29");
+    // The encoded value still round-trips to the exact urn the server sent us.
+    expect(decodeURIComponent(value)).toBe(realUrn);
+    // End-to-end: a correctly-encoded probe still yields the two-way verdict.
+    const msgs = messagesPayload(await chrome.storage.local.get(null));
+    expect(msgs[0]!.had_reply).toBe(true);
+  });
+
   // Build a scan-scoped fetchImpl over a mutable conversations page + per-urn
   // events responder, so each scan's probe fetches can be counted independently.
   function liFetchImpl(
