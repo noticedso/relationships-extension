@@ -42,6 +42,17 @@ const SCAN_TICK_ALARM = "scan-tick";
 const SCAN_TICK_PERIOD_MINUTES = 0.5;
 const SCAN_STALE_CUTOFF_MS = 60 * 60 * 1000; // 1h
 
+/**
+ * NT-99 — circuit breaker for the message-events probe: abort the whole pass
+ * after this many CONSECUTIVE failed probe fetches (non-OK response or throw;
+ * a success resets the count). A rotated/broken events endpoint (e.g. a stale
+ * recipe queryId) would otherwise fire up to `maxConversations` sequential
+ * failed requests per scan — the v1.2.3 ban-risk fingerprint. Aborted
+ * conversations simply omit had_reply (legacy server behavior) and cached
+ * verdicts are unaffected.
+ */
+const MAX_CONSECUTIVE_PROBE_FAILURES = 5;
+
 // ── Messages ────────────────────────────────────────────────────────────────
 
 type ExternalMessage =
@@ -433,6 +444,7 @@ async function runLinkedInMessageEventsPass(
   const jitterMs = (): number =>
     me.jitterMinMs + Math.random() * Math.max(0, me.jitterMaxMs - me.jitterMinMs);
 
+  let consecutiveFailures = 0;
   for (let i = 0; i < probes.length; i++) {
     if (i > 0) await sleep(jitterMs()); // paced between probes
     const t = probes[i]!;
@@ -443,7 +455,15 @@ async function runLinkedInMessageEventsPass(
           .replaceAll("{conversationUrn}", encodeURIComponent(t.conversationUrn))
           .replaceAll("{self}", selfId);
       const res = await fetchImpl(url, { credentials: "include", headers });
-      if (!res.ok) continue; // no retry — degrade to omitted, re-tried next scan
+      if (!res.ok) {
+        // No retry — degrade to omitted (re-tried next scan). A streak of
+        // failures means the endpoint itself is broken (rotated queryId):
+        // trip the breaker instead of hammering every remaining conversation.
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_PROBE_FAILURES) break;
+        continue;
+      }
+      consecutiveFailures = 0;
       const json = await res.json();
       const hr = computeHadReplyFromEvents(json, me, selfId);
       if (hr !== undefined) {
@@ -451,7 +471,10 @@ async function runLinkedInMessageEventsPass(
         nextCache[t.conversationUrn] = { at: t.lastActivityAtMs, had_reply: hr };
       }
     } catch {
-      // best-effort per conversation — a failure just omits had_reply
+      // best-effort per conversation — a failure just omits had_reply, but a
+      // streak (network-level, not just HTTP) also trips the breaker.
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_PROBE_FAILURES) break;
     }
   }
   // Persist the pruned cache (only conversations still in the summary list) so

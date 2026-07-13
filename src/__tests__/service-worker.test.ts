@@ -1103,6 +1103,59 @@ describe("service worker", () => {
     expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true); // cached
   });
 
+  it("29-li-e. circuit breaker: 5 consecutive failed probes abort the pass; cached verdicts from prior scans still re-attach", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const deps = { sleep: async () => {}, jitter: () => 0, nowMs: () => 1 };
+
+    // Scan 1: healthy — jane (two-way) + bob (one-way) verdicts get cached.
+    const conn1 = { n: 0 };
+    const fetch1 = liFetchImpl(() => conversationsPage, eventsFor, conn1);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch1 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Scan 2: 8 NEW conversations appear (all need probes — e.g. a queryId
+    // rotation broke the events endpoint) + jane/bob unchanged. Every events
+    // fetch now 500s: the breaker must stop the pass after 5 consecutive
+    // failures instead of hammering all 8 (the v1.2.3 ban-risk fingerprint).
+    const withNew = {
+      data: {
+        messengerConversationsBySyncToken: {
+          elements: [
+            ...Array.from({ length: 8 }, (_v, i) =>
+              convo(`urn:li:msg_conversation:new${i}`, `new${i}`, 1750010000000 + i),
+            ),
+            convo("urn:li:msg_conversation:jane", "jane", 1750000900000),
+            convo("urn:li:msg_conversation:bob", "bob", 1750000000000),
+          ],
+        },
+      },
+    };
+    const conn2 = { n: 0 };
+    const fetch2 = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events"))
+        return { ok: false, status: 500, json: async () => ({}) } as unknown as Response;
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => withNew } as Response;
+      conn2.n += 1;
+      const elements = conn2.n === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch2 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Breaker tripped: exactly 5 events fetches, not 8.
+    expect(eventsFetchCount(fetch2)).toBe(5);
+    const stored = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(messagesPayload(stored).map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    // Cached verdicts still re-attach (the breaker never degrades known verdicts).
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true);
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false);
+    // The new conversations degrade to absent (legacy server behavior).
+    expect(byCp["https://www.linkedin.com/in/new0"]).toBeUndefined();
+  });
+
   it("29. X tweets pass resolves self from the twid cookie, pages via max_id, and rides along as `mentions` (no text)", async () => {
     const chrome = getChrome();
     const xRecipe = {
