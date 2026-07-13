@@ -4,6 +4,8 @@ import {
   extractParticipantConversations,
   extractMessages,
   extractTweetEdges,
+  computeHadReplyFromEvents,
+  extractConversationEventTargets,
   type DmEntriesFieldMap,
   type ParticipantConversationsFieldMap,
   type TweetEdgesFieldMap,
@@ -225,5 +227,103 @@ describe("extractMessages dispatch", () => {
     expect(extractMessages(x, xFieldMap, "999", false)).toHaveLength(1);
     const li = { data: { messengerConversationsBySyncToken: { elements: [liConv({ selfUrn: "urn:li:fsd_profile:ACoAACself", otherUrn: "urn:li:fsd_profile:ACoAAAj", otherHandle: "in/j", lastAt: 1750000000000 })] } } };
     expect(extractMessages(li, liFieldMap, "ACoAACself", false)).toHaveLength(1);
+  });
+});
+
+// ── NT-99 follow-up: per-conversation had_reply probe (LinkedIn) ──────────────
+// The conversations summary carries no per-message senders, so a bounded probe
+// fetches a per-conversation events page. computeHadReplyFromEvents reads ONLY
+// the message SENDERS (never the text) and returns had_reply = sawSelf &&
+// sawCounterpart, or undefined when it can't tell.
+const eventsCfg = {
+  elementsPath: "data.messengerMessagesByConversation.elements",
+  senderIdPath: "sender.hostIdentityUrn",
+};
+function ev(senderUrn: string) {
+  // `body` deliberately present to prove the probe never reads message text.
+  return { sender: { hostIdentityUrn: senderUrn }, body: { text: "SECRET BODY" } };
+}
+const eventsPage = (senders: string[]) => ({
+  data: { messengerMessagesByConversation: { elements: senders.map(ev) } },
+});
+
+describe("computeHadReplyFromEvents (LinkedIn per-conversation probe)", () => {
+  const SELF = "ACoAACself";
+
+  it("true when the conversation went BOTH ways (self AND counterpart sent)", () => {
+    const page = eventsPage(["urn:li:fsd_profile:ACoAACself", "urn:li:fsd_profile:ACoAAAjane"]);
+    expect(computeHadReplyFromEvents(page, eventsCfg, SELF)).toBe(true);
+  });
+
+  it("false when only self sent (outbound, unreplied)", () => {
+    const page = eventsPage(["urn:li:fsd_profile:ACoAACself", "urn:li:fsd_profile:ACoAACself"]);
+    expect(computeHadReplyFromEvents(page, eventsCfg, SELF)).toBe(false);
+  });
+
+  it("false when only the counterpart sent (inbound, never replied)", () => {
+    const page = eventsPage(["urn:li:fsd_profile:ACoAAAjane", "urn:li:fsd_profile:ACoAAAjane"]);
+    expect(computeHadReplyFromEvents(page, eventsCfg, SELF)).toBe(false);
+  });
+
+  it("undefined when the events array is empty or the path is missing (can't tell → omit)", () => {
+    expect(computeHadReplyFromEvents(eventsPage([]), eventsCfg, SELF)).toBeUndefined();
+    expect(computeHadReplyFromEvents({}, eventsCfg, SELF)).toBeUndefined();
+  });
+
+  it("undefined when selfId is unresolved (empty) — never guesses had_reply", () => {
+    const page = eventsPage(["urn:li:fsd_profile:ACoAACself", "urn:li:fsd_profile:ACoAAAjane"]);
+    expect(computeHadReplyFromEvents(page, eventsCfg, "")).toBeUndefined();
+  });
+
+  it("never reads the message body/text (senders only)", () => {
+    const page = eventsPage(["urn:li:fsd_profile:ACoAACself", "urn:li:fsd_profile:ACoAAAjane"]);
+    const out = computeHadReplyFromEvents(page, eventsCfg, SELF);
+    expect(typeof out).toBe("boolean");
+    // The function returns a scalar boolean — no text can leak by construction.
+    expect(JSON.stringify(out)).not.toContain("SECRET");
+  });
+});
+
+describe("extractConversationEventTargets (LinkedIn)", () => {
+  const SELF = "ACoAACself";
+  const conv = (opts: { urn: string; otherHandle: string; lastAt: number; groupChat?: boolean }) => ({
+    entityUrn: opts.urn,
+    groupChat: opts.groupChat ?? false,
+    lastActivityAt: opts.lastAt,
+    conversationParticipants: [
+      { hostIdentityUrn: "urn:li:fsd_profile:ACoAACself", participantType: { member: { profileUrl: "https://www.linkedin.com/in/me" } } },
+      { hostIdentityUrn: "urn:li:fsd_profile:ACoAAAother", participantType: { member: { profileUrl: opts.otherHandle } } },
+    ],
+  });
+  const page = (arr: unknown[]) => ({ data: { messengerConversationsBySyncToken: { elements: arr } } });
+
+  it("returns one target per 1:1 conversation with urn + counterpart + recency (prefix applied)", () => {
+    const out = extractConversationEventTargets(
+      page([
+        conv({ urn: "urn:li:msg_conversation:(x,c1)", otherHandle: "https://www.linkedin.com/in/jane", lastAt: 1750000900000 }),
+        conv({ urn: "urn:li:msg_conversation:(x,c2)", otherHandle: "https://www.linkedin.com/in/bob", lastAt: 1750000000000 }),
+      ]),
+      liFieldMap,
+      "entityUrn",
+      SELF,
+    );
+    expect(out).toEqual([
+      { conversationUrn: "urn:li:msg_conversation:(x,c1)", counterpartProfileUrl: "https://www.linkedin.com/in/jane", lastActivityAtMs: 1750000900000 },
+      { conversationUrn: "urn:li:msg_conversation:(x,c2)", counterpartProfileUrl: "https://www.linkedin.com/in/bob", lastActivityAtMs: 1750000000000 },
+    ]);
+  });
+
+  it("skips group chats and conversations missing an urn or counterpart", () => {
+    const out = extractConversationEventTargets(
+      page([
+        conv({ urn: "urn:li:msg_conversation:(x,g)", otherHandle: "in/g", lastAt: 1, groupChat: true }),
+        { entityUrn: "", lastActivityAt: 2, conversationParticipants: [] }, // no urn / no counterpart
+        conv({ urn: "urn:li:msg_conversation:(x,ok)", otherHandle: "in/ok", lastAt: 3 }),
+      ]),
+      liFieldMap,
+      "entityUrn",
+      SELF,
+    );
+    expect(out.map((t) => t.conversationUrn)).toEqual(["urn:li:msg_conversation:(x,ok)"]);
   });
 });

@@ -1,5 +1,5 @@
 import type { ScanConnection, ScanMessage } from "./recipe";
-import type { AnyMessageFieldMap, TweetEdgesFieldMap } from "./message-extract";
+import type { AnyMessageFieldMap, MessageEventsConfig, TweetEdgesFieldMap } from "./message-extract";
 
 /** A "messages" pass appended after the connection pass(es). Metadata only. */
 export type MessagesTarget = {
@@ -17,6 +17,13 @@ export type MessagesTarget = {
   messageFieldMap: AnyMessageFieldMap;
   /** Drop conversations that are only un-replied first message(s) (X). */
   excludeUnreplied?: boolean;
+  /**
+   * NT-99 follow-up — optional bounded per-conversation message-events probe
+   * (LinkedIn). When present, after the summary pass the extension probes the
+   * most-recent conversations for a two-way `had_reply` flag. Absent on legacy
+   * recipes / sources without it (loose by design — old recipes still parse).
+   */
+  messageEvents?: MessageEventsConfig;
 };
 
 /** Recipe shape the orchestrator needs. Site specifics live here, never in code. */
@@ -115,6 +122,18 @@ export type State = {
   lastScanCount: number | null;
   /** When the most recent automatic scan hit the network — drives the once-per-period throttle. */
   lastScanStartedAt: number | null;
+  /**
+   * NT-99 follow-up — per-conversation had_reply verdict cache, keyed by
+   * conversation urn: `{ at: lastActivityAt(ms) when probed, had_reply }`. Makes
+   * the message-events probe DELTA-ONLY: a conversation whose lastActivityAt is
+   * unchanged reuses its cached verdict with NO fetch (a re-scan of a quiet inbox
+   * probes ~0 conversations); new activity (at > cached.at) re-probes. Also
+   * correctness-bearing: without it a previously-false (one-way) conversation
+   * skipped on the next scan would lose its flag and regress to the server's
+   * legacy log-everything path. Pruned each pass to conversations still in the
+   * summary list, so it stays bounded by the list size.
+   */
+  hadReplyByConversation?: Record<string, { at: number; had_reply: boolean }> | null;
   needs: Needs;
   testMode?: boolean;
   // ── Checkpoint-and-resume scan state (MV3 resilience) ─────────────────────
@@ -152,6 +171,7 @@ const KEYS: (keyof State)[] = [
   "lastScanAt",
   "lastScanCount",
   "lastScanStartedAt",
+  "hadReplyByConversation",
   "needs",
   "testMode",
   "scanInProgress",

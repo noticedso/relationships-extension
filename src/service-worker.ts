@@ -18,7 +18,13 @@
 import { buildCsrfHeaders } from "./lib/cookies";
 import { applyFieldMap, getByPath } from "./lib/recipe";
 import type { ScanConnection, ScanMessage } from "./lib/recipe";
-import { extractMessages, extractTweetEdges, tweetsArrayOf } from "./lib/message-extract";
+import {
+  extractMessages,
+  extractTweetEdges,
+  tweetsArrayOf,
+  extractConversationEventTargets,
+  computeHadReplyFromEvents,
+} from "./lib/message-extract";
 import type { XTweetEdgeRow } from "./lib/message-extract";
 import { planPhases, assembleScanPayload, type Phase, type ScanExtras } from "./lib/scan-plan";
 import { getState, setState } from "./lib/storage";
@@ -35,6 +41,17 @@ const DEFAULT_SOURCE = "linkedin_extension";
 const SCAN_TICK_ALARM = "scan-tick";
 const SCAN_TICK_PERIOD_MINUTES = 0.5;
 const SCAN_STALE_CUTOFF_MS = 60 * 60 * 1000; // 1h
+
+/**
+ * NT-99 — circuit breaker for the message-events probe: abort the whole pass
+ * after this many CONSECUTIVE failed probe fetches (non-OK response or throw;
+ * a success resets the count). A rotated/broken events endpoint (e.g. a stale
+ * recipe queryId) would otherwise fire up to `maxConversations` sequential
+ * failed requests per scan — the v1.2.3 ban-risk fingerprint. Aborted
+ * conversations simply omit had_reply (legacy server behavior) and cached
+ * verdicts are unaffected.
+ */
+const MAX_CONSECUTIVE_PROBE_FAILURES = 5;
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
@@ -360,6 +377,113 @@ async function runTweetsPass(
 }
 
 /**
+ * NT-99 follow-up — the bounded per-conversation had_reply probe (LinkedIn).
+ * The conversations summary carries no per-message senders, so we can't tell a
+ * one-way DM from a real exchange. This pass does ONE conversations-list fetch to
+ * learn which conversations exist, then — for up to `maxConversations` most-recent
+ * ones — GETs the recipe's per-conversation events endpoint and reads only the
+ * message SENDERS (never text) to compute had_reply = sawSelf && sawCounterpart.
+ *
+ * Ban-risk guardrails (v1.2.3 lesson): a hard conversation cap, a jittered delay
+ * between probes, and NO retries — any per-conversation failure/over-cap
+ * conversation simply omits had_reply (the server then keeps its legacy
+ * log-everything behavior). Returns a map counterpartProfileUrl → had_reply for
+ * the conversations it could determine. Best-effort: a total failure yields {}.
+ *
+ * DELTA-ONLY: verdicts are cached per conversation urn (`hadReplyByConversation`
+ * in storage, stamped with the lastActivityAt they were computed at). A
+ * conversation whose lastActivityAt is unchanged reuses its cached verdict with
+ * NO fetch — so a re-scan only probes conversations that are new or have new
+ * activity (a quiet inbox costs ~0 probe fetches). The cache is also
+ * correctness-bearing: it keeps a previously-false (one-way) conversation
+ * flagged on later scans instead of regressing to the server's legacy
+ * log-everything path. A failed probe leaves no cache entry, so it is naturally
+ * re-tried on the NEXT scan (never within one).
+ */
+async function runLinkedInMessageEventsPass(
+  recipe: ScanRecipe,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  selfId: string,
+  sleep: (ms: number) => Promise<void>,
+): Promise<Map<string, boolean>> {
+  const out = new Map<string, boolean>();
+  const m = recipe.messages;
+  const me = m?.messageEvents;
+  // No probe configured, or self unresolved (can't attribute senders) → omit all.
+  if (!m || !me || !selfId) return out;
+  const fieldMap = m.messageFieldMap;
+  if (!("mode" in fieldMap) || fieldMap.mode !== "participantConversations") return out;
+
+  // One conversations-list fetch to learn which conversations to probe.
+  const listRes = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, 0, selfId), {
+    credentials: "include",
+    headers,
+  });
+  if (!listRes.ok) return out;
+  const listJson = await listRes.json();
+  const targets = extractConversationEventTargets(listJson, fieldMap, me.conversationUrnPath, selfId)
+    .sort((a, b) => b.lastActivityAtMs - a.lastActivityAtMs); // most-recent first
+
+  // Split cached-and-unchanged (reuse the verdict, no fetch) from new/changed
+  // (needs a probe). The cap bounds actual FETCHES, not cache reuse.
+  const cache = (await getState()).hadReplyByConversation ?? {};
+  const nextCache: Record<string, { at: number; had_reply: boolean }> = {};
+  const needProbe: typeof targets = [];
+  for (const t of targets) {
+    const cached = cache[t.conversationUrn];
+    if (cached && cached.at >= t.lastActivityAtMs) {
+      out.set(t.counterpartProfileUrl, cached.had_reply);
+      nextCache[t.conversationUrn] = cached;
+    } else {
+      needProbe.push(t);
+    }
+  }
+  const probes = needProbe.slice(0, Math.max(0, me.maxConversations)); // hard cap
+
+  const jitterMs = (): number =>
+    me.jitterMinMs + Math.random() * Math.max(0, me.jitterMaxMs - me.jitterMinMs);
+
+  let consecutiveFailures = 0;
+  for (let i = 0; i < probes.length; i++) {
+    if (i > 0) await sleep(jitterMs()); // paced between probes
+    const t = probes[i]!;
+    try {
+      const url =
+        recipe.targetOrigin +
+        me.urlTemplate
+          .replaceAll("{conversationUrn}", encodeURIComponent(t.conversationUrn))
+          .replaceAll("{self}", selfId);
+      const res = await fetchImpl(url, { credentials: "include", headers });
+      if (!res.ok) {
+        // No retry — degrade to omitted (re-tried next scan). A streak of
+        // failures means the endpoint itself is broken (rotated queryId):
+        // trip the breaker instead of hammering every remaining conversation.
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_PROBE_FAILURES) break;
+        continue;
+      }
+      consecutiveFailures = 0;
+      const json = await res.json();
+      const hr = computeHadReplyFromEvents(json, me, selfId);
+      if (hr !== undefined) {
+        out.set(t.counterpartProfileUrl, hr);
+        nextCache[t.conversationUrn] = { at: t.lastActivityAtMs, had_reply: hr };
+      }
+    } catch {
+      // best-effort per conversation — a failure just omits had_reply, but a
+      // streak (network-level, not just HTTP) also trips the breaker.
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_PROBE_FAILURES) break;
+    }
+  }
+  // Persist the pruned cache (only conversations still in the summary list) so
+  // the next scan is delta-only and the cache stays bounded.
+  await setState({ hadReplyByConversation: nextCache });
+  return out;
+}
+
+/**
  * Resumable phase stepper. Reads the persisted checkpoint, walks the recipe's
  * phases (connection list(s) then messages), checkpoints to storage after EACH
  * page, and on completion finalizes (assembles + caches the per-source payload,
@@ -476,6 +600,28 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         scanPhaseResults: results,
         scanSelfId: selfId,
       });
+    }
+
+    // NT-99 follow-up — the bounded per-conversation had_reply probe (LinkedIn),
+    // AFTER the message phase so a failure never aborts a completed scan. Merges
+    // the two-way flag onto the summary rows by counterpart; unprobed/failed
+    // conversations keep had_reply ABSENT (the server then keeps its legacy
+    // log-everything behavior — presence-based back-compat).
+    if (recipe.messages?.messageEvents && results.messages.length > 0) {
+      const hadReplyByCounterpart = await runLinkedInMessageEventsPass(
+        recipe,
+        headers,
+        fetchImpl,
+        selfId,
+        sleep,
+      ).catch(() => new Map<string, boolean>());
+      if (hadReplyByCounterpart.size > 0) {
+        results.messages = results.messages.map((msg) =>
+          hadReplyByCounterpart.has(msg.counterpartProfileUrl)
+            ? { ...msg, had_reply: hadReplyByCounterpart.get(msg.counterpartProfileUrl) }
+            : msg,
+        );
+      }
     }
 
     // NT-63 best-effort owner side-passes, AFTER the connection/message phases so

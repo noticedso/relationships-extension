@@ -878,6 +878,284 @@ describe("service worker", () => {
     expect("ownerProfile" in payload).toBe(false); // failed pass → key omitted
   });
 
+  // ── NT-99 follow-up: LinkedIn per-conversation had_reply probe ──────────────
+
+  const liMessagesRecipe = {
+    ...recipe,
+    messages: {
+      listPathTemplate: "/msg/conversations?self={self}",
+      pageSize: 100,
+      selfIdSource: { listPathTemplate: "/voyager/api/me", idPath: "miniProfile.entityUrn", extract: "([^:]+)$" },
+      excludeUnreplied: false,
+      messageFieldMap: {
+        mode: "participantConversations",
+        elementsPath: "data.messengerConversationsBySyncToken.elements",
+        participantsPath: "conversationParticipants",
+        participantSelfIdPath: "hostIdentityUrn",
+        participantHandlePath: "participantType.member.profileUrl",
+        lastActivityAtPath: "lastActivityAt",
+        groupChatPath: "groupChat",
+        unreadCountPath: "unreadCount",
+        counterpartUrlPrefix: "",
+      },
+      messageEvents: {
+        urlTemplate: "/msg/events?conversationUrn={conversationUrn}",
+        conversationUrnPath: "entityUrn",
+        elementsPath: "data.messengerMessagesByConversation.elements",
+        senderIdPath: "sender.hostIdentityUrn",
+        maxConversations: 150,
+        jitterMinMs: 0,
+        jitterMaxMs: 0,
+      },
+    },
+  };
+  const convo = (urn: string, handle: string, lastAt: number) => ({
+    entityUrn: urn,
+    groupChat: false,
+    unreadCount: 0,
+    lastActivityAt: lastAt,
+    conversationParticipants: [
+      { hostIdentityUrn: "urn:li:fsd_profile:ACoAACself", participantType: { member: { profileUrl: "https://www.linkedin.com/in/me" } } },
+      { hostIdentityUrn: "urn:li:fsd_profile:ACoAAA" + handle, participantType: { member: { profileUrl: "https://www.linkedin.com/in/" + handle } } },
+    ],
+  });
+  const conversationsPage = {
+    data: {
+      messengerConversationsBySyncToken: {
+        elements: [
+          convo("urn:li:msg_conversation:jane", "jane", 1750000900000),
+          convo("urn:li:msg_conversation:bob", "bob", 1750000000000),
+        ],
+      },
+    },
+  };
+  // `body` present on every event to prove the probe never reads message text.
+  const evt = (senderUrn: string) => ({ sender: { hostIdentityUrn: senderUrn }, body: { text: "SECRET BODY" } });
+  const eventsFor = (urn: string) => {
+    const senders = urn.includes("jane")
+      ? ["urn:li:fsd_profile:ACoAACself", "urn:li:fsd_profile:ACoAAAjane"] // two-way
+      : ["urn:li:fsd_profile:ACoAACself"]; // bob: outbound only, unreplied
+    return { data: { messengerMessagesByConversation: { elements: senders.map(evt) } } };
+  };
+  function messagesPayload(stored: Record<string, unknown>): Array<Record<string, unknown>> {
+    const ps = stored.pendingScans as Record<string, { payload?: { messages?: Array<Record<string, unknown>> } }> | undefined;
+    return ps?.linkedin_extension?.payload?.messages ?? [];
+  }
+
+  it("29-li. probes recent conversations for had_reply (two-way=true, one-way=false) and never captures message text", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events")) {
+        const urn = decodeURIComponent(url);
+        return { ok: true, json: async () => eventsFor(urn) } as Response;
+      }
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => conversationsPage } as Response;
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const msgs = messagesPayload(stored);
+    const byCp = Object.fromEntries(msgs.map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true);
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false);
+    // Connections still imported alongside the best-effort probe.
+    expect(pendingConns(stored).length).toBe(2);
+    // No message text ever leaves the extension.
+    expect(JSON.stringify(stored.pendingScans)).not.toContain("SECRET");
+  });
+
+  it("29-li-b. a failing events probe degrades gracefully: had_reply omitted, messages + connections still import", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events")) throw new Error("events endpoint down");
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => conversationsPage } as Response;
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const msgs = messagesPayload(stored);
+    expect(msgs.length).toBe(2); // conversations still captured (summary)
+    for (const m of msgs) expect("had_reply" in m).toBe(false); // probe failed → omitted
+    expect(pendingConns(stored).length).toBe(2);
+  });
+
+  // Build a scan-scoped fetchImpl over a mutable conversations page + per-urn
+  // events responder, so each scan's probe fetches can be counted independently.
+  function liFetchImpl(
+    page: () => unknown,
+    events: (decodedUrl: string) => unknown,
+    connCallRef: { n: number },
+  ) {
+    return vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events"))
+        return { ok: true, json: async () => events(decodeURIComponent(url)) } as Response;
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => page() } as Response;
+      connCallRef.n += 1;
+      const elements = connCallRef.n === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+  }
+  const eventsFetchCount = (f: ReturnType<typeof vi.fn>) =>
+    f.mock.calls.filter((c) => String(c[0]).includes("/msg/events")).length;
+
+  it("29-li-c. re-scan with NO new activity probes zero conversations and re-attaches cached had_reply verdicts", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const deps = { sleep: async () => {}, jitter: () => 0, nowMs: () => 1 };
+
+    // Scan 1: both conversations probed (empty cache).
+    const conn1 = { n: 0 };
+    const fetch1 = liFetchImpl(() => conversationsPage, eventsFor, conn1);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch1 as unknown as typeof fetch })).ok).toBe(true);
+    expect(eventsFetchCount(fetch1)).toBe(2);
+    const stored1 = await chrome.storage.local.get(null);
+    const cache = stored1.hadReplyByConversation as Record<string, { at: number; had_reply: boolean }>;
+    expect(cache["urn:li:msg_conversation:jane"]).toMatchObject({ had_reply: true });
+    expect(cache["urn:li:msg_conversation:bob"]).toMatchObject({ had_reply: false });
+
+    // Scan 2: identical conversations page (no new activity) → ZERO events
+    // fetches, but the payload still carries the cached verdicts (a one-way
+    // conversation must not silently regress to legacy log-everything).
+    const conn2 = { n: 0 };
+    const fetch2 = liFetchImpl(() => conversationsPage, eventsFor, conn2);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch2 as unknown as typeof fetch })).ok).toBe(true);
+    expect(eventsFetchCount(fetch2)).toBe(0);
+    const stored2 = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(messagesPayload(stored2).map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true);
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false);
+  });
+
+  it("29-li-d. only a conversation with NEW activity is re-probed; its verdict updates, others come from cache", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const deps = { sleep: async () => {}, jitter: () => 0, nowMs: () => 1 };
+
+    // Scan 1: jane two-way, bob one-way.
+    const conn1 = { n: 0 };
+    const fetch1 = liFetchImpl(() => conversationsPage, eventsFor, conn1);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch1 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Scan 2: bob has NEW activity (he finally replied) — jane unchanged.
+    const bumped = {
+      data: {
+        messengerConversationsBySyncToken: {
+          elements: [
+            convo("urn:li:msg_conversation:jane", "jane", 1750000900000),
+            convo("urn:li:msg_conversation:bob", "bob", 1750009999000),
+          ],
+        },
+      },
+    };
+    const bobNowTwoWay = (urn: string) =>
+      urn.includes("bob")
+        ? { data: { messengerMessagesByConversation: { elements: [evt("urn:li:fsd_profile:ACoAACself"), evt("urn:li:fsd_profile:ACoAAAbob")] } } }
+        : eventsFor(urn);
+    const conn2 = { n: 0 };
+    const fetch2 = liFetchImpl(() => bumped, bobNowTwoWay, conn2);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch2 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Only bob was re-probed; jane's verdict came from the cache.
+    expect(eventsFetchCount(fetch2)).toBe(1);
+    expect(String(fetch2.mock.calls.find((c) => String(c[0]).includes("/msg/events"))?.[0])).toContain("bob");
+    const stored = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(messagesPayload(stored).map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(true); // updated verdict
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true); // cached
+  });
+
+  it("29-li-e. circuit breaker: 5 consecutive failed probes abort the pass; cached verdicts from prior scans still re-attach", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const deps = { sleep: async () => {}, jitter: () => 0, nowMs: () => 1 };
+
+    // Scan 1: healthy — jane (two-way) + bob (one-way) verdicts get cached.
+    const conn1 = { n: 0 };
+    const fetch1 = liFetchImpl(() => conversationsPage, eventsFor, conn1);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch1 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Scan 2: 8 NEW conversations appear (all need probes — e.g. a queryId
+    // rotation broke the events endpoint) + jane/bob unchanged. Every events
+    // fetch now 500s: the breaker must stop the pass after 5 consecutive
+    // failures instead of hammering all 8 (the v1.2.3 ban-risk fingerprint).
+    const withNew = {
+      data: {
+        messengerConversationsBySyncToken: {
+          elements: [
+            ...Array.from({ length: 8 }, (_v, i) =>
+              convo(`urn:li:msg_conversation:new${i}`, `new${i}`, 1750010000000 + i),
+            ),
+            convo("urn:li:msg_conversation:jane", "jane", 1750000900000),
+            convo("urn:li:msg_conversation:bob", "bob", 1750000000000),
+          ],
+        },
+      },
+    };
+    const conn2 = { n: 0 };
+    const fetch2 = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events"))
+        return { ok: false, status: 500, json: async () => ({}) } as unknown as Response;
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => withNew } as Response;
+      conn2.n += 1;
+      const elements = conn2.n === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch2 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Breaker tripped: exactly 5 events fetches, not 8.
+    expect(eventsFetchCount(fetch2)).toBe(5);
+    const stored = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(messagesPayload(stored).map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    // Cached verdicts still re-attach (the breaker never degrades known verdicts).
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true);
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false);
+    // The new conversations degrade to absent (legacy server behavior).
+    expect(byCp["https://www.linkedin.com/in/new0"]).toBeUndefined();
+  });
+
   it("29. X tweets pass resolves self from the twid cookie, pages via max_id, and rides along as `mentions` (no text)", async () => {
     const chrome = getChrome();
     const xRecipe = {

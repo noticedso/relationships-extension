@@ -88,6 +88,15 @@ export type ScanMessage = {
   counterpartProfileUrl: string;
   lastMessageAt: string; // ISO 8601
   direction: "sent" | "received";
+  /**
+   * NT-99 follow-up — the per-conversation two-way signal from the bounded
+   * message-events probe (LinkedIn): `true` = messages both ways (a real reply),
+   * `false` = one-way/unreplied, ABSENT = unfetched/failed/over-cap or a source
+   * without the probe (X). Still metadata only — derived from message SENDERS,
+   * never the text. The server gates its scored replay on this (absent = legacy
+   * log-everything).
+   */
+  had_reply?: boolean;
 };
 
 /**
