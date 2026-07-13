@@ -130,6 +130,33 @@ function str(v: unknown): string {
   return v === null || v === undefined ? "" : String(v);
 }
 
+/**
+ * Percent-encode a value for interpolation into a LinkedIn (Rest.li) URL.
+ *
+ * `encodeURIComponent` alone is NOT enough — it deliberately leaves the RFC-2396
+ * "mark" characters `!`, `'`, `(`, `)` and `*` unescaped. But Rest.li's query
+ * grammar treats `(` and `)` as SUB-DELIMITERS: they open/close a nested object
+ * inside a parameter value. A conversation urn is itself parenthesised —
+ *
+ *   urn:li:msg_conversation:(urn:li:fsd_profile:ACoAA…,2-N2Q…==)
+ *
+ * — so `encodeURIComponent` ships those parens through literally, Rest.li tries to
+ * parse the value as a nested object, and the request fails with **HTTP 400**.
+ * (Measured against a live session 2026-07-13: `encodeURIComponent` → 400; this
+ * encoder → 200 with usable events; the raw urn → 400.)
+ *
+ * So: run `encodeURIComponent` (which already handles `:` `,` `=` and any literal
+ * `%`), then additionally escape the five characters it leaves behind. `%` is not
+ * re-encoded — every literal `%` in the input was already escaped to `%25` by the
+ * first pass, so the only `%` remaining are the escapes themselves.
+ */
+export function encodeRestliValue(value: string): string {
+  return encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase(),
+  );
+}
+
 /** The raw tweet array on a timeline page: the page itself, or `tweetsPath`. */
 export function tweetsArrayOf(page: unknown, fieldMap: TweetEdgesFieldMap): unknown[] {
   if (Array.isArray(page)) return page;

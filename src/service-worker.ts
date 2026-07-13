@@ -24,6 +24,7 @@ import {
   tweetsArrayOf,
   extractConversationEventTargets,
   computeHadReplyFromEvents,
+  encodeRestliValue,
 } from "./lib/message-extract";
 import type { XTweetEdgeRow } from "./lib/message-extract";
 import { planPhases, assembleScanPayload, type Phase, type ScanExtras } from "./lib/scan-plan";
@@ -452,7 +453,10 @@ async function runLinkedInMessageEventsPass(
       const url =
         recipe.targetOrigin +
         me.urlTemplate
-          .replaceAll("{conversationUrn}", encodeURIComponent(t.conversationUrn))
+          // Rest.li-safe, NOT encodeURIComponent: the urn contains parens, which
+          // encodeURIComponent leaves literal → Rest.li reads them as a nested
+          // object → HTTP 400 on every probe. See encodeRestliValue.
+          .replaceAll("{conversationUrn}", encodeRestliValue(t.conversationUrn))
           .replaceAll("{self}", selfId);
       const res = await fetchImpl(url, { credentials: "include", headers });
       if (!res.ok) {
