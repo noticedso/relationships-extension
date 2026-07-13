@@ -878,6 +878,141 @@ describe("service worker", () => {
     expect("ownerProfile" in payload).toBe(false); // failed pass → key omitted
   });
 
+  // ── NT-99 follow-up: LinkedIn per-conversation had_reply probe ──────────────
+
+  const liMessagesRecipe = {
+    ...recipe,
+    messages: {
+      listPathTemplate: "/msg/conversations?self={self}",
+      pageSize: 100,
+      selfIdSource: { listPathTemplate: "/voyager/api/me", idPath: "miniProfile.entityUrn", extract: "([^:]+)$" },
+      excludeUnreplied: false,
+      messageFieldMap: {
+        mode: "participantConversations",
+        elementsPath: "data.messengerConversationsBySyncToken.elements",
+        participantsPath: "conversationParticipants",
+        participantSelfIdPath: "hostIdentityUrn",
+        participantHandlePath: "participantType.member.profileUrl",
+        lastActivityAtPath: "lastActivityAt",
+        groupChatPath: "groupChat",
+        unreadCountPath: "unreadCount",
+        counterpartUrlPrefix: "",
+      },
+      messageEvents: {
+        urlTemplate: "/msg/events?conversationUrn={conversationUrn}",
+        conversationUrnPath: "entityUrn",
+        elementsPath: "data.messengerMessagesByConversation.elements",
+        senderIdPath: "sender.hostIdentityUrn",
+        maxConversations: 150,
+        jitterMinMs: 0,
+        jitterMaxMs: 0,
+      },
+    },
+  };
+  const convo = (urn: string, handle: string, lastAt: number) => ({
+    entityUrn: urn,
+    groupChat: false,
+    unreadCount: 0,
+    lastActivityAt: lastAt,
+    conversationParticipants: [
+      { hostIdentityUrn: "urn:li:fsd_profile:ACoAACself", participantType: { member: { profileUrl: "https://www.linkedin.com/in/me" } } },
+      { hostIdentityUrn: "urn:li:fsd_profile:ACoAAA" + handle, participantType: { member: { profileUrl: "https://www.linkedin.com/in/" + handle } } },
+    ],
+  });
+  const conversationsPage = {
+    data: {
+      messengerConversationsBySyncToken: {
+        elements: [
+          convo("urn:li:msg_conversation:jane", "jane", 1750000900000),
+          convo("urn:li:msg_conversation:bob", "bob", 1750000000000),
+        ],
+      },
+    },
+  };
+  // `body` present on every event to prove the probe never reads message text.
+  const evt = (senderUrn: string) => ({ sender: { hostIdentityUrn: senderUrn }, body: { text: "SECRET BODY" } });
+  const eventsFor = (urn: string) => {
+    const senders = urn.includes("jane")
+      ? ["urn:li:fsd_profile:ACoAACself", "urn:li:fsd_profile:ACoAAAjane"] // two-way
+      : ["urn:li:fsd_profile:ACoAACself"]; // bob: outbound only, unreplied
+    return { data: { messengerMessagesByConversation: { elements: senders.map(evt) } } };
+  };
+  function messagesPayload(stored: Record<string, unknown>): Array<Record<string, unknown>> {
+    const ps = stored.pendingScans as Record<string, { payload?: { messages?: Array<Record<string, unknown>> } }> | undefined;
+    return ps?.linkedin_extension?.payload?.messages ?? [];
+  }
+
+  it("29-li. probes recent conversations for had_reply (two-way=true, one-way=false) and never captures message text", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events")) {
+        const urn = decodeURIComponent(url);
+        return { ok: true, json: async () => eventsFor(urn) } as Response;
+      }
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => conversationsPage } as Response;
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const msgs = messagesPayload(stored);
+    const byCp = Object.fromEntries(msgs.map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true);
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false);
+    // Connections still imported alongside the best-effort probe.
+    expect(pendingConns(stored).length).toBe(2);
+    // No message text ever leaves the extension.
+    expect(JSON.stringify(stored.pendingScans)).not.toContain("SECRET");
+  });
+
+  it("29-li-b. a failing events probe degrades gracefully: had_reply omitted, messages + connections still import", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events")) throw new Error("events endpoint down");
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => conversationsPage } as Response;
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+
+    const res = await sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const msgs = messagesPayload(stored);
+    expect(msgs.length).toBe(2); // conversations still captured (summary)
+    for (const m of msgs) expect("had_reply" in m).toBe(false); // probe failed → omitted
+    expect(pendingConns(stored).length).toBe(2);
+  });
+
   it("29. X tweets pass resolves self from the twid cookie, pages via max_id, and rides along as `mentions` (no text)", async () => {
     const chrome = getChrome();
     const xRecipe = {

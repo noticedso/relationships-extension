@@ -1,5 +1,5 @@
 import type { ScanConnection, ScanMessage } from "./recipe";
-import type { AnyMessageFieldMap, TweetEdgesFieldMap } from "./message-extract";
+import type { AnyMessageFieldMap, MessageEventsConfig, TweetEdgesFieldMap } from "./message-extract";
 
 /** A "messages" pass appended after the connection pass(es). Metadata only. */
 export type MessagesTarget = {
@@ -17,6 +17,13 @@ export type MessagesTarget = {
   messageFieldMap: AnyMessageFieldMap;
   /** Drop conversations that are only un-replied first message(s) (X). */
   excludeUnreplied?: boolean;
+  /**
+   * NT-99 follow-up — optional bounded per-conversation message-events probe
+   * (LinkedIn). When present, after the summary pass the extension probes the
+   * most-recent conversations for a two-way `had_reply` flag. Absent on legacy
+   * recipes / sources without it (loose by design — old recipes still parse).
+   */
+  messageEvents?: MessageEventsConfig;
 };
 
 /** Recipe shape the orchestrator needs. Site specifics live here, never in code. */

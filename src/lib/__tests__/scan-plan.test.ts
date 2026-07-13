@@ -98,6 +98,17 @@ describe("assembleScanPayload", () => {
     expect(out.count).toBe(1);
   });
 
+  it("LinkedIn: threads the per-conversation had_reply flag through unchanged (NT-99 follow-up)", () => {
+    const conns = [conn("janedoe")];
+    const msgs = [
+      { counterpartProfileUrl: "https://www.linkedin.com/in/jane", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "sent" as const, had_reply: true },
+      { counterpartProfileUrl: "https://www.linkedin.com/in/bob", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "sent" as const, had_reply: false },
+      { counterpartProfileUrl: "https://www.linkedin.com/in/carol", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "received" as const },
+    ];
+    const out = assembleScanPayload(liRecipe, [conns], msgs, "self-li");
+    expect(out.payload.messages).toEqual(msgs);
+  });
+
   it("X: intersects mutuals + maps to {mutuals, messages, ownerAccountId}", () => {
     const following = [conn("alice", "1"), conn("bob", "2")];
     const followers = [conn("bob", "2"), conn("dave", "4")];

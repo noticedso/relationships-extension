@@ -80,6 +80,37 @@ export type AnyMessageFieldMap =
   | ParticipantConversationsFieldMap;
 
 /**
+ * NT-99 follow-up — the bounded per-conversation message-events probe (LinkedIn).
+ * The conversations summary carries no per-message senders, so the extension GETs
+ * a per-conversation events page and reads ONLY the message SENDERS (never text)
+ * to decide had_reply = sawSelf && sawCounterpart. All fields are recipe-served so
+ * the endpoint/paths can be calibrated live without an extension re-ship.
+ */
+export type MessageEventsConfig = {
+  /** Per-conversation events URL; `{conversationUrn}` (+ `{self}`) interpolated. */
+  urlTemplate: string;
+  /** Conversation-relative path to the id/urn substituted into `urlTemplate`. */
+  conversationUrnPath: string;
+  /** Path to the events/messages array in the events response. */
+  elementsPath: string;
+  /** Event-relative path to the sender id (substring-matched against selfId). */
+  senderIdPath: string;
+  /** Hard cap on conversations probed per scan (ban-risk guardrail). */
+  maxConversations: number;
+  /** Jitter window (ms) between per-conversation probe fetches. */
+  jitterMinMs: number;
+  jitterMaxMs: number;
+};
+
+/** A 1:1 conversation to probe for had_reply: its urn (for the fetch), the
+ *  counterpart url (the merge key back onto the ScanMessage) and recency. */
+export type ConversationEventTarget = {
+  conversationUrn: string;
+  counterpartProfileUrl: string;
+  lastActivityAtMs: number;
+};
+
+/**
  * A single owner→other EDGE derived from one of the owner's tweets. METADATA
  * ONLY — the tweet text is never read or returned. One row per @-mention, plus
  * a reply-marker row per reply tweet (isReply=true, empty mention fields).
@@ -217,6 +248,28 @@ export function extractDmEntries(
   return out;
 }
 
+/**
+ * The counterpart handle in a 1:1 conversation = the participant whose self-id
+ * path does NOT contain selfId (self's hostIdentityUrn is
+ * urn:li:fsd_profile:<selfId>). "" when none resolves. Shared by the summary
+ * extractor and the had_reply probe so both key on the SAME counterpart.
+ */
+function counterpartHandleOf(
+  el: unknown,
+  fieldMap: ParticipantConversationsFieldMap,
+  selfId: string,
+): string {
+  const participants = getByPath(el, fieldMap.participantsPath);
+  if (!Array.isArray(participants)) return "";
+  for (const p of participants) {
+    const pid = str(getByPath(p, fieldMap.participantSelfIdPath));
+    if (selfId !== "" && pid.includes(selfId)) continue; // this is self
+    const handle = str(getByPath(p, fieldMap.participantHandlePath));
+    if (handle !== "") return handle;
+  }
+  return "";
+}
+
 /** LinkedIn conversations: counterpart = the participant that isn't self. */
 export function extractParticipantConversations(
   page: unknown,
@@ -229,21 +282,7 @@ export function extractParticipantConversations(
   const out: ScanMessage[] = [];
   for (const el of elements) {
     if (fieldMap.groupChatPath && getByPath(el, fieldMap.groupChatPath) === true) continue; // 1:1 only
-    const participants = getByPath(el, fieldMap.participantsPath);
-    if (!Array.isArray(participants)) continue;
-
-    // The counterpart is the participant whose self-id path does NOT contain
-    // selfId (self's hostIdentityUrn is urn:li:fsd_profile:<selfId>).
-    let counterpartHandle = "";
-    for (const p of participants) {
-      const pid = str(getByPath(p, fieldMap.participantSelfIdPath));
-      if (selfId !== "" && pid.includes(selfId)) continue; // this is self
-      const handle = str(getByPath(p, fieldMap.participantHandlePath));
-      if (handle !== "") {
-        counterpartHandle = handle;
-        break;
-      }
-    }
+    const counterpartHandle = counterpartHandleOf(el, fieldMap, selfId);
     if (counterpartHandle === "") continue;
 
     const iso = toIso(getByPath(el, fieldMap.lastActivityAtPath));
@@ -278,4 +317,69 @@ export function extractMessages(
     return extractParticipantConversations(page, fieldMap, selfId);
   }
   return applyMessageFieldMap(page, fieldMap as MessageFieldMap, selfId, excludeUnreplied);
+}
+
+/**
+ * The 1:1 conversations to probe for had_reply (NT-99 follow-up). One target per
+ * non-group conversation carrying an urn AND a resolvable counterpart: the urn
+ * drives the per-conversation events fetch, the counterpart url is the merge key
+ * back onto the ScanMessage, and lastActivityAtMs lets the caller prioritise the
+ * most-recent conversations under the probe cap. Pure — no fetch.
+ */
+export function extractConversationEventTargets(
+  page: unknown,
+  fieldMap: ParticipantConversationsFieldMap,
+  conversationUrnPath: string,
+  selfId: string,
+): ConversationEventTarget[] {
+  const elements = getByPath(page, fieldMap.elementsPath);
+  if (!Array.isArray(elements)) return [];
+
+  const out: ConversationEventTarget[] = [];
+  for (const el of elements) {
+    if (fieldMap.groupChatPath && getByPath(el, fieldMap.groupChatPath) === true) continue; // 1:1 only
+    const conversationUrn = str(getByPath(el, conversationUrnPath));
+    if (conversationUrn === "") continue;
+    const counterpartHandle = counterpartHandleOf(el, fieldMap, selfId);
+    if (counterpartHandle === "") continue;
+    const lastRaw = getByPath(el, fieldMap.lastActivityAtPath);
+    const lastActivityAtMs = typeof lastRaw === "number" ? lastRaw : Number(lastRaw) || 0;
+    out.push({
+      conversationUrn,
+      counterpartProfileUrl: (fieldMap.counterpartUrlPrefix ?? "") + counterpartHandle,
+      lastActivityAtMs,
+    });
+  }
+  return out;
+}
+
+/**
+ * Compute a conversation's two-way flag from its message-events page (NT-99
+ * follow-up). Reads ONLY the message SENDERS (via `senderIdPath`, substring-
+ * matched against selfId — self's sender urn contains the bare id) — never the
+ * message text. Returns:
+ *   - `true`  when both self AND the counterpart sent (a real exchange),
+ *   - `false` when only one side sent (one-way / unreplied),
+ *   - `undefined` when it can't tell (no events, missing path, or unresolved
+ *     selfId) → the caller then OMITS had_reply and the server keeps its legacy
+ *     log-everything behavior. Pure — no fetch.
+ */
+export function computeHadReplyFromEvents(
+  eventsPage: unknown,
+  cfg: { elementsPath: string; senderIdPath: string },
+  selfId: string,
+): boolean | undefined {
+  if (selfId === "") return undefined; // can't attribute a sender to self → omit
+  const raw = getByPath(eventsPage, cfg.elementsPath);
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  let sawSelf = false;
+  let sawCounterpart = false;
+  for (const event of raw) {
+    const sender = str(getByPath(event, cfg.senderIdPath));
+    if (sender === "") continue;
+    if (sender.includes(selfId)) sawSelf = true;
+    else sawCounterpart = true;
+  }
+  if (!sawSelf && !sawCounterpart) return undefined; // no usable senders → omit
+  return sawSelf && sawCounterpart;
 }

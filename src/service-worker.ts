@@ -18,7 +18,13 @@
 import { buildCsrfHeaders } from "./lib/cookies";
 import { applyFieldMap, getByPath } from "./lib/recipe";
 import type { ScanConnection, ScanMessage } from "./lib/recipe";
-import { extractMessages, extractTweetEdges, tweetsArrayOf } from "./lib/message-extract";
+import {
+  extractMessages,
+  extractTweetEdges,
+  tweetsArrayOf,
+  extractConversationEventTargets,
+  computeHadReplyFromEvents,
+} from "./lib/message-extract";
 import type { XTweetEdgeRow } from "./lib/message-extract";
 import { planPhases, assembleScanPayload, type Phase, type ScanExtras } from "./lib/scan-plan";
 import { getState, setState } from "./lib/storage";
@@ -360,6 +366,70 @@ async function runTweetsPass(
 }
 
 /**
+ * NT-99 follow-up — the bounded per-conversation had_reply probe (LinkedIn).
+ * The conversations summary carries no per-message senders, so we can't tell a
+ * one-way DM from a real exchange. This pass does ONE conversations-list fetch to
+ * learn which conversations exist, then — for up to `maxConversations` most-recent
+ * ones — GETs the recipe's per-conversation events endpoint and reads only the
+ * message SENDERS (never text) to compute had_reply = sawSelf && sawCounterpart.
+ *
+ * Ban-risk guardrails (v1.2.3 lesson): a hard conversation cap, a jittered delay
+ * between probes, and NO retries — any per-conversation failure/over-cap
+ * conversation simply omits had_reply (the server then keeps its legacy
+ * log-everything behavior). Returns a map counterpartProfileUrl → had_reply for
+ * the conversations it could determine. Best-effort: a total failure yields {}.
+ */
+async function runLinkedInMessageEventsPass(
+  recipe: ScanRecipe,
+  headers: Record<string, string>,
+  fetchImpl: typeof fetch,
+  selfId: string,
+  sleep: (ms: number) => Promise<void>,
+): Promise<Map<string, boolean>> {
+  const out = new Map<string, boolean>();
+  const m = recipe.messages;
+  const me = m?.messageEvents;
+  // No probe configured, or self unresolved (can't attribute senders) → omit all.
+  if (!m || !me || !selfId) return out;
+  const fieldMap = m.messageFieldMap;
+  if (!("mode" in fieldMap) || fieldMap.mode !== "participantConversations") return out;
+
+  // One conversations-list fetch to learn which conversations to probe.
+  const listRes = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, 0, selfId), {
+    credentials: "include",
+    headers,
+  });
+  if (!listRes.ok) return out;
+  const listJson = await listRes.json();
+  const targets = extractConversationEventTargets(listJson, fieldMap, me.conversationUrnPath, selfId)
+    .sort((a, b) => b.lastActivityAtMs - a.lastActivityAtMs) // most-recent first
+    .slice(0, Math.max(0, me.maxConversations)); // hard cap
+
+  const jitterMs = (): number =>
+    me.jitterMinMs + Math.random() * Math.max(0, me.jitterMaxMs - me.jitterMinMs);
+
+  for (let i = 0; i < targets.length; i++) {
+    if (i > 0) await sleep(jitterMs()); // paced between probes
+    const t = targets[i]!;
+    try {
+      const url =
+        recipe.targetOrigin +
+        me.urlTemplate
+          .replaceAll("{conversationUrn}", encodeURIComponent(t.conversationUrn))
+          .replaceAll("{self}", selfId);
+      const res = await fetchImpl(url, { credentials: "include", headers });
+      if (!res.ok) continue; // no retry — degrade to omitted
+      const json = await res.json();
+      const hr = computeHadReplyFromEvents(json, me, selfId);
+      if (hr !== undefined) out.set(t.counterpartProfileUrl, hr);
+    } catch {
+      // best-effort per conversation — a failure just omits had_reply
+    }
+  }
+  return out;
+}
+
+/**
  * Resumable phase stepper. Reads the persisted checkpoint, walks the recipe's
  * phases (connection list(s) then messages), checkpoints to storage after EACH
  * page, and on completion finalizes (assembles + caches the per-source payload,
@@ -476,6 +546,28 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         scanPhaseResults: results,
         scanSelfId: selfId,
       });
+    }
+
+    // NT-99 follow-up — the bounded per-conversation had_reply probe (LinkedIn),
+    // AFTER the message phase so a failure never aborts a completed scan. Merges
+    // the two-way flag onto the summary rows by counterpart; unprobed/failed
+    // conversations keep had_reply ABSENT (the server then keeps its legacy
+    // log-everything behavior — presence-based back-compat).
+    if (recipe.messages?.messageEvents && results.messages.length > 0) {
+      const hadReplyByCounterpart = await runLinkedInMessageEventsPass(
+        recipe,
+        headers,
+        fetchImpl,
+        selfId,
+        sleep,
+      ).catch(() => new Map<string, boolean>());
+      if (hadReplyByCounterpart.size > 0) {
+        results.messages = results.messages.map((msg) =>
+          hadReplyByCounterpart.has(msg.counterpartProfileUrl)
+            ? { ...msg, had_reply: hadReplyByCounterpart.get(msg.counterpartProfileUrl) }
+            : msg,
+        );
+      }
     }
 
     // NT-63 best-effort owner side-passes, AFTER the connection/message phases so
