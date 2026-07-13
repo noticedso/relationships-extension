@@ -122,6 +122,18 @@ export type State = {
   lastScanCount: number | null;
   /** When the most recent automatic scan hit the network — drives the once-per-period throttle. */
   lastScanStartedAt: number | null;
+  /**
+   * NT-99 follow-up — per-conversation had_reply verdict cache, keyed by
+   * conversation urn: `{ at: lastActivityAt(ms) when probed, had_reply }`. Makes
+   * the message-events probe DELTA-ONLY: a conversation whose lastActivityAt is
+   * unchanged reuses its cached verdict with NO fetch (a re-scan of a quiet inbox
+   * probes ~0 conversations); new activity (at > cached.at) re-probes. Also
+   * correctness-bearing: without it a previously-false (one-way) conversation
+   * skipped on the next scan would lose its flag and regress to the server's
+   * legacy log-everything path. Pruned each pass to conversations still in the
+   * summary list, so it stays bounded by the list size.
+   */
+  hadReplyByConversation?: Record<string, { at: number; had_reply: boolean }> | null;
   needs: Needs;
   testMode?: boolean;
   // ── Checkpoint-and-resume scan state (MV3 resilience) ─────────────────────
@@ -159,6 +171,7 @@ const KEYS: (keyof State)[] = [
   "lastScanAt",
   "lastScanCount",
   "lastScanStartedAt",
+  "hadReplyByConversation",
   "needs",
   "testMode",
   "scanInProgress",

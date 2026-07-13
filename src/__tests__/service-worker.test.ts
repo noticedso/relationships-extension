@@ -1013,6 +1013,96 @@ describe("service worker", () => {
     expect(pendingConns(stored).length).toBe(2);
   });
 
+  // Build a scan-scoped fetchImpl over a mutable conversations page + per-urn
+  // events responder, so each scan's probe fetches can be counted independently.
+  function liFetchImpl(
+    page: () => unknown,
+    events: (decodedUrl: string) => unknown,
+    connCallRef: { n: number },
+  ) {
+    return vi.fn(async (url: string) => {
+      if (url.includes("/voyager/api/me"))
+        return { ok: true, json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }) } as Response;
+      if (url.includes("/msg/events"))
+        return { ok: true, json: async () => events(decodeURIComponent(url)) } as Response;
+      if (url.includes("/msg/conversations"))
+        return { ok: true, json: async () => page() } as Response;
+      connCallRef.n += 1;
+      const elements = connCallRef.n === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+  }
+  const eventsFetchCount = (f: ReturnType<typeof vi.fn>) =>
+    f.mock.calls.filter((c) => String(c[0]).includes("/msg/events")).length;
+
+  it("29-li-c. re-scan with NO new activity probes zero conversations and re-attaches cached had_reply verdicts", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const deps = { sleep: async () => {}, jitter: () => 0, nowMs: () => 1 };
+
+    // Scan 1: both conversations probed (empty cache).
+    const conn1 = { n: 0 };
+    const fetch1 = liFetchImpl(() => conversationsPage, eventsFor, conn1);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch1 as unknown as typeof fetch })).ok).toBe(true);
+    expect(eventsFetchCount(fetch1)).toBe(2);
+    const stored1 = await chrome.storage.local.get(null);
+    const cache = stored1.hadReplyByConversation as Record<string, { at: number; had_reply: boolean }>;
+    expect(cache["urn:li:msg_conversation:jane"]).toMatchObject({ had_reply: true });
+    expect(cache["urn:li:msg_conversation:bob"]).toMatchObject({ had_reply: false });
+
+    // Scan 2: identical conversations page (no new activity) → ZERO events
+    // fetches, but the payload still carries the cached verdicts (a one-way
+    // conversation must not silently regress to legacy log-everything).
+    const conn2 = { n: 0 };
+    const fetch2 = liFetchImpl(() => conversationsPage, eventsFor, conn2);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch2 as unknown as typeof fetch })).ok).toBe(true);
+    expect(eventsFetchCount(fetch2)).toBe(0);
+    const stored2 = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(messagesPayload(stored2).map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true);
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false);
+  });
+
+  it("29-li-d. only a conversation with NEW activity is re-probed; its verdict updates, others come from cache", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const deps = { sleep: async () => {}, jitter: () => 0, nowMs: () => 1 };
+
+    // Scan 1: jane two-way, bob one-way.
+    const conn1 = { n: 0 };
+    const fetch1 = liFetchImpl(() => conversationsPage, eventsFor, conn1);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch1 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Scan 2: bob has NEW activity (he finally replied) — jane unchanged.
+    const bumped = {
+      data: {
+        messengerConversationsBySyncToken: {
+          elements: [
+            convo("urn:li:msg_conversation:jane", "jane", 1750000900000),
+            convo("urn:li:msg_conversation:bob", "bob", 1750009999000),
+          ],
+        },
+      },
+    };
+    const bobNowTwoWay = (urn: string) =>
+      urn.includes("bob")
+        ? { data: { messengerMessagesByConversation: { elements: [evt("urn:li:fsd_profile:ACoAACself"), evt("urn:li:fsd_profile:ACoAAAbob")] } } }
+        : eventsFor(urn);
+    const conn2 = { n: 0 };
+    const fetch2 = liFetchImpl(() => bumped, bobNowTwoWay, conn2);
+    expect((await sw.runScan(undefined, { ...deps, fetchImpl: fetch2 as unknown as typeof fetch })).ok).toBe(true);
+
+    // Only bob was re-probed; jane's verdict came from the cache.
+    expect(eventsFetchCount(fetch2)).toBe(1);
+    expect(String(fetch2.mock.calls.find((c) => String(c[0]).includes("/msg/events"))?.[0])).toContain("bob");
+    const stored = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(messagesPayload(stored).map((m) => [m.counterpartProfileUrl, m.had_reply]));
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(true); // updated verdict
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true); // cached
+  });
+
   it("29. X tweets pass resolves self from the twid cookie, pages via max_id, and rides along as `mentions` (no text)", async () => {
     const chrome = getChrome();
     const xRecipe = {

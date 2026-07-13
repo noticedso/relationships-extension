@@ -378,6 +378,16 @@ async function runTweetsPass(
  * conversation simply omits had_reply (the server then keeps its legacy
  * log-everything behavior). Returns a map counterpartProfileUrl → had_reply for
  * the conversations it could determine. Best-effort: a total failure yields {}.
+ *
+ * DELTA-ONLY: verdicts are cached per conversation urn (`hadReplyByConversation`
+ * in storage, stamped with the lastActivityAt they were computed at). A
+ * conversation whose lastActivityAt is unchanged reuses its cached verdict with
+ * NO fetch — so a re-scan only probes conversations that are new or have new
+ * activity (a quiet inbox costs ~0 probe fetches). The cache is also
+ * correctness-bearing: it keeps a previously-false (one-way) conversation
+ * flagged on later scans instead of regressing to the server's legacy
+ * log-everything path. A failed probe leaves no cache entry, so it is naturally
+ * re-tried on the NEXT scan (never within one).
  */
 async function runLinkedInMessageEventsPass(
   recipe: ScanRecipe,
@@ -402,15 +412,30 @@ async function runLinkedInMessageEventsPass(
   if (!listRes.ok) return out;
   const listJson = await listRes.json();
   const targets = extractConversationEventTargets(listJson, fieldMap, me.conversationUrnPath, selfId)
-    .sort((a, b) => b.lastActivityAtMs - a.lastActivityAtMs) // most-recent first
-    .slice(0, Math.max(0, me.maxConversations)); // hard cap
+    .sort((a, b) => b.lastActivityAtMs - a.lastActivityAtMs); // most-recent first
+
+  // Split cached-and-unchanged (reuse the verdict, no fetch) from new/changed
+  // (needs a probe). The cap bounds actual FETCHES, not cache reuse.
+  const cache = (await getState()).hadReplyByConversation ?? {};
+  const nextCache: Record<string, { at: number; had_reply: boolean }> = {};
+  const needProbe: typeof targets = [];
+  for (const t of targets) {
+    const cached = cache[t.conversationUrn];
+    if (cached && cached.at >= t.lastActivityAtMs) {
+      out.set(t.counterpartProfileUrl, cached.had_reply);
+      nextCache[t.conversationUrn] = cached;
+    } else {
+      needProbe.push(t);
+    }
+  }
+  const probes = needProbe.slice(0, Math.max(0, me.maxConversations)); // hard cap
 
   const jitterMs = (): number =>
     me.jitterMinMs + Math.random() * Math.max(0, me.jitterMaxMs - me.jitterMinMs);
 
-  for (let i = 0; i < targets.length; i++) {
+  for (let i = 0; i < probes.length; i++) {
     if (i > 0) await sleep(jitterMs()); // paced between probes
-    const t = targets[i]!;
+    const t = probes[i]!;
     try {
       const url =
         recipe.targetOrigin +
@@ -418,14 +443,20 @@ async function runLinkedInMessageEventsPass(
           .replaceAll("{conversationUrn}", encodeURIComponent(t.conversationUrn))
           .replaceAll("{self}", selfId);
       const res = await fetchImpl(url, { credentials: "include", headers });
-      if (!res.ok) continue; // no retry — degrade to omitted
+      if (!res.ok) continue; // no retry — degrade to omitted, re-tried next scan
       const json = await res.json();
       const hr = computeHadReplyFromEvents(json, me, selfId);
-      if (hr !== undefined) out.set(t.counterpartProfileUrl, hr);
+      if (hr !== undefined) {
+        out.set(t.counterpartProfileUrl, hr);
+        nextCache[t.conversationUrn] = { at: t.lastActivityAtMs, had_reply: hr };
+      }
     } catch {
       // best-effort per conversation — a failure just omits had_reply
     }
   }
+  // Persist the pruned cache (only conversations still in the summary list) so
+  // the next scan is delta-only and the cache stays bounded.
+  await setState({ hadReplyByConversation: nextCache });
   return out;
 }
 
