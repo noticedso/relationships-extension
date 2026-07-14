@@ -155,6 +155,19 @@ export type State = {
   /** When the current scan began — drives the stale-zombie guard. */
   scanStartedAt?: number | null;
   /**
+   * This scan still owes itself a recipe refresh. Set by the scan STARTERS
+   * (scanNow / runScan), cleared by `continueScan` the moment it refreshes —
+   * BEFORE it fetches its first page.
+   *
+   * That ordering is the whole safety argument: `flag === true` implies the scan
+   * has fetched ZERO pages, so swapping in a fresh recipe cannot contradict a
+   * phase index / cursor that was derived from the old one. Once any page is
+   * fetched the flag is false forever for that scan, so a RESUMED scan (keepalive
+   * tick, MV3 restart) re-reads the checkpoint but never re-fetches the recipe
+   * and never swaps it mid-flight.
+   */
+  scanNeedsRecipeRefresh?: boolean | null;
+  /**
    * The id of the background handoff tab opened at finalize (the /x/sync page).
    * Closed on syncConfirmed so the silent background tab doesn't linger.
    */
@@ -182,6 +195,7 @@ const KEYS: (keyof State)[] = [
   "scanPhaseResults",
   "scanSelfId",
   "scanStartedAt",
+  "scanNeedsRecipeRefresh",
   "syncTabId",
 ];
 

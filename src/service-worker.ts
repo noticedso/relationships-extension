@@ -28,6 +28,14 @@ import {
 } from "./lib/message-extract";
 import type { XTweetEdgeRow } from "./lib/message-extract";
 import { planPhases, assembleScanPayload, type Phase, type ScanExtras } from "./lib/scan-plan";
+import {
+  DEFAULT_SOURCE,
+  RECIPE_PATH,
+  parseServedRecipes,
+  recipeList,
+  sourceOf,
+  toRecipeRecord,
+} from "./lib/recipe-source";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
 
@@ -37,7 +45,6 @@ const SCAN_PERIOD_MS = SCAN_PERIOD_MINUTES * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const SCAN_THROTTLE_MS = SCAN_PERIOD_MS - DAY_MS;
 const SYNC_PATH = "/x/sync";
-const DEFAULT_SOURCE = "linkedin_extension";
 
 const SCAN_TICK_ALARM = "scan-tick";
 const SCAN_TICK_PERIOD_MINUTES = 0.5;
@@ -102,8 +109,40 @@ function recipesOf(state: Partial<State>): Record<string, ScanRecipe> {
   return {};
 }
 
-function sourceOf(recipe: ScanRecipe): string {
-  return recipe.source ?? DEFAULT_SOURCE;
+/**
+ * Pull the CURRENT recipes from noticed and store them, so a scan never runs on
+ * a recipe from the previous sync. Recipes are served live precisely so endpoint
+ * drift (LinkedIn rotates its GraphQL `queryId`s) can be fixed without shipping
+ * an extension; before this, recipes only ever arrived on the `pair` message —
+ * and noticed's handoff order is scan → POST → re-pair → syncConfirmed, so every
+ * scan ran on the PREVIOUS recipe and a server-side fix landed one scan late.
+ *
+ * `https://*.noticed.so/*` is a REQUIRED host permission (manifest.json), so the
+ * service worker can call this with the user's session cookies — no new
+ * permission, no re-consent, no store re-review.
+ *
+ * BEST-EFFORT BY CONTRACT: any failure (offline, expired session, 401, non-2xx,
+ * HTML login page, malformed body) returns null and the caller keeps its cached
+ * recipe. A user who is signed out of noticed still scans exactly as before —
+ * refreshing the recipe must never be able to break scanning.
+ */
+async function refreshRecipesFromServer(
+  noticedOrigin: string | null | undefined,
+): Promise<Record<string, ScanRecipe> | null> {
+  if (!noticedOrigin) return null;
+  try {
+    const res = await fetch(noticedOrigin + RECIPE_PATH, { credentials: "include" });
+    if (!res.ok) return null;
+    // Validated + ATOMIC: a garbage/partial body yields null rather than
+    // clobbering a known-good cached recipe.
+    const parsed = parseServedRecipes(await res.json());
+    if (!parsed) return null;
+    // Recipes only — `account` stays owned by the pair path.
+    await setState({ recipe: parsed.recipe, recipes: parsed.recipes });
+    return parsed.recipes;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -147,6 +186,14 @@ export type RunScanDeps = {
   sleep?: (ms: number) => Promise<void>;
   jitter?: () => number;
   nowMs?: () => number;
+  /**
+   * Refresh the recipes from noticed at this scan's start (default true). Set
+   * false ONLY when the caller already holds a server-fresh recipe — the `pair`
+   * path (the recipes literally just arrived in the pair message), and the 2nd+
+   * source of one multi-source scan (the first source's refresh already stored
+   * EVERY source's recipe). Both would otherwise be a pointless double-fetch.
+   */
+  refreshRecipes?: boolean;
 };
 
 export type RunScanResult = { ok: boolean; needs?: string; count?: number; note?: string };
@@ -504,7 +551,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     const state = await getState();
     const { noticedOrigin, testMode, scanInProgress, scanSource } = state;
     if (!scanInProgress || !scanSource) return { ok: true, note: "not-in-progress" };
-    const recipe = recipesOf(state)[scanSource];
+    let recipe = recipesOf(state)[scanSource];
     if (!recipe) return { ok: false };
 
     if (isScanStale(state.scanStartedAt, now())) {
@@ -513,11 +560,38 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       return { ok: false, note: "stale" };
     }
 
-    const headers = await buildCsrfHeaders(recipe);
+    let headers = await buildCsrfHeaders(recipe);
     if (!headers) {
       await clearScanState({ needs: "network-signin" });
       clearScanTick();
       return { ok: false, needs: "network-signin" };
+    }
+
+    // ── Recipe refresh: ONCE, at the START of a scan ──────────────────────────
+    // Gated on the persisted `scanNeedsRecipeRefresh` flag, which the scan
+    // STARTERS set and which we clear here, BEFORE the first page is fetched. So:
+    //
+    //   • a genuine start refreshes exactly once and then scans on the FRESH
+    //     recipe (a rotated queryId applies to THIS scan, not the next one);
+    //   • a RESUMED scan (keepalive tick / MV3 restart / re-entrant continueScan)
+    //     sees the flag already false → no re-fetch, and the recipe it started
+    //     with cannot be swapped under its phase index + cursor;
+    //   • the flag being true implies zero pages have been fetched, so adopting a
+    //     new recipe here can never contradict an existing checkpoint.
+    //
+    // It sits AFTER the CSRF gate on purpose: no network session means no scan,
+    // and a scan that cannot run must not make a request to noticed either.
+    if (state.scanNeedsRecipeRefresh) {
+      const refreshed = await refreshRecipesFromServer(noticedOrigin);
+      await setState({ scanNeedsRecipeRefresh: false });
+      const fresh = refreshed?.[scanSource];
+      if (fresh) {
+        recipe = fresh;
+        // The fresh recipe may carry a different csrfRule — rebuild, but keep the
+        // headers we already have if it somehow yields none (never fail a scan).
+        headers = (await buildCsrfHeaders(recipe)) ?? headers;
+      }
+      // refreshed == null → keep the cached recipe + headers and scan as before.
     }
 
     const jitter = deps.jitter ?? makeJitter(recipe);
@@ -672,6 +746,7 @@ async function clearScanState(extra?: { needs?: "network-signin" }): Promise<voi
     scanPhaseResults: null,
     scanSelfId: null,
     scanStartedAt: null,
+    scanNeedsRecipeRefresh: false,
     ...(extra?.needs !== undefined ? { needs: extra.needs } : {}),
   });
 }
@@ -703,6 +778,7 @@ async function finalizeScan(
     scanPhaseResults: null,
     scanSelfId: null,
     scanStartedAt: null,
+    scanNeedsRecipeRefresh: false,
   } as const;
 
   if (!noticedOrigin) {
@@ -749,6 +825,8 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
     scanPhaseResults: { connLists: [], messages: [] },
     scanSelfId: null,
     scanStartedAt: now(),
+    // A genuine fresh start → owe a recipe refresh (continueScan performs it).
+    scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
     needs: null,
   });
   armScanTick();
@@ -766,11 +844,21 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
  * finalizes → opens another /x/sync tab → re-pairs → scans …, an unbounded loop
  * that continuously hammers LinkedIn/X (account-ban risk). A user gesture
  * (scanNow) deliberately bypasses this.
+ *
+ * `refreshRecipes` is false ONLY for the pair path, whose recipes arrived in the
+ * pair message microseconds ago — re-fetching them would be a pure double-fetch.
+ * The monthly alarm passes true: a 30-day-old recipe is exactly the stale one.
+ * Either way only the FIRST source refreshes — one response carries every
+ * source's recipe.
  */
-async function autoScanGrantedSources(): Promise<void> {
+async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promise<void> {
   const state = await getState();
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
-  for (const src of await grantedSources(recipesOf(state))) await runScan(src);
+  let refreshRecipes = opts.refreshRecipes;
+  for (const src of await grantedSources(recipesOf(state))) {
+    await runScan(src, { refreshRecipes });
+    refreshRecipes = false;
+  }
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -787,9 +875,9 @@ async function handleExternal(
     case "pair": {
       // Store the per-source recipes + account and arm the monthly alarm. The
       // host permission is requested from a user gesture in the popup, not here.
-      const list = message.recipes && message.recipes.length > 0 ? message.recipes : [message.recipe];
-      const recipes: Record<string, ScanRecipe> = {};
-      for (const r of list) if (r) recipes[sourceOf(r)] = r;
+      // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
+      // refresh (recipe-source.ts), so the two intake paths cannot drift.
+      const recipes = toRecipeRecord(recipeList(message.recipe, message.recipes));
       await setState({
         recipe: message.recipe,
         recipes,
@@ -805,7 +893,12 @@ async function handleExternal(
       // First-time users (no host permission yet) are scanned by the popup's grant
       // gesture / permissions.onAdded instead. Fire-and-forget so the connect
       // page's ack isn't blocked on the scan.
-      void autoScanGrantedSources();
+      //
+      // refreshRecipes:false — the recipes we just stored ARE the server's current
+      // ones (the connect page GET them from RECIPE_PATH immediately before it
+      // pairs), so a pair-triggered scan must not re-fetch them. The throttle
+      // above still guards the /x/sync re-pair → scan loop.
+      void autoScanGrantedSources({ refreshRecipes: false });
       return;
     }
     case "getCachedScan": {
@@ -906,6 +999,10 @@ async function handleInternal(
           scanPhaseResults: { connLists: [], messages: [] },
           scanSelfId: null,
           scanStartedAt: Date.now(),
+          // A user-gesture scan is a genuine fresh start → refresh the recipe.
+          // continueScan does the actual fetch AFTER the CSRF gate, so the ack
+          // below is never blocked on a round-trip to noticed (Cause B).
+          scanNeedsRecipeRefresh: true,
           needs: null,
         });
         armScanTick();
@@ -915,9 +1012,13 @@ async function handleInternal(
       // Drive the scan(s) WITHOUT blocking the ack. continueScan picks up the state
       // set above (and self-clears + sets needs:network-signin on a missing session);
       // any remaining sources scan sequentially after it.
+      //
+      // The remaining sources pass refreshRecipes:false — the first source's
+      // refresh already stored EVERY source's recipe (one response carries them
+      // all), so re-fetching per source would be a pure double-fetch.
       void (async () => {
         if (recipes[first]) await continueScan();
-        for (const src of list.slice(1)) await runScan(src);
+        for (const src of list.slice(1)) await runScan(src, { refreshRecipes: false });
       })();
       return;
     }
@@ -1027,7 +1128,9 @@ export function registerListeners(): void {
       return;
     }
     if (alarm.name !== SCAN_ALARM) return;
-    void autoScanGrantedSources();
+    // The ~30-day alarm: whatever recipe we hold is up to a month old — exactly
+    // the case a live-served recipe exists for. Refresh before scanning.
+    void autoScanGrantedSources({ refreshRecipes: true });
   });
 
   // Grant → scan. When the user approves "grant access", Chrome commonly
@@ -1047,7 +1150,13 @@ export function registerListeners(): void {
       const targets = Object.entries(recipes)
         .filter(([, r]) => added.some((o) => grantCovers(o, r.targetOrigin)))
         .map(([src]) => src);
-      for (const src of targets) await runScan(src);
+      // Grant is a user gesture that starts a real scan → refresh (only the first
+      // source; one response carries every source's recipe).
+      let refreshRecipes = true;
+      for (const src of targets) {
+        await runScan(src, { refreshRecipes });
+        refreshRecipes = false;
+      }
     })();
   });
 
