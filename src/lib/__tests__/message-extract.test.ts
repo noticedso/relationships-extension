@@ -44,15 +44,15 @@ describe("extractDmEntries (X)", () => {
       a.counterpartProfileUrl.localeCompare(b.counterpartProfileUrl),
     );
     expect(out).toEqual([
-      { counterpartProfileUrl: "100", lastMessageAt: "2025-06-15T15:21:40.000Z", direction: "sent" },
-      { counterpartProfileUrl: "200", lastMessageAt: "2025-06-15T15:20:00.000Z", direction: "sent" },
+      { counterpartProfileUrl: "100", lastMessageAt: "2025-06-15T15:21:40.000Z", direction: "sent", had_reply: true },
+      { counterpartProfileUrl: "200", lastMessageAt: "2025-06-15T15:20:00.000Z", direction: "sent", had_reply: true },
     ]);
   });
 
   it("never returns message text", () => {
     const page = { inbox_initial_state: { entries: [xEntry("c1", "100", "999", 1750000000000), xEntry("c1", "999", "100", 1750000900000)] } };
     const out = extractDmEntries(page, xFieldMap, SELF, false);
-    for (const m of out) expect(Object.keys(m).sort()).toEqual(["counterpartProfileUrl", "direction", "lastMessageAt"]);
+    for (const m of out) expect(Object.keys(m).sort()).toEqual(["counterpartProfileUrl", "direction", "had_reply", "lastMessageAt"]);
     expect(JSON.stringify(out)).not.toContain("SECRET");
   });
 
@@ -76,6 +76,68 @@ describe("extractDmEntries (X)", () => {
     expect(extractDmEntries(page, xFieldMap, SELF, false)[0]!.counterpartProfileUrl).toBe("100");
     const page2 = { inbox_initial_state: { entries: [xEntry("c1", "100", "999", 1)] } };
     expect(extractDmEntries(page2, xFieldMap, SELF, false)[0]!.counterpartProfileUrl).toBe("100");
+  });
+});
+
+// ── NT-107: unreplied X DMs are RECORDED (had_reply:false), not dropped ───────
+// Unanswered outreach is real relationship signal — the extension must EMIT the
+// verdict instead of silently dropping the conversation. Contract with the
+// server: had_reply true = two-way (scored), false = one-way (recorded + shown
+// on the timeline, scored ZERO), ABSENT = unknown (legacy).
+describe("extractDmEntries had_reply (NT-107)", () => {
+  const SELF = "999";
+  const page = {
+    inbox_initial_state: {
+      entries: [
+        xEntry("c1", "999", "100", 1750000000000), // OUTBOUND only → unreplied
+        xEntry("c2", "200", "999", 1750000100000), // INBOUND only → never replied to
+        xEntry("c3", "999", "300", 1750000200000), // two-way
+        xEntry("c3", "300", "999", 1750000900000),
+      ],
+    },
+  };
+  const byCounterpart = (excludeUnreplied: boolean) =>
+    Object.fromEntries(
+      extractDmEntries(page, xFieldMap, SELF, excludeUnreplied).map((m) => [
+        m.counterpartProfileUrl,
+        m.had_reply,
+      ]),
+    );
+
+  it("excludeUnreplied:false — an outbound-only conversation IS emitted with had_reply:false", () => {
+    expect(byCounterpart(false)["100"]).toBe(false);
+  });
+
+  it("excludeUnreplied:false — an inbound-only (never-replied-to) conversation IS emitted with had_reply:false", () => {
+    expect(byCounterpart(false)["200"]).toBe(false);
+  });
+
+  it("excludeUnreplied:false — a two-way conversation is emitted with had_reply:true", () => {
+    expect(byCounterpart(false)["300"]).toBe(true);
+  });
+
+  it("excludeUnreplied:false — EVERY conversation is emitted (nothing is silently dropped)", () => {
+    expect(extractDmEntries(page, xFieldMap, SELF, false)).toHaveLength(3);
+  });
+
+  it("excludeUnreplied:true — legacy drop preserved, and the surviving two-way rows still carry had_reply:true", () => {
+    // An OLD server recipe must behave exactly as before: never-replied dropped.
+    // The verdict rides along anyway (always true here, by construction) so the
+    // server gets it either way.
+    expect(byCounterpart(true)).toEqual({ "300": true });
+  });
+
+  it("never emits message text on the new one-way path either", () => {
+    const out = extractDmEntries(page, xFieldMap, SELF, false);
+    for (const m of out)
+      expect(Object.keys(m).sort()).toEqual(["counterpartProfileUrl", "direction", "had_reply", "lastMessageAt"]);
+    expect(JSON.stringify(out)).not.toContain("SECRET");
+  });
+
+  it("extractMessages dispatch carries had_reply through the dmEntries mode", () => {
+    const out = extractMessages(page, xFieldMap, SELF, false);
+    expect(out.find((m) => m.counterpartProfileUrl === "100")!.had_reply).toBe(false);
+    expect(out.find((m) => m.counterpartProfileUrl === "300")!.had_reply).toBe(true);
   });
 });
 

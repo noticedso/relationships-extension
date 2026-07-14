@@ -1235,6 +1235,94 @@ describe("service worker", () => {
     expect(byCp["https://www.linkedin.com/in/new0"]).toBeUndefined();
   });
 
+  // ── NT-107: X records unreplied DMs (had_reply:false) instead of dropping them ──
+
+  it("29-x. X DM pass emits EVERY conversation with had_reply (one-way=false, two-way=true), carried onto the X payload, never any text", async () => {
+    const chrome = getChrome();
+    const xDmRecipe = {
+      source: "x",
+      ingestPath: "/api/x/import/extension",
+      networkLabel: "X",
+      targetOrigin: "https://x.com",
+      listPathTemplate: "/friends?cursor={cursor}",
+      paginationParams: { pageSize: 2 },
+      cursorPath: "next_cursor_str",
+      pacing: { maxPagesPerSession: 5, minDelayMs: 0, maxDelayMs: 0 },
+      csrfRule: { header: "x-csrf-token", cookie: "ct0" },
+      fieldMap: { elementsPath: "users", firstName: "name", lastName: "", profileUrl: "screen_name", headline: "d", externalId: "id_str" },
+      messages: {
+        listPathTemplate: "/dm/inbox_initial_state.json",
+        pageSize: 50,
+        selfIdCookie: { name: "twid", pattern: "u=([0-9]+)" },
+        // The server flips this to false (the recipe is served live) — unanswered
+        // outreach is recorded, not dropped.
+        excludeUnreplied: false,
+        messageFieldMap: {
+          mode: "dmEntries",
+          entriesPath: "inbox_initial_state.entries",
+          conversationIdPath: "message.conversation_id",
+          senderIdPath: "message.message_data.sender_id",
+          recipientIdPath: "message.message_data.recipient_id",
+          timePath: "message.message_data.time",
+        },
+      },
+    };
+    await dispatchExternal({ type: "pair", recipe: xDmRecipe, account }, noticedSender);
+
+    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }: { url: string; name: string }) => {
+      if (name === "ct0") return { name, value: "csrf" };
+      if (name === "twid") return { name, value: "u=555" };
+      return null;
+    });
+
+    // `text` present on every DM event to prove the extractor never reads it.
+    const dm = (conv: string, sender: string, recipient: string, time: number) => ({
+      message: { conversation_id: conv, message_data: { sender_id: sender, recipient_id: recipient, time: String(time), text: "SECRET BODY" } },
+    });
+    let connCall = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.includes("/dm/inbox_initial_state"))
+        return {
+          ok: true,
+          json: async () => ({
+            inbox_initial_state: {
+              entries: [
+                dm("c1", "555", "100", 1750000000000), // outbound only → unreplied
+                dm("c2", "200", "555", 1750000100000), // inbound only → never replied to
+                dm("c3", "555", "300", 1750000200000), // two-way
+                dm("c3", "300", "555", 1750000900000),
+              ],
+            },
+          }),
+        } as Response;
+      connCall += 1;
+      const users = connCall === 1 ? [{ id_str: "2", name: "Bob", screen_name: "bob", d: "" }] : [];
+      return { ok: true, json: async () => ({ users, next_cursor_str: "0" }) } as Response;
+    });
+
+    const res = await sw.runScan("x", {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+      nowMs: () => 1,
+    });
+    expect(res.ok).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const payload = (stored.pendingScans as Record<string, { payload: Record<string, unknown> }>).x.payload;
+    const msgs = payload.messages as Array<Record<string, unknown>>;
+    // Nothing dropped: all three conversations reach the server.
+    expect(msgs).toHaveLength(3);
+    const byCp = Object.fromEntries(msgs.map((m) => [m.counterpartAccountId, m.had_reply]));
+    expect(byCp["100"]).toBe(false); // unanswered outreach — recorded, scored ZERO server-side
+    expect(byCp["200"]).toBe(false); // never replied to — recorded, scored ZERO
+    expect(byCp["300"]).toBe(true); // a real exchange — scored
+    // Metadata only: counterpart + timestamp + direction + verdict. Never text.
+    for (const m of msgs)
+      expect(Object.keys(m).sort()).toEqual(["counterpartAccountId", "direction", "had_reply", "lastMessageAt"]);
+    expect(JSON.stringify(stored.pendingScans)).not.toContain("SECRET");
+  });
+
   it("29. X tweets pass resolves self from the twid cookie, pages via max_id, and rides along as `mentions` (no text)", async () => {
     const chrome = getChrome();
     const xRecipe = {

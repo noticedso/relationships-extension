@@ -124,6 +124,28 @@ describe("assembleScanPayload", () => {
     expect(out.count).toBe(2); // 1 mutual + 1 message
   });
 
+  it("X: carries had_reply through onto the re-mapped messages (NT-107), omitting it when absent", () => {
+    const following = [conn("alice", "1"), conn("bob", "2")];
+    const followers = [conn("bob", "2"), conn("dave", "4")];
+    const msgs = [
+      { counterpartProfileUrl: "2", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "received" as const, had_reply: true },
+      { counterpartProfileUrl: "7", lastMessageAt: "2026-06-19T10:30:00.000Z", direction: "sent" as const, had_reply: false },
+      { counterpartProfileUrl: "9", lastMessageAt: "2026-06-18T10:30:00.000Z", direction: "sent" as const }, // legacy: unknown
+    ];
+    const out = assembleScanPayload(xRecipe, [following, followers], msgs, "owner-99");
+    expect(out.payload.messages).toEqual([
+      { counterpartAccountId: "2", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "received", had_reply: true },
+      { counterpartAccountId: "7", lastMessageAt: "2026-06-19T10:30:00.000Z", direction: "sent", had_reply: false },
+      { counterpartAccountId: "9", lastMessageAt: "2026-06-18T10:30:00.000Z", direction: "sent" }, // ABSENT stays absent
+    ]);
+    // The unknown row must not carry an explicit `had_reply: undefined` — absence
+    // is the wire signal the server reads as "legacy, score as today".
+    const unknown = (out.payload.messages as Array<Record<string, unknown>>)[2]!;
+    expect("had_reply" in unknown).toBe(false);
+    // Unreplied DMs count as imported rows (they ARE recorded, just not scored).
+    expect(out.count).toBe(4); // 1 mutual + 3 messages
+  });
+
   // ── NT-63 side-pass extras (owner profile + tweet edges) ──────────────────────
 
   it("LinkedIn: threads ownerProfile raw JSON through when provided, omits the key otherwise", () => {
