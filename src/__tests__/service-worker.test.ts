@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChromeMock } from "../../test/mocks/chrome";
+import { RECIPE_PATH } from "../lib/recipe-source";
 import * as sw from "../service-worker";
 
 // The chrome mock is installed per-test by test/setup.ts (globalThis.chrome).
@@ -430,9 +431,17 @@ describe("service worker", () => {
   // ── Checkpoint + resume (E1/E3) ─────────────────────────────────────────────
 
   // A full page each time → 3 full pages then a short page (cap is 5 here).
+  //
+  // The service worker also GETs the noticed recipe endpoint at the start of a
+  // scan. This fixture serves only the TARGET SITE, so it answers the recipe URL
+  // with a 404 — which is the "no fresh recipe available" path: the scan falls
+  // back to the cached (paired) recipe, exactly as it behaved before the refresh
+  // existed. Crucially it does NOT advance `call`, so the page sequence (and the
+  // per-test page-count assertions) are unaffected by the recipe request.
   function makeFullThenShortFetch(fullPages: number) {
     let call = 0;
-    return vi.fn(async () => {
+    return vi.fn(async (url: string) => {
+      if (String(url).includes(RECIPE_PATH)) return { ok: false, status: 404 } as Response;
       call += 1;
       const elements =
         call <= fullPages
@@ -1366,5 +1375,194 @@ describe("service worker", () => {
 
     // onAdded must not clobber the in-flight checkpoint by re-initializing a scan.
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  // ── Recipe refresh at scan START (the one-scan-lag bug) ─────────────────────
+  //
+  // Recipes are served live so LinkedIn endpoint drift (rotating GraphQL
+  // queryIds) can be fixed WITHOUT shipping an extension. But recipes only ever
+  // arrived on `pair`, and noticed's handoff order is
+  //   scan → POST payload → re-pair (fresh recipes stored) → syncConfirmed
+  // so a scan always ran on the PREVIOUS recipe and only refreshed afterwards.
+  // Measured in prod on v1.2.6: the server was serving the messageEvents probe,
+  // the scan wrote 16 conversations with had_reply unknown, and the extension had
+  // no `hadReplyByConversation` key at all — the probe was absent from the recipe
+  // AT SCAN TIME. The fix: refresh from the server at the START of a scan.
+
+  /** The recipe the extension has CACHED: messages, but no messageEvents probe. */
+  function withoutProbe(r: typeof liMessagesRecipe) {
+    const messages = { ...r.messages };
+    delete (messages as { messageEvents?: unknown }).messageEvents;
+    return { ...r, messages };
+  }
+
+  /**
+   * A fetch stub that serves BOTH noticed (the recipe endpoint) and the target
+   * site (connections / conversations / message events). `served` is the recipe
+   * body noticed returns; pass a `{ ok:false }` status or a garbage body to
+   * exercise the fallback.
+   */
+  function makeServerFetch(served: unknown, recipeStatus = 200) {
+    let connCall = 0;
+    return vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u.includes(RECIPE_PATH)) {
+        if (recipeStatus !== 200) return { ok: false, status: recipeStatus } as Response;
+        return { ok: true, json: async () => served } as Response;
+      }
+      if (u.includes("/voyager/api/me"))
+        return {
+          ok: true,
+          json: async () => ({ miniProfile: { entityUrn: "urn:li:fsd_profile:ACoAACself" } }),
+        } as Response;
+      if (u.includes("/msg/events"))
+        return { ok: true, json: async () => eventsFor(decodeURIComponent(u)) } as Response;
+      if (u.includes("/msg/conversations"))
+        return { ok: true, json: async () => conversationsPage } as Response;
+      connCall += 1;
+      const elements = connCall === 1 ? [makeElement("a"), makeElement("b")] : [];
+      return { ok: true, json: async () => ({ elements }) } as Response;
+    });
+  }
+
+  const urlsOf = (spy: { mock: { calls: unknown[][] } }): string[] =>
+    spy.mock.calls.map((c) => String(c[0]));
+  const settle = () => new Promise((r) => setTimeout(r, 30));
+
+  it("33. a server-side recipe change applies to THIS scan: the scan refreshes at START and runs the freshly-served probe (one-scan-lag fix)", async () => {
+    const chrome = getChrome();
+    // CACHED = the previous recipe: messages, but NO messageEvents probe.
+    await dispatchExternal(
+      { type: "pair", recipe: withoutProbe(liMessagesRecipe), account },
+      noticedSender,
+    );
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+
+    // noticed NOW serves the probe (the server-side activation / rotated queryId).
+    const fetchSpy = makeServerFetch({ recipe: liMessagesRecipe, recipes: [liMessagesRecipe] });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+
+    await dispatchInternal({ type: "scanNow" });
+    await settle();
+
+    const urls = urlsOf(fetchSpy);
+    // It refreshed from noticed …
+    expect(urls.some((u) => u.includes(RECIPE_PATH))).toBe(true);
+    // … and the scan's OUTBOUND URLs reflect the NEW recipe, not the cached one:
+    // the cached recipe has no messageEvents, so /msg/events can only have been
+    // reached via the freshly-fetched recipe. This is the bug, inverted.
+    expect(urls.some((u) => u.includes("/msg/events"))).toBe(true);
+
+    const stored = await chrome.storage.local.get(null);
+    const byCp = Object.fromEntries(
+      messagesPayload(stored).map((m) => [m.counterpartProfileUrl, m.had_reply]),
+    );
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true); // two-way
+    expect(byCp["https://www.linkedin.com/in/bob"]).toBe(false); // one-way
+    // the freshly-served recipe is now the cached one
+    const recipes = stored.recipes as Record<string, { messages?: { messageEvents?: unknown } }>;
+    expect(recipes.linkedin_extension?.messages?.messageEvents).toBeTruthy();
+    // connections still import, and the privacy rail holds
+    expect(pendingConns(stored).length).toBe(2);
+    expect(JSON.stringify(stored.pendingScans)).not.toContain("SECRET");
+  });
+
+  it("34. a FAILED recipe refresh (401/offline) never blocks the scan — it falls back to the cached recipe and completes", async () => {
+    const chrome = getChrome();
+    // CACHED = the full recipe, probe included (a user signed out of noticed).
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+
+    const fetchSpy = makeServerFetch(null, 401); // session expired
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+
+    await dispatchInternal({ type: "scanNow" });
+    await settle();
+
+    const urls = urlsOf(fetchSpy);
+    expect(urls.some((u) => u.includes(RECIPE_PATH))).toBe(true); // it tried …
+    expect(urls.some((u) => u.includes("/msg/events"))).toBe(true); // … and scanned anyway
+
+    const stored = await chrome.storage.local.get(null);
+    expect(pendingConns(stored).length).toBe(2); // the scan completed
+    expect(stored.needs).toBe("noticed-signin"); // ready to hand off
+    const byCp = Object.fromEntries(
+      messagesPayload(stored).map((m) => [m.counterpartProfileUrl, m.had_reply]),
+    );
+    expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true); // cached recipe drove it
+  });
+
+  it("34b. a malformed 200 recipe body is NOT stored over the good cached recipe (and the scan still completes)", async () => {
+    const chrome = getChrome();
+    await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+
+    // A 200 that is NOT a recipe (an HTML login page, an error body, …).
+    const fetchSpy = makeServerFetch({ error: "unauthorized" });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+
+    await dispatchInternal({ type: "scanNow" });
+    await settle();
+
+    const stored = await chrome.storage.local.get(null);
+    // The cached recipe survived intact — garbage must never clobber it.
+    const recipes = stored.recipes as Record<string, { messages?: { messageEvents?: unknown } }>;
+    expect(recipes.linkedin_extension?.messages?.messageEvents).toBeTruthy();
+    expect(pendingConns(stored).length).toBe(2); // and the scan completed
+  });
+
+  it("35. a RESUMED scan does NOT re-fetch the recipe — it keeps the one it started with (no mid-scan swap)", async () => {
+    const chrome = getChrome();
+    await pair(); // cached = the plain connections recipe
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    // The server would hand out a DIFFERENT recipe — but a resume must not ask.
+    const fetchSpy = makeServerFetch({ recipe: liMessagesRecipe, recipes: [liMessagesRecipe] });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+
+    // A scan that already fetched a page → its start-of-scan refresh is DONE
+    // (continueScan clears the flag before the first page), so the keepalive tick
+    // resumes it from the checkpoint.
+    await chrome.storage.local.set(
+      inProgress({ scanCursor: 1, scanNeedsRecipeRefresh: false }),
+    );
+    chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
+    await settle();
+
+    const urls = urlsOf(fetchSpy);
+    expect(urls.some((u) => u.includes(RECIPE_PATH))).toBe(false); // never re-fetched
+    expect(urls.some((u) => u.includes("/msg/events"))).toBe(false); // never swapped in
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress ?? false).toBe(false); // resumed → finished
+    expect(stored.needs).toBe("noticed-signin");
+    // the recipe it started with is still the stored one
+    const recipes = stored.recipes as Record<string, { messages?: unknown }>;
+    expect(recipes.linkedin_extension?.messages).toBeUndefined();
+  });
+
+  it("36. pair does NOT re-fetch the recipe it was just handed (no double-fetch) and runs exactly ONE scan (no loop)", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const tabSpy = vi.spyOn(chrome.tabs, "create");
+
+    const fetchSpy = makeServerFetch({ recipe, recipes: [recipe] });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+
+    await pair(); // the pair message already CARRIES the server's current recipes
+    await settle();
+
+    // The pair-triggered auto-scan must not re-fetch what it was just handed.
+    expect(urlsOf(fetchSpy).filter((u) => u.includes(RECIPE_PATH))).toHaveLength(0);
+
+    const stored = await chrome.storage.local.get(null);
+    expect(pendingConns(stored).length).toBeGreaterThan(0); // it DID scan
+    // Exactly one handoff tab → exactly one scan. A scan loop (scan → /x/sync →
+    // re-pair → scan …) would open many.
+    expect(tabSpy).toHaveBeenCalledTimes(1);
   });
 });
