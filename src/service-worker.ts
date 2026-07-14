@@ -106,6 +106,25 @@ export function grantCovers(pattern: string, targetOrigin: string): boolean {
   }
 }
 
+/**
+ * Is the owner currently signed in to a source's network? Read live from the
+ * session cookie the scanner uses for its CSRF header (present + non-empty →
+ * signed in), so the popup can show a per-network "not signed in" state without
+ * running a scan. Mirrors buildCsrfHeaders' cookie check; needs the source's
+ * host permission, so only probe granted sources (others → null/unknown).
+ */
+async function isSignedIn(recipe: ScanRecipe): Promise<boolean> {
+  try {
+    const cookie = await chrome.cookies.get({
+      url: recipe.targetOrigin,
+      name: recipe.csrfRule.cookie,
+    });
+    return Boolean(cookie && typeof cookie.value === "string" && cookie.value.trim() !== "");
+  } catch {
+    return false;
+  }
+}
+
 /** Sources whose optional host permission the user has already granted. */
 async function grantedSources(
   recipes: Record<string, ScanRecipe>,
@@ -707,17 +726,24 @@ async function handleInternal(
       const recipes = recipesOf(state);
       const granted = await grantedSources(recipes);
       const lastBy = state.lastScanBySource ?? {};
-      const sources = Object.values(recipes).map((r) => {
-        const s = sourceOf(r);
-        return {
-          source: s,
-          networkLabel: r.networkLabel ?? s,
-          targetOrigin: r.targetOrigin,
-          granted: granted.includes(s),
-          lastScanAt: lastBy[s]?.at ?? null,
-          lastScanCount: lastBy[s]?.count ?? null,
-        };
-      });
+      const sources = await Promise.all(
+        Object.values(recipes).map(async (r) => {
+          const s = sourceOf(r);
+          const isGranted = granted.includes(s);
+          return {
+            source: s,
+            networkLabel: r.networkLabel ?? s,
+            targetOrigin: r.targetOrigin,
+            granted: isGranted,
+            // Only granted sources can be cookie-probed (host permission); leave
+            // others unknown so the popup defers to its grant flow, not a false
+            // "not signed in". Live so it survives the needs-clobbering bug.
+            signedIn: isGranted ? await isSignedIn(r) : null,
+            lastScanAt: lastBy[s]?.at ?? null,
+            lastScanCount: lastBy[s]?.count ?? null,
+          };
+        }),
+      );
       const lastScanAt = state.lastScanAt ?? null;
       sendResponse({
         account: state.account ?? null,

@@ -78,6 +78,13 @@ function openConnect(): void {
   if (chrome.tabs?.create) void chrome.tabs.create({ url });
   else window.open(url, "_blank");
 }
+// Open a network's site in a new tab so the user can sign in. targetOrigin is
+// runtime data from the recipe (e.g. the network's root URL), never a hard-coded
+// platform literal, so the popup's platform-name purity guard stays satisfied.
+function openNetwork(targetOrigin: string): void {
+  if (typeof chrome !== "undefined" && chrome.tabs?.create) void chrome.tabs.create({ url: targetOrigin });
+  else window.open(targetOrigin, "_blank");
+}
 function wireOnce(el: HTMLElement | null, fn: () => void): void {
   if (el && el.dataset.wired !== "1") {
     el.dataset.wired = "1";
@@ -117,6 +124,12 @@ type SourceStatus = {
   networkLabel?: string;
   targetOrigin?: string;
   granted?: boolean;
+  // Live cookie probe (getStatus): true/false for granted sources, null for
+  // sources whose host permission isn't granted yet (unknown — grant flow owns
+  // those). Drives the per-network "not signed in" warning.
+  signedIn?: boolean | null;
+  lastScanAt?: number | null;
+  lastScanCount?: number | null;
 };
 
 type Status = {
@@ -190,6 +203,67 @@ function setLastScanLine(
   } else {
     setText(root, "last-scan", "no sync yet");
   }
+}
+
+// A compact "day month" stamp (e.g. "2 Feb") for the per-network rows, matching
+// the recent-syncs list rather than the wider aggregate date.
+function formatShortDate(ms: number): string {
+  return new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short" }).format(new Date(ms));
+}
+
+// One per-network status row. A source the user is signed out of gets a warning
+// line + an inline "sign in" link that opens that network; otherwise the row
+// shows its last sync (or "not synced yet"). Every label is runtime data
+// (networkLabel), never a hard-coded platform name.
+function buildNetworkRow(s: SourceStatus): HTMLLIElement {
+  const li = document.createElement("li");
+  li.className = "net-row";
+  const label = s.networkLabel ?? prettifySource(s.source);
+
+  if (s.granted && s.signedIn === false) {
+    li.classList.add("net-row--warn");
+    const text = document.createElement("span");
+    text.className = "net-text";
+    text.textContent = `${label} · not signed in ⚠`;
+    li.append(text);
+    if (s.targetOrigin) {
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "net-signin";
+      link.textContent = "sign in";
+      link.addEventListener("click", () => openNetwork(s.targetOrigin!));
+      li.append(link);
+    }
+    return li;
+  }
+
+  const text = document.createElement("span");
+  text.className = "net-text";
+  if (s.lastScanAt != null) {
+    text.textContent = `${label} · ${s.lastScanCount ?? 0} synced · ${formatShortDate(s.lastScanAt)}`;
+  } else {
+    text.textContent = `${label} · not synced yet`;
+  }
+  li.append(text);
+  return li;
+}
+
+// Render the per-network status list from status.sources. Returns true when it
+// rendered rows (so the caller hides the aggregate #last-scan line it
+// supersedes); false when there are no sources (legacy single-source shape),
+// leaving the aggregate line in charge.
+function renderNetworkStatus(root: Document | HTMLElement, status: Status): boolean {
+  const list = root.querySelector<HTMLElement>("#network-status");
+  if (!list) return false;
+  const sources = status.sources ?? [];
+  if (sources.length === 0) {
+    list.replaceChildren();
+    list.hidden = true;
+    return false;
+  }
+  list.replaceChildren(...sources.map(buildNetworkRow));
+  list.hidden = false;
+  return true;
 }
 
 type SyncRun = {
@@ -316,15 +390,13 @@ function render(root: Document | HTMLElement, status: Status): void {
       "password and no noticed login — it hands data to your own signed-in noticed tab.",
   );
 
-  // The noticed-signin case is handled in init() via a single source of truth
-  // (applyNoticedSigninState) so the red "finish syncing" text never appears
-  // without the actionable #signin-cta button beside it (E4). Here we only render
-  // the network-signin case — a sign-in to the user's professional network, which
-  // is informative-only (not actionable via this button).
-  if (status.needs === "network-signin") {
-    const label2 = status.recipe?.networkLabel ?? "your professional network";
-    setText(root, "needs", `sign in to ${label2} so we can read your connections.`);
-  } else if (status.needs !== "noticed-signin") {
+  // Network sign-in is surfaced PER-NETWORK in the status list now
+  // (renderNetworkStatus), correctly naming the network the user is logged out
+  // of — the old aggregate #needs line hard-coded the single recipe's label and
+  // was wrong once a second network existed. The noticed-signin case is still
+  // handled in init() via applyNoticedSigninState (its own message + button).
+  // Clear any stale #needs text unless a noticed sign-in is pending.
+  if (status.needs !== "noticed-signin") {
     setText(root, "needs", "");
   }
 
@@ -442,13 +514,19 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     const explainer = root.querySelector<HTMLElement>("#grant-explainer");
     const nextScan = root.querySelector<HTMLElement>("#next-scan");
     const lastScan = root.querySelector<HTMLElement>("#last-scan");
+    const networkStatus = root.querySelector<HTMLElement>("#network-status");
+    // Populate the per-network rows; when present they supersede the aggregate
+    // #last-scan line (show one or the other, never both).
+    const hasNetworkRows = renderNetworkStatus(root, status);
     if (explainer) explainer.hidden = true;
     if (nextScan) nextScan.hidden = false;
-    if (lastScan) lastScan.hidden = false;
+    if (lastScan) lastScan.hidden = hasNetworkRows;
+    if (networkStatus) networkStatus.hidden = !hasNetworkRows;
     if (!granted && grantPatterns.length > 0) {
       next.textContent = "grant access";
       if (nextScan) nextScan.hidden = true;
       if (lastScan) lastScan.hidden = true;
+      if (networkStatus) networkStatus.hidden = true;
       if (explainer) {
         explainer.textContent = grantExplainerText(status);
         explainer.hidden = false;

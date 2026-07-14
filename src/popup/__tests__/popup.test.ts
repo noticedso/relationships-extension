@@ -24,6 +24,7 @@ function buildDom() {
     <div id="account-name"></div>
     <div id="account-email"></div>
     <div id="next-scan"></div>
+    <ul id="network-status" hidden></ul>
     <div id="last-scan"></div>
     <button id="scan-now"></button>
     <span id="scan-spinner" hidden></span>
@@ -530,28 +531,89 @@ describe("popup", () => {
     }
   });
 
-  it("E4: keeps the network-signin informative text (and does NOT show the noticed button) for network-signin", async () => {
-    const networkSignin = {
+  it("surfaces a signed-out granted network as a per-network warning row (not the aggregate #needs line) and does NOT show the noticed button", async () => {
+    // A granted source the user is logged out of (signedIn:false) — the SW's
+    // live cookie probe. It should render as a per-network warning row, NOT the
+    // old aggregate #needs text (which hard-coded the wrong recipe label).
+    const status = {
       account: { name: "X" },
       recipe: { networkLabel: "ExampleNet" },
+      sources: [
+        {
+          source: "example_net",
+          networkLabel: "ExampleNet",
+          targetOrigin: "https://example.net",
+          granted: true,
+          signedIn: false,
+          lastScanAt: null,
+          lastScanCount: null,
+        },
+      ],
       needs: "network-signin",
       lastScanAt: null,
       lastScanCount: null,
     };
+    const create = vi.fn();
     const sendMessage = vi.fn(async (m: { type: string }) =>
-      m.type === "getSyncHistory" ? { runs: [] } : networkSignin,
+      m.type === "getSyncHistory" ? { runs: [] } : status,
+    );
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create },
+      permissions: { contains: vi.fn(async () => true) },
+    };
+
+    await init(document);
+
+    const list = document.getElementById("network-status")!;
+    expect(list.hidden).toBe(false);
+    const row = list.querySelector(".net-row--warn")!;
+    expect(row).not.toBeNull();
+    expect(row.textContent).toContain("ExampleNet");
+    expect(row.textContent).toContain("not signed in");
+    // the aggregate red #needs line is gone; the noticed button stays hidden
+    expect(document.getElementById("needs")!.textContent).toBe("");
+    expect((document.getElementById("signin-cta") as HTMLButtonElement).hidden).toBe(true);
+
+    // the inline "sign in" link opens that network's site so the user can log in
+    const signin = row.querySelector<HTMLButtonElement>(".net-signin")!;
+    signin.click();
+    expect(create).toHaveBeenCalledWith({ url: "https://example.net" });
+  });
+
+  it("shows synced per-network rows (label · count synced · date) and hides the aggregate last-scan line", async () => {
+    const status = {
+      account: { name: "X" },
+      recipe: { networkLabel: "LinkedIn" },
+      sources: [
+        { source: "linkedin_extension", networkLabel: "LinkedIn", targetOrigin: "https://li.example", granted: true, signedIn: true, lastScanAt: 1707091200000, lastScanCount: 342 },
+        { source: "x", networkLabel: "X", targetOrigin: "https://x.example", granted: true, signedIn: true, lastScanAt: null, lastScanCount: null },
+      ],
+      needs: null,
+      lastScanAt: 1707091200000,
+      lastScanCount: 342,
+    };
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs: [] } : status,
     );
     (globalThis as unknown as { chrome: unknown }).chrome = {
       runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
       tabs: { create: vi.fn() },
+      permissions: { contains: vi.fn(async () => true) },
     };
 
     await init(document);
-    const needsText = document.getElementById("needs")!.textContent ?? "";
-    expect(needsText.toLowerCase()).toContain("sign in to");
-    expect(needsText).toContain("ExampleNet"); // network label, informative
-    // not actionable via the noticed button
-    expect((document.getElementById("signin-cta") as HTMLButtonElement).hidden).toBe(true);
+
+    const rows = document.querySelectorAll("#network-status .net-row");
+    expect(rows.length).toBe(2);
+    expect(rows[0].textContent).toContain("LinkedIn");
+    expect(rows[0].textContent).toContain("342 synced");
+    expect(rows[1].textContent).toContain("not synced yet");
+    // per-network rows supersede the aggregate line
+    expect(document.getElementById("network-status")!.hidden).toBe(false);
+    expect((document.getElementById("last-scan") as HTMLElement).hidden).toBe(true);
+    // no signed-out sources → no warning rows
+    expect(document.querySelectorAll("#network-status .net-row--warn").length).toBe(0);
   });
 
   it("E4: still shows the Sign-in button when only history.needs is noticed-signin (the 401 path)", async () => {
