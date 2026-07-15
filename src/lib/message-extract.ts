@@ -7,7 +7,9 @@
  *  - "dmEntries" (X): a flat list of message events, each carrying sender_id,
  *    recipient_id, time and conversation_id. We group by conversation, take the
  *    last message, derive counterpart + direction from sender/recipient vs self,
- *    and (for excludeUnreplied) keep only conversations with ≥1 message each way.
+ *    and emit `had_reply` (≥1 message each way) so the server can record an
+ *    unanswered DM without scoring it (NT-107). The legacy `excludeUnreplied`
+ *    switch still drops never-replied conversations when the served recipe asks.
  *  - "participantConversations" (LinkedIn): a list of conversations, each with a
  *    participants array + a last-activity timestamp. Counterpart = the
  *    participant that isn't self. The conversations API does not expose the last
@@ -225,7 +227,22 @@ export function extractTweetEdges(
   return out;
 }
 
-/** X DM inbox: group message events by conversation; last message per convo. */
+/**
+ * X DM inbox: group message events by conversation; last message per convo.
+ *
+ * NT-107 — unanswered outreach IS relationship signal. Every conversation is
+ * EMITTED carrying `had_reply = sawSelf && sawCounterpart`; the server records
+ * one-way conversations and shows them on the timeline but scores them ZERO.
+ * The extractor already had the verdict in hand — it just used to throw the
+ * conversation away.
+ *
+ * `excludeUnreplied` (recipe-served) is the LEGACY drop switch, kept so an old
+ * server recipe behaves exactly as it did before this change: when it is `true`
+ * a never-replied conversation is dropped. The survivors are two-way by
+ * construction, so they still carry `had_reply: true` — the verdict is emitted
+ * on BOTH paths and the server gets it either way. The server flips the served
+ * recipe to `excludeUnreplied: false` to turn recording on.
+ */
 export function extractDmEntries(
   page: unknown,
   fieldMap: DmEntriesFieldMap,
@@ -265,11 +282,13 @@ export function extractDmEntries(
 
   const out: ScanMessage[] = [];
   for (const acc of byConv.values()) {
-    if (excludeUnreplied && !(acc.sawSelf && acc.sawCounterpart)) continue; // never-replied
+    const hadReply = acc.sawSelf && acc.sawCounterpart; // messages BOTH ways = a real exchange
+    if (excludeUnreplied && !hadReply) continue; // legacy recipe: drop never-replied
     out.push({
       counterpartProfileUrl: (fieldMap.counterpartUrlPrefix ?? "") + acc.counterpart,
       lastMessageAt: acc.iso,
       direction: acc.direction,
+      had_reply: hadReply,
     });
   }
   return out;

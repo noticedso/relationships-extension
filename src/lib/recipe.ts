@@ -89,12 +89,17 @@ export type ScanMessage = {
   lastMessageAt: string; // ISO 8601
   direction: "sent" | "received";
   /**
-   * NT-99 follow-up — the per-conversation two-way signal from the bounded
-   * message-events probe (LinkedIn): `true` = messages both ways (a real reply),
-   * `false` = one-way/unreplied, ABSENT = unfetched/failed/over-cap or a source
-   * without the probe (X). Still metadata only — derived from message SENDERS,
-   * never the text. The server gates its scored replay on this (absent = legacy
-   * log-everything).
+   * The per-conversation two-way signal. `true` = messages both ways (a real
+   * exchange) ⇒ the server SCORES it; `false` = one-way/unreplied ⇒ the server
+   * RECORDS it and shows it on the timeline but scores it ZERO (NT-107 —
+   * unanswered outreach is real, it must not be silently dropped); ABSENT =
+   * unknown ⇒ legacy, the server scores it as it does today.
+   *
+   * Sources: LinkedIn derives it from the bounded per-conversation message-events
+   * probe (NT-99 follow-up — absent when unfetched/failed/over-cap); X derives it
+   * inline in `extractDmEntries` from the DM events it already reads (NT-107 —
+   * always present). Still metadata only — derived from message SENDERS, never
+   * the text.
    */
   had_reply?: boolean;
 };

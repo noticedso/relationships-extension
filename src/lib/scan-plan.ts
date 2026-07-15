@@ -92,10 +92,15 @@ export function assembleScanPayload(
       accountId: (c.externalId ?? c.profileUrl) ?? "",
       handle: c.profileUrl,
     }));
+    // NT-107 — `had_reply` must survive the X re-map: `false` (an unreplied DM)
+    // is the whole point of the change, so dropping the key here would silently
+    // un-do it. Spread it only when the extractor produced a verdict — ABSENT is
+    // the wire signal the server reads as "unknown / legacy, score as today".
     const msgs = messages.map((m) => ({
       counterpartAccountId: m.counterpartProfileUrl,
       lastMessageAt: m.lastMessageAt,
       direction: m.direction,
+      ...(m.had_reply !== undefined ? { had_reply: m.had_reply } : {}),
     }));
     // Owner-tweet mention/reply edges (NT-63) ride along as `mentions` — the
     // server maps them into interaction signal. Always present (empty by default)
