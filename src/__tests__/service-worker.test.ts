@@ -135,6 +135,55 @@ describe("service worker", () => {
     expect(res.lastScanAt).toBeNull();
   });
 
+  // Seed paired state WITHOUT the pair() message so its fire-and-forget
+  // auto-scan can't race a granted permission into a real network fetch.
+  async function seedPaired(): Promise<void> {
+    await getChrome().storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+    });
+  }
+
+  it("3b. getStatus reports per-source signedIn from a live cookie probe on granted sources", async () => {
+    const chrome = getChrome();
+    await seedPaired();
+    // grant the host permission + a live session cookie for the network
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const cookieSpy = vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    const res = (await dispatchInternal({ type: "getStatus" })) as {
+      sources: Array<{ source: string; granted: boolean; signedIn: boolean | null }>;
+    };
+    const src = res.sources.find((s) => s.source === "linkedin_extension")!;
+    expect(src.granted).toBe(true);
+    expect(src.signedIn).toBe(true);
+    // probed the recipe's CSRF cookie at its target origin (mirrors the scanner)
+    expect(cookieSpy).toHaveBeenCalledWith({ url: recipe.targetOrigin, name: "tok" });
+  });
+
+  it("3c. getStatus reports signedIn:false when logged out, and null (unprobed) when the source isn't granted", async () => {
+    const chrome = getChrome();
+    await seedPaired();
+    // granted but logged out → the cookie is absent
+    const containsSpy = vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue(null);
+    let res = (await dispatchInternal({ type: "getStatus" })) as {
+      sources: Array<{ source: string; granted: boolean; signedIn: boolean | null }>;
+    };
+    expect(res.sources.find((s) => s.source === "linkedin_extension")!.signedIn).toBe(false);
+
+    // not granted → signedIn is null (unknown); the grant flow owns this state
+    containsSpy.mockResolvedValue(false);
+    res = (await dispatchInternal({ type: "getStatus" })) as {
+      sources: Array<{ source: string; granted: boolean; signedIn: boolean | null }>;
+    };
+    const src = res.sources.find((s) => s.source === "linkedin_extension")!;
+    expect(src.granted).toBe(false);
+    expect(src.signedIn).toBeNull();
+  });
+
   it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
     const chrome = getChrome();
     await pair();

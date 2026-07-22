@@ -223,6 +223,42 @@ body {
   background: var(--muted);
 }
 
+/* per-network status list (NT-45): one compact row per paired source. A row for
+   a network the user is signed out of turns destructive and carries an inline
+   "sign in" link. */
+.network-status {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.net-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--text-label);
+  color: var(--content-tertiary);
+}
+.net-row--warn .net-text {
+  color: var(--destructive);
+}
+.net-signin {
+  flex: none;
+  appearance: none;
+  border: none;
+  background: none;
+  cursor: pointer;
+  padding: 0;
+  font-family: inherit;
+  font-size: var(--text-label);
+  color: var(--brand-text);
+}
+.net-signin:hover {
+  text-decoration: underline;
+}
+
 /* info blocks */
 .block {
   display: flex;
