@@ -44,6 +44,12 @@
         <!-- Both lines share the status-sub style; shown in the granted "scan now"
              state, hidden in the grant stage. -->
         <p id="next-scan" class="status-sub"></p>
+        <!-- Per-network status (NT-45 multi-network): one row per paired source
+             showing its last sync, or a "not signed in" warning + sign-in link
+             when the user is logged out of that network. Populated by popup.ts
+             from status.sources; supersedes the aggregate #last-scan line below
+             when present, which stays as the legacy single-source fallback. -->
+        <ul id="network-status" class="network-status" hidden></ul>
         <p id="last-scan" class="status-sub"></p>
         <!-- Shown ONLY in the "grant access" state (populated by popup.ts), BELOW
              the CTA: spells out what the one-time host permission lets the
