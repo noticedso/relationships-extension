@@ -184,6 +184,20 @@ describe("service worker", () => {
     expect(src.signedIn).toBeNull();
   });
 
+  it("3d. getStatus reports signedIn:null (unknown) when the cookie probe itself fails — not a false 'signed out'", async () => {
+    const chrome = getChrome();
+    await seedPaired();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    // the probe throws (transient) → unknown, must NOT masquerade as logged-out
+    vi.spyOn(chrome.cookies, "get").mockRejectedValue(new Error("cookies unavailable"));
+    const res = (await dispatchInternal({ type: "getStatus" })) as {
+      sources: Array<{ source: string; granted: boolean; signedIn: boolean | null }>;
+    };
+    const src = res.sources.find((s) => s.source === "linkedin_extension")!;
+    expect(src.granted).toBe(true);
+    expect(src.signedIn).toBeNull();
+  });
+
   it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
     const chrome = getChrome();
     await pair();

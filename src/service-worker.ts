@@ -169,8 +169,13 @@ export function grantCovers(pattern: string, targetOrigin: string): boolean {
  * signed in), so the popup can show a per-network "not signed in" state without
  * running a scan. Mirrors buildCsrfHeaders' cookie check; needs the source's
  * host permission, so only probe granted sources (others → null/unknown).
+ *
+ * Returns true/false for a definitive answer (cookie present / absent), or null
+ * when the probe itself fails — so a transient cookies.get error surfaces as
+ * "unknown" (the popup shows a plain sync row) rather than a false "not signed
+ * in" warning.
  */
-async function isSignedIn(recipe: ScanRecipe): Promise<boolean> {
+async function isSignedIn(recipe: ScanRecipe): Promise<boolean | null> {
   try {
     const cookie = await chrome.cookies.get({
       url: recipe.targetOrigin,
@@ -178,7 +183,7 @@ async function isSignedIn(recipe: ScanRecipe): Promise<boolean> {
     });
     return Boolean(cookie && typeof cookie.value === "string" && cookie.value.trim() !== "");
   } catch {
-    return false;
+    return null;
   }
 }
 

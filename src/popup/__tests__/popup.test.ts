@@ -616,6 +616,38 @@ describe("popup", () => {
     expect(document.querySelectorAll("#network-status .net-row--warn").length).toBe(0);
   });
 
+  it("E5: reconciles a per-network row from the newest /api/sync/runs run when the local per-source stamp lags", async () => {
+    // local status has no per-source stamp (lastScanBySource lost) → row would
+    // read "not synced yet", but a completed run is recorded for that source.
+    const status = {
+      account: { name: "X" },
+      recipe: { networkLabel: "LinkedIn" },
+      sources: [
+        { source: "linkedin_extension", networkLabel: "LinkedIn", targetOrigin: "https://li.example", granted: true, signedIn: true, lastScanAt: null, lastScanCount: null },
+      ],
+      needs: null,
+      lastScanAt: null,
+      lastScanCount: null,
+    };
+    const runs = [
+      { source: "linkedin_extension", kind: "relationships", itemCount: 200, status: "succeeded", startedAt: "2026-07-01T00:00:00Z", finishedAt: "2026-07-01T00:00:00Z" },
+    ];
+    const sendMessage = vi.fn(async (m: { type: string }) =>
+      m.type === "getSyncHistory" ? { runs } : status,
+    );
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" },
+      tabs: { create: vi.fn() },
+      permissions: { contains: vi.fn(async () => true) },
+    };
+
+    await init(document);
+
+    const row = document.querySelector("#network-status .net-row")!;
+    expect(row.textContent).toContain("200 synced");
+    expect(row.textContent).not.toContain("not synced yet");
+  });
+
   it("E4: still shows the Sign-in button when only history.needs is noticed-signin (the 401 path)", async () => {
     const sendMessage = vi.fn(async (m: { type: string }) =>
       m.type === "getSyncHistory"

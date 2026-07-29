@@ -98,7 +98,8 @@ function wireOnce(el: HTMLElement | null, fn: () => void): void {
 // revealed the button, so a user could see the red "finish syncing" text with no
 // way to act on it. When needed, we reveal + wire the actionable button (openConnect)
 // and clear the dangling red text — the button is the affordance. When not needed,
-// we hide the button and leave any other (e.g. network-signin) text in place.
+// we hide the button; render() has already cleared any stale #needs text (network
+// sign-in is surfaced per-network in the status list now, not via #needs).
 function applyNoticedSigninState(root: Document | HTMLElement, needsNoticedSignin: boolean): void {
   const signin = root.querySelector<HTMLButtonElement>("#signin-cta");
   if (needsNoticedSignin) {
@@ -360,6 +361,32 @@ function newestRunLastSync(runs: SyncRun[]): { at: number; count: number } | nul
   return best;
 }
 
+// E5 for the per-network rows: the SW stamps last-sync per source only from
+// `syncConfirmed` (lastScanBySource), which can be lost if the SW died. The
+// /api/sync/runs history is the durable record, so fold each source's newest
+// run into its row when it's newer than (or fills a gap in) the local stamp —
+// the same guarantee the aggregate #last-scan line already gets.
+function reconcileSourcesFromRuns(sources: SourceStatus[], runs: SyncRun[]): SourceStatus[] {
+  const newestBySource = new Map<string, { at: number; count: number }>();
+  for (const r of runs) {
+    const stamp = r.finishedAt ?? r.startedAt;
+    if (!stamp || !r.source) continue;
+    const at = new Date(stamp).getTime();
+    if (Number.isNaN(at)) continue;
+    const cur = newestBySource.get(r.source);
+    if (!cur || at > cur.at) {
+      newestBySource.set(r.source, { at, count: typeof r.itemCount === "number" ? r.itemCount : 0 });
+    }
+  }
+  return sources.map((s) => {
+    const run = newestBySource.get(s.source);
+    if (run && (s.lastScanAt == null || run.at > s.lastScanAt)) {
+      return { ...s, lastScanAt: run.at, lastScanCount: run.count };
+    }
+    return s;
+  });
+}
+
 function render(root: Document | HTMLElement, status: Status): void {
   setText(root, "account-name", status.account?.name ?? "your noticed account");
   setText(root, "account-email", status.account?.email ?? "");
@@ -589,6 +616,13 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     const localAt = status.lastScanAt ?? null;
     if (fromRuns && (localAt == null || fromRuns.at > localAt)) {
       setLastScanLine(root, fromRuns.at, fromRuns.count);
+    }
+    // Same E5 guarantee for the per-network rows — but only when they're actually
+    // shown (not the grant state, where the list is hidden), so we never un-hide
+    // them. Re-render with each source's newest run folded in.
+    const netList = root.querySelector<HTMLElement>("#network-status");
+    if (netList && !netList.hidden && status.sources && status.sources.length > 0) {
+      renderNetworkStatus(root, { ...status, sources: reconcileSourcesFromRuns(status.sources, runs) });
     }
   }
 
