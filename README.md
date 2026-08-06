@@ -7,7 +7,7 @@ It's built in the open so you can verify exactly what it does.
 ## What it does
 
 - Reads **your own first-degree LinkedIn connection list** (name, headline, profile link, connection date) as the signed-in you, and hands it to your own signed-in noticed tab.
-- Refreshes about **once a month** so your network stays current.
+- Refreshes automatically **every three days** so your network stays current.
 - That's it — it never reads your messages, anyone else's data, or anything beyond your connection list.
 
 ## Privacy
@@ -38,7 +38,7 @@ It's built in the open so you can verify exactly what it does.
 
 1. Click the extension, then **Connect to noticed**.
 2. Sign in to noticed if prompted — it opens `noticed.so/x/connect` and pairs back to this extension.
-3. Approve the one-time LinkedIn access prompt, then **Scan now** (or wait for the monthly run).
+3. Approve the one-time LinkedIn access prompt, then **Scan now** (or wait for the next three-day run).
 
 ## Updating
 

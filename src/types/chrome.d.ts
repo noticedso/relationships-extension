@@ -17,6 +17,7 @@ declare const chrome: {
     onMessageExternal: ChromeEvent<
       [unknown, { id?: string; origin?: string; url?: string }, SendResponse]
     >;
+    onInstalled: ChromeEvent<[{ reason: string; previousVersion?: string }]>;
   };
   storage: {
     local: {

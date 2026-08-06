@@ -22,7 +22,7 @@ releases auto-publish — see [PUBLISHING.md](./PUBLISHING.md).
   How it works
   • Click Connect and sign in to noticed once.
   • The extension reads your own first-degree connection list as you (name, headline, profile link, connection date) and hands it to your signed-in noticed tab.
-  • It refreshes about once a month so your network stays current.
+  • It refreshes automatically every three days so your network stays current.
 
   Privacy
   • It only reads your own connection list — never your messages or anyone else's data.
@@ -42,8 +42,8 @@ releases auto-publish — see [PUBLISHING.md](./PUBLISHING.md).
   noticed Relationships imports the signed-in user's own first-degree LinkedIn connections into their noticed account and shows the import history.
   ```
 - **Permission justifications** (one per item):
-  - `storage` — `Stores the link to the user's noticed account (scan recipe + account summary) and the most recent pending import locally, so the popup can show status and the monthly import can run.`
-  - `alarms` — `Runs the connection import about once a month so the user's network stays current without manual re-triggering.`
+  - `storage` — `Stores the link to the user's noticed account (scan recipe + account summary) and the most recent pending import locally, so the popup can show status and the automatic three-day import can run.`
+  - `alarms` — `Runs the connection import every three days so the user's network stays current without manual re-triggering.`
   - `cookies` — `Reads the user's own LinkedIn session cookie in the browser to authenticate the connection-list request as the signed-in user. The value is used only as the request's CSRF header — never sent to our servers or stored.`
   - Host `*://*.linkedin.com/*` (optional, requested at runtime) — `Reads the signed-in user's own first-degree connection list from LinkedIn (name, headline, profile link, connection date), only when the user clicks Connect or Scan. Requested at runtime, not at install.`
   - Host `https://*.noticed.so/*` — `Sends the user's imported connections to their own noticed account and reads their import history, using the user's existing noticed session.`

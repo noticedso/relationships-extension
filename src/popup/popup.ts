@@ -405,7 +405,7 @@ function render(root: Document | HTMLElement, status: Status): void {
     root,
     "what-we-fetch",
     `we read your ${list} connection ${listWord} — name, headline, profile link, ` +
-      `connection date — as you, paced like a human, about once a month. ` +
+      `connection date — as you, paced like a human, every three days. ` +
       `we never read messages or anything else.`,
   );
 

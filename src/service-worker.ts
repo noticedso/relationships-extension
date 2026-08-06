@@ -40,10 +40,9 @@ import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
 
 const SCAN_ALARM = "scan";
-const SCAN_PERIOD_MINUTES = 43200; // ~30 days
+const SCAN_PERIOD_MINUTES = 3 * 24 * 60;
 const SCAN_PERIOD_MS = SCAN_PERIOD_MINUTES * 60 * 1000;
-const DAY_MS = 24 * 60 * 60 * 1000;
-const SCAN_THROTTLE_MS = SCAN_PERIOD_MS - DAY_MS;
+const SCAN_THROTTLE_MS = SCAN_PERIOD_MS;
 const SYNC_PATH = "/x/sync";
 
 const SCAN_TICK_ALARM = "scan-tick";
@@ -859,7 +858,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
 
 /**
  * Auto-scan every source whose host permission is already granted, at most once
- * per throttle window. The SHARED path for the monthly alarm AND auto-scan-on-
+ * per throttle window. The SHARED path for the three-day alarm AND auto-scan-on-
  * pair (NT-66) — a single implementation so the two can never drift.
  *
  * The `lastScanStartedAt` throttle is load-bearing for the pair path: the /x/sync
@@ -871,7 +870,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
  *
  * `refreshRecipes` is false ONLY for the pair path, whose recipes arrived in the
  * pair message microseconds ago — re-fetching them would be a pure double-fetch.
- * The monthly alarm passes true: a 30-day-old recipe is exactly the stale one.
+ * The three-day alarm passes true so every automatic scan uses fresh recipes.
  * Either way only the FIRST source refreshes — one response carries every
  * source's recipe.
  */
@@ -897,7 +896,7 @@ async function handleExternal(
       sendResponse({ ok: true });
       return;
     case "pair": {
-      // Store the per-source recipes + account and arm the monthly alarm. The
+      // Store the per-source recipes + account and arm the three-day alarm. The
       // host permission is requested from a user gesture in the popup, not here.
       // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
       // refresh (recipe-source.ts), so the two intake paths cannot drift.
@@ -911,7 +910,7 @@ async function handleExternal(
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
       sendResponse({ ok: true });
       // NT-66 auto-scan on pair: import the already-granted sources immediately so
-      // a reconnect syncs with no manual click. This TRULY mirrors the monthly-
+      // a reconnect syncs with no manual click. This TRULY mirrors the three-day
       // alarm path — including its throttle — via the shared helper, so the
       // /x/sync recipe-refresh re-pair (SyncBroker) can't re-trigger a scan loop.
       // First-time users (no host permission yet) are scanned by the popup's grant
@@ -1129,6 +1128,13 @@ export function registerListeners(): void {
   registered = true;
   lastChrome = chrome;
 
+  // Recreate the named alarm when Chrome installs or updates the extension.
+  // Without this, an existing installation would retain its previous cadence
+  // until the user paired again, despite running code with the new cadence.
+  chrome.runtime.onInstalled.addListener(() => {
+    chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
+  });
+
   chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
     const origin = senderOrigin(sender);
     if (!isNoticedOrigin(origin)) return;
@@ -1159,15 +1165,14 @@ export function registerListeners(): void {
       return;
     }
     if (alarm.name !== SCAN_ALARM) return;
-    // The ~30-day alarm: whatever recipe we hold is up to a month old — exactly
-    // the case a live-served recipe exists for. Refresh before scanning.
+    // Refresh live-served recipes before every three-day automatic scan.
     void autoScanGrantedSources({ refreshRecipes: true });
   });
 
   // Grant → scan. When the user approves "grant access", Chrome commonly
   // DISMISSES the extension popup as the permission prompt appears, so the
   // popup's own post-grant scanNow never runs — the grant would then sync
-  // nothing until the 30-day alarm. The service worker is the durable context:
+  // nothing until the three-day alarm. The service worker is the durable context:
   // scan the newly-granted source(s) here so grant always completes a sync.
   // Skip if a scan is already in flight (the popup survived and sent scanNow) so
   // we never clobber an in-progress checkpoint.
