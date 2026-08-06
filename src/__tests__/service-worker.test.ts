@@ -107,7 +107,7 @@ describe("service worker", () => {
     expect(stored.account).toMatchObject({ id: "acct-1" });
     expect(stored.noticedOrigin).toBe("https://app.noticed.so");
 
-    expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 43200 });
+    expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 4320 });
     // pair must always ack — requesting permission here would throw (no gesture)
     // and leave the connect page hanging. Permission is requested in the popup.
     expect(reqPerms).not.toHaveBeenCalled();
@@ -316,10 +316,10 @@ describe("service worker", () => {
     expect(fakeFetch.mock.calls.length).toBeGreaterThan(2);
   });
 
-  it("9. alarm is throttled within the period and runs once the period has elapsed", async () => {
+  it("9. automatic scans wait the full three-day cadence and run once it has elapsed", async () => {
     const chrome = getChrome();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
-    // The monthly alarm auto-scans every source whose host permission is granted.
+    // The three-day alarm auto-scans every source whose host permission is granted.
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     const fetchSpy = vi.fn(
       async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response,
@@ -333,14 +333,15 @@ describe("service worker", () => {
     await settle();
     fetchSpy.mockClear(); // isolate the alarm from any pair-path activity
 
-    // an alarm fire is now a duplicate/catch-up within the period → skip it
+    // Two days is still inside the cadence, including reconnect-triggered scans.
+    await chrome.storage.local.set({ lastScanStartedAt: Date.now() - 2 * 24 * 60 * 60 * 1000 });
     chrome.alarms.onAlarm.dispatch({ name: "scan" });
     await settle();
     expect(fetchSpy).not.toHaveBeenCalled();
 
-    // last automatic scan was > a period ago → the alarm runs a fresh scan
+    // The last automatic scan was more than three days ago → run a fresh scan.
     fetchSpy.mockClear();
-    await chrome.storage.local.set({ lastScanStartedAt: Date.now() - 31 * 24 * 60 * 60 * 1000 });
+    await chrome.storage.local.set({ lastScanStartedAt: Date.now() - 4 * 24 * 60 * 60 * 1000 });
     chrome.alarms.onAlarm.dispatch({ name: "scan" });
     await settle();
     expect(fetchSpy).toHaveBeenCalled();
@@ -699,6 +700,15 @@ describe("service worker", () => {
     expect(createAlarm).toHaveBeenCalledWith("scan-tick", { periodInMinutes: 0.5 });
   });
 
+  it("22b. updating an existing install replaces its old alarm with the three-day cadence", () => {
+    const chrome = getChrome();
+    const createAlarm = vi.spyOn(chrome.alarms, "create");
+
+    chrome.runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.2.9" });
+
+    expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 4320 });
+  });
+
   it("23. getStatus exposes scanning + scannedCount while a scan is in progress (E2)", async () => {
     const chrome = getChrome();
     await pair();
@@ -833,7 +843,7 @@ describe("service worker", () => {
     await pair(); // the SyncBroker recipe-refresh re-pair
     await settle();
 
-    // Throttled just like the monthly alarm → no re-scan. Otherwise the re-pair
+    // Throttled just like the three-day alarm → no re-scan. Otherwise the re-pair
     // scans → finalizes → opens another /x/sync tab → re-pairs → scans …, an
     // unbounded loop that hammers LinkedIn/X (account-ban risk).
     expect(fetchSpy).not.toHaveBeenCalled();

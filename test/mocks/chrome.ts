@@ -33,6 +33,7 @@ export interface ChromeMock {
     sendMessage: (message: unknown) => Promise<unknown>;
     onMessage: FakeEvent<[unknown, unknown, (response?: unknown) => void]>;
     onMessageExternal: FakeEvent<[unknown, unknown, (response?: unknown) => void]>;
+    onInstalled: FakeEvent<[{ reason: string; previousVersion?: string }]>;
   };
   storage: {
     local: {
@@ -89,6 +90,7 @@ function createChromeMock(): ChromeMock {
       },
       onMessage: createEvent(),
       onMessageExternal: createEvent(),
+      onInstalled: createEvent(),
     },
     storage: { local },
     alarms: {

@@ -35,10 +35,10 @@ not at install.)
 **`src/service-worker.ts` is the brain.** It registers listeners (idempotently — re-binds when the test
 harness swaps the global `chrome`):
 - `onMessageExternal` — only from `*.noticed.so` origins (enforced by `isNoticedOrigin`): `ping`, `pair`
-  (store recipe+account+`noticedOrigin`, request the host permission, set the ~30-day alarm),
+  (store recipe+account+`noticedOrigin`, request the host permission, set the three-day alarm),
   `getCachedScan`, `syncConfirmed`.
 - `onMessage` (popup) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`.
-- `onAlarm` — runs `runScan` at most once per ~30 days (a `lastScanStartedAt` throttle guards
+- `onAlarm` — runs `runScan` at most once per three days (a `lastScanStartedAt` throttle guards
   catch-up/duplicate fires).
 
 `runScan` composes the pure libs: `cookies.ts` (read the session cookie → CSRF header) → `fetch-engine.ts`

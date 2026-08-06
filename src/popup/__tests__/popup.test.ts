@@ -60,6 +60,7 @@ describe("popup", () => {
     expect(document.getElementById("last-scan")!.textContent).toContain("412");
     const fetched = document.getElementById("what-we-fetch")!.textContent ?? "";
     expect(fetched).toContain("ExampleNet");
+    expect(fetched).toContain("every three days");
     expect(fetched.toLowerCase()).not.toContain("linkedin");
     // E4: status.needs === "noticed-signin" now surfaces the actionable Sign-in
     // button (single source of truth) rather than a dangling red text line.
