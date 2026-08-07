@@ -43,7 +43,8 @@ export interface ChromeMock {
     };
   };
   alarms: {
-    create: (name: string, alarmInfo?: unknown) => void;
+    create: (name: string, alarmInfo?: { periodInMinutes?: number; when?: number }) => void;
+    get: (name: string) => Promise<{ name: string; periodInMinutes?: number } | undefined>;
     clear: (name: string) => Promise<boolean>;
     onAlarm: FakeEvent<[{ name: string }]>;
   };
@@ -93,13 +94,21 @@ function createChromeMock(): ChromeMock {
       onInstalled: createEvent(),
     },
     storage: { local },
-    alarms: {
-      create(_name: string, _alarmInfo?: unknown): void {},
-      async clear(_name: string): Promise<boolean> {
-        return true;
-      },
-      onAlarm: createEvent(),
-    },
+    alarms: (() => {
+      const alarms = new Map<string, { name: string; periodInMinutes?: number }>();
+      return {
+        create(name: string, alarmInfo?: { periodInMinutes?: number; when?: number }): void {
+          alarms.set(name, { name, periodInMinutes: alarmInfo?.periodInMinutes });
+        },
+        async get(name: string): Promise<{ name: string; periodInMinutes?: number } | undefined> {
+          return alarms.get(name);
+        },
+        async clear(name: string): Promise<boolean> {
+          return alarms.delete(name);
+        },
+        onAlarm: createEvent(),
+      };
+    })(),
     cookies: {
       async get(_details: { url: string; name: string }): Promise<{ name: string; value: string } | null> {
         return null;

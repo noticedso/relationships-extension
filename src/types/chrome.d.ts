@@ -26,7 +26,11 @@ declare const chrome: {
     };
   };
   alarms: {
-    create(name: string, alarmInfo?: { periodInMinutes?: number; delayInMinutes?: number }): void;
+    create(
+      name: string,
+      alarmInfo?: { periodInMinutes?: number; delayInMinutes?: number; when?: number },
+    ): void;
+    get(name: string): Promise<{ name: string; periodInMinutes?: number } | undefined>;
     clear(name: string): Promise<boolean>;
     onAlarm: ChromeEvent<[{ name: string }]>;
   };

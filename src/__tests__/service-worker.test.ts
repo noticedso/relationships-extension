@@ -700,13 +700,52 @@ describe("service worker", () => {
     expect(createAlarm).toHaveBeenCalledWith("scan-tick", { periodInMinutes: 0.5 });
   });
 
-  it("22b. updating an existing install replaces its old alarm with the three-day cadence", () => {
+  it("22b. a fresh install with no prior scan arms the alarm from now", async () => {
     const chrome = getChrome();
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+    const createAlarm = vi.spyOn(chrome.alarms, "create");
+
+    chrome.runtime.onInstalled.dispatch({ reason: "install" });
+    await settle();
+
+    expect(createAlarm).toHaveBeenCalledTimes(1);
+    const [name, info] = createAlarm.mock.calls[0] as [string, { periodInMinutes?: number; when?: number }];
+    expect(name).toBe("scan");
+    expect(info.periodInMinutes).toBe(4320);
+    expect(info.when).toBeGreaterThan(Date.now());
+  });
+
+  it("22c. an old installation on a stale (30-day) cadence gets re-armed anchored to its last real scan — not to now", async () => {
+    const chrome = getChrome();
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+    const lastScanAt = Date.now() - 5 * 24 * 60 * 60 * 1000; // scanned 5 days ago
+    await chrome.storage.local.set({ lastScanAt });
+    // Simulate the pre-PR14 30-day alarm already being armed.
+    chrome.alarms.create("scan", { periodInMinutes: 43200 });
     const createAlarm = vi.spyOn(chrome.alarms, "create");
 
     chrome.runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.2.9" });
+    await settle();
 
-    expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 4320 });
+    expect(createAlarm).toHaveBeenCalledTimes(1);
+    const [name, info] = createAlarm.mock.calls[0] as [string, { periodInMinutes?: number; when?: number }];
+    expect(name).toBe("scan");
+    expect(info.periodInMinutes).toBe(4320);
+    // Anchored to lastScanAt + 3 days — already in the past — not "now + 3 days".
+    expect(info.when).toBe(lastScanAt + 3 * 24 * 60 * 60 * 1000);
+    expect(info.when).toBeLessThan(Date.now());
+  });
+
+  it("22d. a browser update that fires onInstalled again leaves an already-current alarm untouched", async () => {
+    const chrome = getChrome();
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+    chrome.alarms.create("scan", { periodInMinutes: 4320 });
+    const createAlarm = vi.spyOn(chrome.alarms, "create");
+
+    chrome.runtime.onInstalled.dispatch({ reason: "chrome_update" });
+    await settle();
+
+    expect(createAlarm).not.toHaveBeenCalled();
   });
 
   it("23. getStatus exposes scanning + scannedCount while a scan is in progress (E2)", async () => {
