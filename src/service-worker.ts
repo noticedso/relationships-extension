@@ -1128,11 +1128,26 @@ export function registerListeners(): void {
   registered = true;
   lastChrome = chrome;
 
-  // Recreate the named alarm when Chrome installs or updates the extension.
-  // Without this, an existing installation would retain its previous cadence
-  // until the user paired again, despite running code with the new cadence.
+  // Reconcile the named alarm on install/update. `onInstalled` also fires on
+  // every BROWSER update (not just extension updates), which happens far more
+  // often than SCAN_PERIOD_MINUTES — recreating unconditionally would reset the
+  // countdown to "now" each time and could defer the scan indefinitely. Only
+  // (re)arm when no alarm exists yet, or when its cadence doesn't match the
+  // shipped SCAN_PERIOD_MINUTES (e.g. this release shortened it). A fresh arm
+  // anchors to the last real scan — not "now" — so it agrees with the popup's
+  // `nextScanAt` display (lastScanAt + SCAN_PERIOD_MS) instead of silently
+  // pushing the next scan further out on every reconcile.
   chrome.runtime.onInstalled.addListener(() => {
-    chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
+    void (async () => {
+      const existing = await chrome.alarms.get(SCAN_ALARM);
+      if (existing && existing.periodInMinutes === SCAN_PERIOD_MINUTES) return;
+      const { lastScanAt } = await getState();
+      // A `when` in the past is fine — Chrome fires it as soon as possible,
+      // which is exactly right for a Team that's overdue: catch up now rather
+      // than silently deferring another full period from this reconcile.
+      const when = (lastScanAt ?? Date.now()) + SCAN_PERIOD_MS;
+      chrome.alarms.create(SCAN_ALARM, { when, periodInMinutes: SCAN_PERIOD_MINUTES });
+    })();
   });
 
   chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
