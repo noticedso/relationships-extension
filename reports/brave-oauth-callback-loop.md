@@ -89,4 +89,4 @@ npm run build
 npm run hash
 ```
 
-Version 1.2.12 is intended to be released by the repository's automatic tag-and-publish workflow after merge.
+The tab-loop guard shipped in 1.2.12. Final release verification then found that the workflow put the reproducible `dist` content digest in `SHA256SUMS.txt` while labeling it as the packaged ZIP digest. The 1.2.12 ZIP itself was intact, but its checksum file could not validate it. Version 1.2.13 corrects the release workflow, publishes separate content and ZIP digests, and makes `SHA256SUMS.txt` validate the downloadable ZIP.
