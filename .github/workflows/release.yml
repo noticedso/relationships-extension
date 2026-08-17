@@ -64,10 +64,12 @@ jobs:
           # Stable-named copy so releases/latest/download/noticed-relationships.zip
           # always resolves to the newest release (the in-app install link uses it).
           cp "${ZIP}" noticed-relationships.zip
-          HASH=$(node scripts/hash-artifact.mjs | tail -1)
+          BUILD_HASH=$(node scripts/hash-artifact.mjs | tail -1)
+          ZIP_HASH=$(shasum -a 256 "${ZIP}" | awk '{print $1}')
           echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
-          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
-          echo "${HASH}  ${ZIP}" > SHA256SUMS.txt
+          echo "build_hash=${BUILD_HASH}" >> "$GITHUB_OUTPUT"
+          echo "zip_hash=${ZIP_HASH}" >> "$GITHUB_OUTPUT"
+          echo "${ZIP_HASH}  ${ZIP}" > SHA256SUMS.txt
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -76,9 +78,12 @@ jobs:
           body: |
             Reproducible build of the noticed Relationships extension.
 
-            **Artifact SHA-256:** `${{ steps.pkg.outputs.hash }}`
+            **Reproducible content SHA-256:** `${{ steps.pkg.outputs.build_hash }}`
 
-            Verify locally: `npm ci && node build.mjs && node scripts/hash-artifact.mjs` — the digest must match.
+            **Packaged ZIP SHA-256:** `${{ steps.pkg.outputs.zip_hash }}`
+
+            Verify the download: `shasum -a 256 -c SHA256SUMS.txt`.
+            Verify the reproducible content: `npm ci && node build.mjs && node scripts/hash-artifact.mjs`.
             The same `${{ steps.pkg.outputs.zip }}` is what's uploaded to the Chrome Web Store.
           files: |
             ${{ steps.pkg.outputs.zip }}
