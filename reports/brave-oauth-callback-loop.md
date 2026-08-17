@@ -71,7 +71,7 @@ User-triggered `scanNow` is intentionally unchanged.
 | Immediate re-pair after a completed scan | Timestamp throttle prevents rescan | Existing test passes |
 | Re-pair with pending payload and missing legacy timestamp | No scan, no new tab, pending payload preserved | New regression test passes |
 | Manual sync | Still starts a fresh scan | Existing scan tests pass |
-| Full unit/integration suite | No regressions | 200 tests pass |
+| Full unit/integration suite | No regressions | 201 tests pass |
 | TypeScript/build/reproducible artifact | Clean and deterministic | Release verification commands below |
 
 ## Brave environment note
@@ -89,4 +89,4 @@ npm run build
 npm run hash
 ```
 
-The tab-loop guard shipped in 1.2.12. Final release verification then found that the workflow put the reproducible `dist` content digest in `SHA256SUMS.txt` while labeling it as the packaged ZIP digest. The 1.2.12 ZIP itself was intact, but its checksum file could not validate it. Version 1.2.13 corrected the release workflow and separated the content and ZIP digests, but its tag-triggered release exposed a test-isolation race: the mocked `pair` acknowledgement could leave its fire-and-forget automatic-scan check running into the next test. Version 1.2.14 drains that task inside the test helper, keeps the production acknowledgement behavior unchanged, and is the final verified release.
+The tab-loop guard shipped in 1.2.12. Final release verification then found that the workflow put the reproducible `dist` content digest in `SHA256SUMS.txt` while labeling it as the packaged ZIP digest. The 1.2.12 ZIP itself was intact, but its checksum file could not validate it. Version 1.2.13 corrected the release workflow and separated the content and ZIP digests, but its tag-triggered release exposed a test-isolation race: the mocked `pair` acknowledgement could leave its fire-and-forget automatic-scan check running into the next test. Version 1.2.14 drains that task inside the test helper and keeps the production acknowledgement behavior unchanged. Its GitHub release, tag, two ZIP assets, manifest, and published checksum are verified. Chrome Web Store rejected the newer upload with `ITEM_NOT_UPDATABLE` because the already-submitted update is still pending review; the public store continues to serve 1.2.11 until Google completes that external review, after which 1.2.14 must be retried.
