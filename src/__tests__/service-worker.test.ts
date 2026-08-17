@@ -888,6 +888,36 @@ describe("service worker", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
+  it("26d. pair does not auto-scan a source whose previous handoff is still pending, even when the legacy throttle timestamp is missing", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn(
+      async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response,
+    );
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    const tabSpy = vi.spyOn(chrome.tabs, "create");
+    const settle = () => new Promise((r) => setTimeout(r, 25));
+
+    // Brave can leave the first-party handoff unconfirmed when that tab is
+    // redirected away (the reported localhost OAuth callback is one example).
+    // Older installs can have this pending payload without lastScanStartedAt.
+    // A re-pair must preserve it, not start another scan and open another tab.
+    await chrome.storage.local.set({
+      ...pending([{ profileUrl: "already-scanned" }]),
+      lastScanStartedAt: null,
+      needs: "noticed-signin",
+    });
+
+    await pair();
+    await settle();
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(tabSpy).not.toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(pendingConns(stored)).toEqual([{ profileUrl: "already-scanned" }]);
+  });
+
   it("27. scanNow sets scanInProgress + arms the tick SYNCHRONOUSLY and acks before the CSRF cookie round-trip (Cause B)", async () => {
     const chrome = getChrome();
     await pair();
