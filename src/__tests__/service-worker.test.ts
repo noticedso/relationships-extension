@@ -84,7 +84,14 @@ function dispatchInternal(message: unknown): Promise<unknown> {
 const noticedSender = { origin: "https://app.noticed.so", url: "https://app.noticed.so/x/install" };
 
 async function pair() {
-  return dispatchExternal({ type: "pair", recipe, account }, noticedSender);
+  const response = await dispatchExternal({ type: "pair", recipe, account }, noticedSender);
+  // `pair` acknowledges before its automatic-scan check finishes by design.
+  // Drain that fire-and-forget check while this test's Chrome mock is still
+  // installed; otherwise it can resume against the next test's mock and leave
+  // the module-level scan guard occupied. That race only surfaced reliably in
+  // the tag-triggered release runner.
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  return response;
 }
 
 describe("service worker", () => {
