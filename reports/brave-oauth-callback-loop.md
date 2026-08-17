@@ -89,4 +89,4 @@ npm run build
 npm run hash
 ```
 
-The tab-loop guard shipped in 1.2.12. Final release verification then found that the workflow put the reproducible `dist` content digest in `SHA256SUMS.txt` while labeling it as the packaged ZIP digest. The 1.2.12 ZIP itself was intact, but its checksum file could not validate it. Version 1.2.13 corrects the release workflow, publishes separate content and ZIP digests, and makes `SHA256SUMS.txt` validate the downloadable ZIP.
+The tab-loop guard shipped in 1.2.12. Final release verification then found that the workflow put the reproducible `dist` content digest in `SHA256SUMS.txt` while labeling it as the packaged ZIP digest. The 1.2.12 ZIP itself was intact, but its checksum file could not validate it. Version 1.2.13 corrected the release workflow and separated the content and ZIP digests, but its tag-triggered release exposed a test-isolation race: the mocked `pair` acknowledgement could leave its fire-and-forget automatic-scan check running into the next test. Version 1.2.14 drains that task inside the test helper, keeps the production acknowledgement behavior unchanged, and is the final verified release.
