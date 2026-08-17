@@ -879,6 +879,12 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   let refreshRecipes = opts.refreshRecipes;
   for (const src of await grantedSources(recipesOf(state))) {
+    // A pending payload means this source already scanned and its first-party
+    // handoff has not confirmed yet. Re-scanning it cannot help: it only replaces
+    // the pending payload and opens another handoff tab. This state guard is
+    // stronger than the timestamp throttle and also covers legacy installs where
+    // lastScanStartedAt was never persisted.
+    if (state.pendingScans?.[src]) continue;
     await runScan(src, { refreshRecipes });
     refreshRecipes = false;
   }
