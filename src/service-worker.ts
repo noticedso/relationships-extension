@@ -65,6 +65,7 @@ const MAX_CONSECUTIVE_PROBE_FAILURES = 5;
 type ExternalMessage =
   | { type: "ping" }
   | { type: "pair"; recipe: ScanRecipe; recipes?: ScanRecipe[]; account: Account }
+  | { type: "getOnboardingStatus" }
   | { type: "getCachedScan"; source?: string }
   | { type: "syncConfirmed"; source?: string };
 
@@ -106,6 +107,30 @@ function recipesOf(state: Partial<State>): Record<string, ScanRecipe> {
   if (state.recipes && Object.keys(state.recipes).length > 0) return state.recipes;
   if (state.recipe) return { [state.recipe.source ?? DEFAULT_SOURCE]: state.recipe };
   return {};
+}
+
+function recipeForSource(
+  recipes: Record<string, ScanRecipe>,
+  source: string,
+): ScanRecipe | undefined {
+  return recipes[source]
+    ?? (source === "x" ? recipes.x_extension : undefined)
+    ?? (source === "x_extension" ? recipes.x : undefined);
+}
+
+/** Preserve cached payloads while rebinding their upload destination to the
+ * newly paired run/session. The correlation lives in the served ingestPath. */
+function rebindPendingIngestPaths(
+  pendingScans: Record<string, PendingScan> | null | undefined,
+  recipes: Record<string, ScanRecipe>,
+): Record<string, PendingScan> | null {
+  if (!pendingScans) return null;
+  return Object.fromEntries(
+    Object.entries(pendingScans).map(([key, pending]) => {
+      const ingestPath = recipeForSource(recipes, pending.source)?.ingestPath;
+      return [key, ingestPath ? { ...pending, ingestPath } : pending];
+    }),
+  );
 }
 
 /**
@@ -816,7 +841,13 @@ async function finalizeScan(
     url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`,
     active: false,
   });
-  await setState({ syncTabId: tab?.id ?? null });
+  await setState({
+    syncTabId: tab?.id ?? null,
+    syncTabIds:
+      tab?.id != null
+        ? { ...(state.syncTabIds ?? {}), [source]: tab.id }
+        : state.syncTabIds ?? {},
+  });
   return { ok: true, count };
 }
 
@@ -890,6 +921,67 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
   }
 }
 
+async function openPendingHandoffs(origin: string): Promise<void> {
+  const state = await getState();
+  const tabIds = { ...(state.syncTabIds ?? {}) };
+  for (const pending of Object.values(state.pendingScans ?? {})) {
+    const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
+    const existingTabId = tabIds[pending.source];
+    if (existingTabId != null) {
+      try {
+        const existing = await chrome.tabs.get(existingTabId);
+        if (existing.url === handoffUrl) continue;
+        delete tabIds[pending.source];
+      } catch {
+        delete tabIds[pending.source];
+      }
+    }
+    const tab = await chrome.tabs.create({
+      url: handoffUrl,
+      active: false,
+    });
+    if (tab?.id != null) tabIds[pending.source] = tab.id;
+  }
+  await setState({ syncTabIds: tabIds });
+}
+
+async function buildStatus(): Promise<Record<string, unknown>> {
+  const state = await getState();
+  const recipes = recipesOf(state);
+  const granted = await grantedSources(recipes);
+  const lastBy = state.lastScanBySource ?? {};
+  const sources = await Promise.all(
+    Object.values(recipes).map(async (recipe) => {
+      const source = sourceOf(recipe);
+      const isGranted = granted.includes(source);
+      return {
+        source,
+        networkLabel: recipe.networkLabel ?? source,
+        targetOrigin: recipe.targetOrigin,
+        granted: isGranted,
+        signedIn: isGranted ? await isSignedIn(recipe) : null,
+        pending: state.pendingScans?.[source] != null,
+        lastScanAt: lastBy[source]?.at ?? null,
+        lastScanCount: lastBy[source]?.count ?? null,
+      };
+    }),
+  );
+  const lastScanAt = state.lastScanAt ?? null;
+  return {
+    account: state.account ?? null,
+    recipe: state.recipe ?? null,
+    sources,
+    nextScanAt: lastScanAt != null ? lastScanAt + SCAN_PERIOD_MS : null,
+    lastScanAt,
+    lastScanCount: state.lastScanCount ?? null,
+    needs: state.needs ?? null,
+    testMode: state.testMode ?? false,
+    scanning: state.scanInProgress === true,
+    scanningSource: state.scanSource ?? null,
+    scannedCount: state.scanItems?.length ?? 0,
+  };
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 async function handleExternal(
@@ -907,11 +999,13 @@ async function handleExternal(
       // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
       // refresh (recipe-source.ts), so the two intake paths cannot drift.
       const recipes = toRecipeRecord(recipeList(message.recipe, message.recipes));
+      const prior = await getState();
       await setState({
         recipe: message.recipe,
         recipes,
         account: message.account,
         noticedOrigin: origin,
+        pendingScans: rebindPendingIngestPaths(prior.pendingScans, recipes),
       });
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
       sendResponse({ ok: true });
@@ -928,6 +1022,11 @@ async function handleExternal(
       // pairs), so a pair-triggered scan must not re-fetch them. The throttle
       // above still guards the /x/sync re-pair → scan loop.
       void autoScanGrantedSources({ refreshRecipes: false });
+      void openPendingHandoffs(origin);
+      return;
+    }
+    case "getOnboardingStatus": {
+      sendResponse(await buildStatus());
       return;
     }
     case "getCachedScan": {
@@ -959,10 +1058,12 @@ async function handleExternal(
         lastScanAt: Date.now(),
         lastScanCount: count,
       });
-      if (state.syncTabId != null) {
-        await chrome.tabs.remove(state.syncTabId).catch(() => {});
-        await setState({ syncTabId: null });
-      }
+      const sourceTabId = src ? state.syncTabIds?.[src] : undefined;
+      const tabId = sourceTabId ?? state.syncTabId;
+      if (tabId != null) await chrome.tabs.remove(tabId).catch(() => {});
+      const syncTabIds = { ...(state.syncTabIds ?? {}) };
+      if (src) delete syncTabIds[src];
+      await setState({ syncTabId: null, syncTabIds });
       sendResponse({ ok: true });
       return;
     }
@@ -975,42 +1076,7 @@ async function handleInternal(
 ): Promise<void> {
   switch (message.type) {
     case "getStatus": {
-      const state = await getState();
-      const recipes = recipesOf(state);
-      const granted = await grantedSources(recipes);
-      const lastBy = state.lastScanBySource ?? {};
-      const sources = await Promise.all(
-        Object.values(recipes).map(async (r) => {
-          const s = sourceOf(r);
-          const isGranted = granted.includes(s);
-          return {
-            source: s,
-            networkLabel: r.networkLabel ?? s,
-            targetOrigin: r.targetOrigin,
-            granted: isGranted,
-            // Only granted sources can be cookie-probed (host permission); leave
-            // others unknown so the popup defers to its grant flow, not a false
-            // "not signed in". Live so it survives the needs-clobbering bug.
-            signedIn: isGranted ? await isSignedIn(r) : null,
-            lastScanAt: lastBy[s]?.at ?? null,
-            lastScanCount: lastBy[s]?.count ?? null,
-          };
-        }),
-      );
-      const lastScanAt = state.lastScanAt ?? null;
-      sendResponse({
-        account: state.account ?? null,
-        recipe: state.recipe ?? null,
-        sources,
-        nextScanAt: lastScanAt != null ? lastScanAt + SCAN_PERIOD_MS : null,
-        lastScanAt,
-        lastScanCount: state.lastScanCount ?? null,
-        needs: state.needs ?? null,
-        testMode: state.testMode ?? false,
-        scanning: state.scanInProgress === true,
-        scanningSource: state.scanSource ?? null,
-        scannedCount: state.scanItems?.length ?? 0,
-      });
+      sendResponse(await buildStatus());
       return;
     }
     case "scanNow": {

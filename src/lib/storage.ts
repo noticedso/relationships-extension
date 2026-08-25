@@ -172,6 +172,8 @@ export type State = {
    * Closed on syncConfirmed so the silent background tab doesn't linger.
    */
   syncTabId?: number | null;
+  /** Per-source handoff tabs. Kept alongside syncTabId for older installs. */
+  syncTabIds?: Record<string, number> | null;
 };
 
 const KEYS: (keyof State)[] = [
@@ -197,6 +199,7 @@ const KEYS: (keyof State)[] = [
   "scanStartedAt",
   "scanNeedsRecipeRefresh",
   "syncTabId",
+  "syncTabIds",
 ];
 
 /** Typed read of the full stored state (any unset key is simply absent). */

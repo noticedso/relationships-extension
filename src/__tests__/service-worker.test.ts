@@ -205,6 +205,107 @@ describe("service worker", () => {
     expect(src.signedIn).toBeNull();
   });
 
+  it("3e. exposes the same source status to an allowed noticed onboarding page", async () => {
+    const chrome = getChrome();
+    await seedPaired();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    const res = (await dispatchExternal(
+      { type: "getOnboardingStatus" },
+      noticedSender,
+    )) as {
+      sources: Array<{ source: string; granted: boolean; signedIn: boolean | null }>;
+    };
+
+    expect(res.sources).toEqual([
+      expect.objectContaining({
+        source: "linkedin_extension",
+        granted: true,
+        signedIn: true,
+      }),
+    ]);
+    expect(JSON.stringify(res)).not.toContain("pendingScans");
+    expect(JSON.stringify(res)).not.toContain("payload");
+  });
+
+  it("3f. re-pairing reopens a cached handoff without rescanning", async () => {
+    const chrome = getChrome();
+    const createTab = vi.spyOn(chrome.tabs, "create");
+    const fetchSpy = vi.fn();
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: "/api/linkedin/import/extension",
+          payload: { connections: [{ profileUrl: "in/cached" }] },
+          count: 1,
+        },
+      },
+    });
+
+    const correlatedPath =
+      "/api/linkedin/import/extension?run_id=11111111-1111-4111-8111-111111111111&connect_session_id=22222222-2222-4222-8222-222222222222";
+    await dispatchExternal(
+      {
+        type: "pair",
+        recipe: { ...recipe, ingestPath: correlatedPath },
+        account,
+      },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(createTab).toHaveBeenCalledWith({
+      url: "https://app.noticed.so/x/sync?ext_id=test-extension-id&source=linkedin_extension",
+      active: false,
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans).toMatchObject({
+      linkedin_extension: { count: 1, ingestPath: correlatedPath },
+    });
+  });
+
+  it("3g. re-pairing replaces a handoff tab that redirected away", async () => {
+    const chrome = getChrome();
+    const createTab = vi.spyOn(chrome.tabs, "create");
+    vi.spyOn(chrome.tabs, "get").mockResolvedValueOnce({
+      id: 99,
+      url: "http://localhost:3000/oauth/callback",
+    });
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [] },
+          count: 0,
+        },
+      },
+      syncTabIds: { linkedin_extension: 99 },
+    });
+
+    await pair();
+
+    expect(chrome.tabs.get).toHaveBeenCalledWith(99);
+    expect(createTab).toHaveBeenCalledWith({
+      url: "https://app.noticed.so/x/sync?ext_id=test-extension-id&source=linkedin_extension",
+      active: false,
+    });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.syncTabIds).toMatchObject({ linkedin_extension: 1 });
+  });
+
   it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
     const chrome = getChrome();
     await pair();
@@ -895,7 +996,7 @@ describe("service worker", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("26d. pair does not auto-scan a source whose previous handoff is still pending, even when the legacy throttle timestamp is missing", async () => {
+  it("26d. pair preserves a pending payload and reopens its handoff without rescanning", async () => {
     const chrome = getChrome();
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
@@ -909,7 +1010,8 @@ describe("service worker", () => {
     // Brave can leave the first-party handoff unconfirmed when that tab is
     // redirected away (the reported localhost OAuth callback is one example).
     // Older installs can have this pending payload without lastScanStartedAt.
-    // A re-pair must preserve it, not start another scan and open another tab.
+    // A re-pair must preserve it, skip the network scan, and reopen the
+    // first-party handoff so the cached upload can be retried.
     await chrome.storage.local.set({
       ...pending([{ profileUrl: "already-scanned" }]),
       lastScanStartedAt: null,
@@ -920,7 +1022,7 @@ describe("service worker", () => {
     await settle();
 
     expect(fetchSpy).not.toHaveBeenCalled();
-    expect(tabSpy).not.toHaveBeenCalled();
+    expect(tabSpy).toHaveBeenCalledTimes(1);
     const stored = await chrome.storage.local.get(null);
     expect(pendingConns(stored)).toEqual([{ profileUrl: "already-scanned" }]);
   });
