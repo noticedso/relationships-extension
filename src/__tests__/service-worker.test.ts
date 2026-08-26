@@ -414,6 +414,148 @@ describe("service worker", () => {
     expect(stored.scanPhaseResults).toBeNull();
   });
 
+  it("3j. an account switch wins when finalization has already prepared its pending write", async () => {
+    const chrome = getChrome();
+    await seedPaired();
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const originalSet = chrome.storage.local.set.bind(chrome.storage.local);
+    let releaseFinalWrite: () => void = () => {};
+    let finalWriteReached = false;
+    const finalWriteGate = new Promise<void>((resolve) => {
+      releaseFinalWrite = resolve;
+    });
+    vi.spyOn(chrome.storage.local, "set").mockImplementation(async (items) => {
+      if (!finalWriteReached && items.pendingScans != null && items.scanInProgress === false) {
+        finalWriteReached = true;
+        await finalWriteGate;
+      }
+      await originalSet(items);
+    });
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [] }),
+    })) as unknown as typeof fetch;
+
+    const scan = sw.runScan(undefined, {
+      fetchImpl,
+      sleep: async () => {},
+      jitter: () => 0,
+    });
+    await vi.waitFor(() => expect(finalWriteReached).toBe(true));
+    const nextPair = dispatchExternal(
+      { type: "pair", recipe, account: { id: "acct-2" } },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    releaseFinalWrite();
+    await Promise.all([scan, nextPair]);
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.account).toMatchObject({ id: "acct-2" });
+    expect(stored.pendingScans).toEqual({});
+    expect(stored.scanInProgress).toBe(false);
+  });
+
+  it("3k. legacy account shapes discard cached data when normalized emails differ", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account: { email: "first@example.com" },
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [{ profileUrl: "account-a" }] },
+          count: 1,
+        },
+      },
+      syncTabIds: { linkedin_extension: 99 },
+    });
+    const removeTab = vi.spyOn(chrome.tabs, "remove");
+
+    await dispatchExternal(
+      {
+        type: "pair",
+        recipe,
+        account: { email: " SECOND@example.com " },
+      },
+      noticedSender,
+    );
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans).toEqual({});
+    expect(stored.syncTabIds).toEqual({});
+    expect(removeTab).toHaveBeenCalledWith(99);
+  });
+
+  it("3l. pairing discards orphaned cached data when its prior account is unknown", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account: null,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [{ profileUrl: "unknown-owner" }] },
+          count: 1,
+        },
+      },
+      syncTabIds: { linkedin_extension: 99 },
+    });
+
+    await dispatchExternal(
+      { type: "pair", recipe, account: { id: "acct-2" } },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans).toEqual({});
+    expect(stored.syncTabIds).toEqual({});
+  });
+
+  it("3m. an email-owned pending scan survives the same account gaining a stable id", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account: { email: "same@example.com" },
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [{ profileUrl: "same-owner" }] },
+          count: 1,
+          accountKey: "email:same@example.com",
+        },
+      },
+    });
+
+    await dispatchExternal(
+      {
+        type: "pair",
+        recipe,
+        account: { id: "acct-1", email: " SAME@example.com " },
+      },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const cached = await dispatchExternal(
+      { type: "getCachedScan", source: "linkedin_extension" },
+      noticedSender,
+    );
+
+    expect(cached).toMatchObject({
+      payload: { connections: [{ profileUrl: "same-owner" }] },
+    });
+  });
+
   it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
     const chrome = getChrome();
     await pair();
@@ -544,7 +686,7 @@ describe("service worker", () => {
     const settle = () => new Promise((r) => setTimeout(r, 25));
 
     // A scan ran moments ago → pairing is itself throttled (shared with the alarm).
-    await chrome.storage.local.set({ lastScanStartedAt: Date.now() });
+    await chrome.storage.local.set({ account, lastScanStartedAt: Date.now() });
     await pair();
     await settle();
     fetchSpy.mockClear(); // isolate the alarm from any pair-path activity
@@ -1093,7 +1235,7 @@ describe("service worker", () => {
     const settle = () => new Promise((r) => setTimeout(r, 25));
 
     // A scan finalized moments ago (finalizeScan stamps lastScanStartedAt).
-    await chrome.storage.local.set({ lastScanStartedAt: Date.now() });
+    await chrome.storage.local.set({ account, lastScanStartedAt: Date.now() });
 
     await pair(); // the SyncBroker recipe-refresh re-pair
     await settle();
@@ -1122,6 +1264,7 @@ describe("service worker", () => {
     // first-party handoff so the cached upload can be retried.
     await chrome.storage.local.set({
       ...pending([{ profileUrl: "already-scanned" }]),
+      account,
       lastScanStartedAt: null,
       needs: "noticed-signin",
     });
@@ -1230,6 +1373,96 @@ describe("service worker", () => {
       linkedin_extension: { count: 0 },
       x: { count: 0 },
     });
+  });
+
+  it("27d. a stale scan tick abandons the first source and drains the persisted queue", async () => {
+    const chrome = getChrome();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      ...inProgress({
+        scanStartedAt: Date.now() - 2 * 60 * 60 * 1000,
+        scanQueue: ["x"],
+      }),
+    });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [] }),
+    })) as unknown as typeof fetch;
+
+    chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored).toMatchObject({
+      scanQueue: [],
+      scanInProgress: false,
+      pendingScans: { x: { count: 0 } },
+    });
+  });
+
+  it("27e. startup abandons a stale first source and drains the persisted queue", async () => {
+    const chrome = getChrome();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      ...inProgress({
+        scanStartedAt: Date.now() - 2 * 60 * 60 * 1000,
+        scanQueue: ["x"],
+      }),
+    });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [] }),
+    })) as unknown as typeof fetch;
+
+    sw.registerListenersForTest();
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanQueue).toEqual([]);
+    expect(stored.pendingScans).toMatchObject({ x: { count: 0 } });
+  });
+
+  it("27f. startup reopens a durable pending handoff when no tab was recorded", async () => {
+    const chrome = getChrome();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [] },
+          count: 0,
+        },
+      },
+      scanInProgress: false,
+      scanQueue: [],
+      syncTabIds: {},
+    });
+    const createTab = vi.spyOn(chrome.tabs, "create");
+
+    sw.registerListenersForTest();
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(createTab).toHaveBeenCalledWith({
+      url: "https://app.noticed.so/x/sync?ext_id=test-extension-id&source=linkedin_extension",
+      active: false,
+    });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.syncTabIds).toMatchObject({ linkedin_extension: 1 });
   });
 
   // ── NT-63 owner-profile pass (LinkedIn) + tweets pass (X) ────────────────────
@@ -1947,6 +2180,7 @@ describe("service worker", () => {
       { type: "pair", recipe: withoutProbe(liMessagesRecipe), account },
       noticedSender,
     );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
 
@@ -1983,6 +2217,7 @@ describe("service worker", () => {
     const chrome = getChrome();
     // CACHED = the full recipe, probe included (a user signed out of noticed).
     await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
 
@@ -2008,6 +2243,7 @@ describe("service worker", () => {
   it("34b. a malformed 200 recipe body is NOT stored over the good cached recipe (and the scan still completes)", async () => {
     const chrome = getChrome();
     await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
 

@@ -91,7 +91,9 @@ export type ScanRecipe = {
 };
 
 export type Account = {
-  id: string;
+  /** Stable noticed user id. Optional only for mixed-version server rollout. */
+  id?: string;
+  email?: string | null;
   displayName?: string;
   [key: string]: unknown;
 };
@@ -105,6 +107,8 @@ export type PendingScan = {
   ingestPath: string;
   payload: Record<string, unknown>;
   count: number;
+  /** Identity key of the noticed account that produced this payload. */
+  accountKey?: string | null;
 };
 
 export type State = {

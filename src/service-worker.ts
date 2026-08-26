@@ -296,15 +296,70 @@ function countMessageRaw(json: unknown, fieldMap: NonNullable<ScanRecipe["messag
 }
 
 let scanRunning = false;
+let accountStateMutation = Promise.resolve();
 
 class ScanSupersededError extends Error {}
+
+function accountKey(account: Account | null | undefined): string | null {
+  const id = typeof account?.id === "string" ? account.id.trim() : "";
+  if (id) return `id:${id}`;
+  const email = typeof account?.email === "string" ? account.email.trim().toLowerCase() : "";
+  return email ? `email:${email}` : null;
+}
+
+function accountsMatch(
+  prior: Account | null | undefined,
+  next: Account | null | undefined,
+): boolean {
+  const priorId = typeof prior?.id === "string" ? prior.id.trim() : "";
+  const nextId = typeof next?.id === "string" ? next.id.trim() : "";
+  if (priorId && nextId) return priorId === nextId;
+  const priorEmail = typeof prior?.email === "string" ? prior.email.trim().toLowerCase() : "";
+  const nextEmail = typeof next?.email === "string" ? next.email.trim().toLowerCase() : "";
+  return priorEmail !== "" && priorEmail === nextEmail;
+}
+
+function accountOwnsKey(account: Account | null | undefined, ownerKey: string | null): boolean {
+  if (ownerKey == null) return true;
+  const id = typeof account?.id === "string" ? account.id.trim() : "";
+  if (id && ownerKey === `id:${id}`) return true;
+  const email = typeof account?.email === "string" ? account.email.trim().toLowerCase() : "";
+  return email !== "" && ownerKey === `email:${email}`;
+}
+
+function hasAccountBoundState(state: Partial<State>): boolean {
+  return Object.keys(state.pendingScans ?? {}).length > 0
+    || state.scanInProgress === true
+    || (state.scanQueue?.length ?? 0) > 0
+    || state.syncTabId != null
+    || Object.keys(state.syncTabIds ?? {}).length > 0
+    || state.lastScanAt != null
+    || state.lastScanCount != null
+    || state.lastScanStartedAt != null
+    || Object.keys(state.lastScanBySource ?? {}).length > 0
+    || Object.keys(state.hadReplyByConversation ?? {}).length > 0;
+}
+
+async function withAccountStateMutation<T>(action: () => Promise<T>): Promise<T> {
+  const previous = accountStateMutation;
+  let release: () => void = () => {};
+  accountStateMutation = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
 
 async function assertCurrentScan(source: string, accountId: string | null): Promise<void> {
   const current = await getState();
   if (
     !current.scanInProgress
     || current.scanSource !== source
-    || (accountId != null && current.account?.id !== accountId)
+    || (accountId != null && accountKey(current.account) !== accountId)
     || (current.scanAccountId != null && current.scanAccountId !== accountId)
   ) {
     throw new ScanSupersededError();
@@ -620,7 +675,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     if (!scanInProgress || !scanSource) return { ok: true, note: "not-in-progress" };
     let recipe = recipesOf(state)[scanSource];
     if (!recipe) return { ok: false };
-    const scanAccountId = state.scanAccountId ?? state.account?.id ?? null;
+    const scanAccountId = state.scanAccountId ?? accountKey(state.account);
     const assertCurrent = () => assertCurrentScan(scanSource, scanAccountId);
 
     if (isScanStale(state.scanStartedAt, now())) {
@@ -808,6 +863,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       noticedOrigin ?? null,
       now(),
       extras,
+      scanAccountId,
     );
   } catch (error) {
     if (error instanceof ScanSupersededError) return { ok: false, note: "superseded" };
@@ -843,47 +899,63 @@ async function finalizeScan(
   noticedOrigin: string | null,
   startedAt: number,
   extras: ScanExtras = {},
+  scanAccountId: string | null = null,
 ): Promise<RunScanResult> {
-  clearScanTick();
   const source = sourceOf(recipe);
   const { ingestPath, payload, count } = assembleScanPayload(recipe, connLists, messages, selfId, extras);
-  const pending: PendingScan = { source, ingestPath, payload, count };
+  return withAccountStateMutation(async () => {
+    const state = await getState();
+    if (
+      !state.scanInProgress
+      || state.scanSource !== source
+      || (scanAccountId != null && accountKey(state.account) !== scanAccountId)
+      || (state.scanAccountId != null && state.scanAccountId !== scanAccountId)
+    ) {
+      return { ok: false, note: "superseded" };
+    }
 
-  const state = await getState();
-  const pendingScans = { ...(state.pendingScans ?? {}), [source]: pending };
+    clearScanTick();
+    const pending: PendingScan = {
+      source,
+      ingestPath,
+      payload,
+      count,
+      accountKey: scanAccountId,
+    };
+    const pendingScans = { ...(state.pendingScans ?? {}), [source]: pending };
+    const cleared = {
+      scanInProgress: false,
+      scanSource: null,
+      scanAccountId: null,
+      scanPhaseIndex: null,
+      scanCursor: null,
+      scanItems: null,
+      scanPhaseResults: null,
+      scanSelfId: null,
+      scanStartedAt: null,
+      scanNeedsRecipeRefresh: false,
+    } as const;
 
-  const cleared = {
-    scanInProgress: false,
-    scanSource: null,
-    scanPhaseIndex: null,
-    scanCursor: null,
-    scanItems: null,
-    scanPhaseResults: null,
-    scanSelfId: null,
-    scanStartedAt: null,
-    scanNeedsRecipeRefresh: false,
-  } as const;
+    if (!noticedOrigin) {
+      await setState({ pendingScans, needs: null, lastScanStartedAt: startedAt, ...cleared });
+      return { ok: true, count, note: "no-handoff-origin" };
+    }
 
-  if (!noticedOrigin) {
-    await setState({ pendingScans, needs: null, lastScanStartedAt: startedAt, ...cleared });
-    return { ok: true, count, note: "no-handoff-origin" };
-  }
-
-  await setState({ pendingScans, needs: "noticed-signin", lastScanStartedAt: startedAt, ...cleared });
-
-  // E7 silent handoff: open /x/sync?ext_id=…&source=<src> in a BACKGROUND tab.
-  const tab = await chrome.tabs.create({
-    url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`,
-    active: false,
+    await setState({ pendingScans, needs: "noticed-signin", lastScanStartedAt: startedAt, ...cleared });
+    // E7 silent handoff: open /x/sync?ext_id=…&source=<src> in a BACKGROUND tab.
+    const tab = await chrome.tabs.create({
+      url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`,
+      active: false,
+    });
+    await setState({
+      syncTabId: tab?.id ?? null,
+      syncTabIds:
+        tab?.id != null
+          ? { ...(state.syncTabIds ?? {}), [source]: tab.id }
+          : state.syncTabIds ?? {},
+    });
+    return { ok: true, count };
   });
-  await setState({
-    syncTabId: tab?.id ?? null,
-    syncTabIds:
-      tab?.id != null
-        ? { ...(state.syncTabIds ?? {}), [source]: tab.id }
-        : state.syncTabIds ?? {},
-  });
-  return { ok: true, count };
 }
 
 /**
@@ -908,7 +980,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
   await setState({
     scanInProgress: true,
     scanSource: src,
-    scanAccountId: state.account?.id ?? null,
+    scanAccountId: accountKey(state.account),
     scanPhaseIndex: 0,
     scanCursor: null,
     scanItems: [],
@@ -939,7 +1011,7 @@ async function initializeScanPlan(
     scanInProgress: true,
     scanSource: first,
     scanQueue: list.slice(1),
-    scanAccountId: state.account?.id ?? null,
+    scanAccountId: accountKey(state.account),
     scanPhaseIndex: 0,
     scanCursor: null,
     scanItems: [],
@@ -971,7 +1043,7 @@ async function drainScanQueue(): Promise<void> {
       scanInProgress: true,
       scanSource: next,
       scanQueue: rest,
-      scanAccountId: state.account?.id ?? null,
+      scanAccountId: accountKey(state.account),
       scanPhaseIndex: 0,
       scanCursor: null,
       scanItems: [],
@@ -1031,6 +1103,7 @@ async function openPendingHandoffs(origin: string): Promise<void> {
   const state = await getState();
   const tabIds = { ...(state.syncTabIds ?? {}) };
   for (const pending of Object.values(state.pendingScans ?? {})) {
+    if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
     const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
     const existingTabId = tabIds[pending.source];
     if (existingTabId != null) {
@@ -1105,49 +1178,53 @@ async function handleExternal(
       // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
       // refresh (recipe-source.ts), so the two intake paths cannot drift.
       const recipes = toRecipeRecord(recipeList(message.recipe, message.recipes));
-      const prior = await getState();
-      const nextAccountId = typeof message.account?.id === "string" ? message.account.id : null;
-      const priorAccountId = typeof prior.account?.id === "string" ? prior.account.id : null;
-      const accountChanged = prior.account != null
-        && nextAccountId != null
-        && priorAccountId !== nextAccountId;
-      const oldTabIds = accountChanged
-        ? new Set([
-            ...(prior.syncTabId == null ? [] : [prior.syncTabId]),
-            ...Object.values(prior.syncTabIds ?? {}),
-          ])
-        : new Set<number>();
-      await setState({
-        recipe: message.recipe,
-        recipes,
-        account: message.account,
-        noticedOrigin: origin,
-        pendingScans: accountChanged
-          ? {}
-          : rebindPendingIngestPaths(prior.pendingScans, recipes),
-        ...(accountChanged
-          ? {
-              lastScanBySource: {},
-              lastScanAt: null,
-              lastScanCount: null,
-              lastScanStartedAt: null,
-              hadReplyByConversation: {},
-              needs: null,
-              scanInProgress: false,
-              scanSource: null,
-              scanQueue: [],
-              scanAccountId: null,
-              scanPhaseIndex: null,
-              scanCursor: null,
-              scanItems: null,
-              scanPhaseResults: null,
-              scanSelfId: null,
-              scanStartedAt: null,
-              scanNeedsRecipeRefresh: false,
-              syncTabId: null,
-              syncTabIds: {},
-            }
-          : {}),
+      const oldTabIds = await withAccountStateMutation(async () => {
+        const prior = await getState();
+        // During a mixed-version rollout an older noticed instance may omit id.
+        // Preserve account-bound data only when id or normalized email proves
+        // this is the same user; ambiguity is handled conservatively as a switch.
+        const accountChanged = prior.account != null
+          ? !accountsMatch(prior.account, message.account)
+          : hasAccountBoundState(prior);
+        const tabs = accountChanged
+          ? new Set([
+              ...(prior.syncTabId == null ? [] : [prior.syncTabId]),
+              ...Object.values(prior.syncTabIds ?? {}),
+            ])
+          : new Set<number>();
+        await setState({
+          recipe: message.recipe,
+          recipes,
+          account: message.account,
+          noticedOrigin: origin,
+          pendingScans: accountChanged
+            ? {}
+            : rebindPendingIngestPaths(prior.pendingScans, recipes),
+          ...(accountChanged
+            ? {
+                lastScanBySource: {},
+                lastScanAt: null,
+                lastScanCount: null,
+                lastScanStartedAt: null,
+                hadReplyByConversation: {},
+                needs: null,
+                scanInProgress: false,
+                scanSource: null,
+                scanQueue: [],
+                scanAccountId: null,
+                scanPhaseIndex: null,
+                scanCursor: null,
+                scanItems: null,
+                scanPhaseResults: null,
+                scanSelfId: null,
+                scanStartedAt: null,
+                scanNeedsRecipeRefresh: false,
+                syncTabId: null,
+                syncTabIds: {},
+              }
+            : {}),
+        });
+        return tabs;
       });
       for (const tabId of oldTabIds) {
         try {
@@ -1179,12 +1256,16 @@ async function handleExternal(
       return;
     }
     case "getCachedScan": {
-      const { pendingScans } = await getState();
+      const state = await getState();
+      const { pendingScans } = state;
       const src = message.source;
       const pending = src
         ? pendingScans?.[src]
         : Object.values(pendingScans ?? {})[0];
-      if (!pending) {
+      if (
+        !pending
+        || !accountOwnsKey(state.account, pending.accountKey ?? null)
+      ) {
         sendResponse({ ingestPath: null, payload: null });
         return;
       }
@@ -1372,6 +1453,7 @@ export function registerListeners(): void {
         if (isScanStale(scanStartedAt, Date.now())) {
           await clearScanState();
           clearScanTick();
+          await drainScanQueue();
           return;
         }
         await continueScanPlan();
@@ -1407,17 +1489,17 @@ export function registerListeners(): void {
   });
 
   void (async () => {
-    const { scanInProgress, scanStartedAt, scanQueue } = await getState();
+    const { scanInProgress, scanStartedAt, scanQueue, noticedOrigin } = await getState();
     if (!scanInProgress) {
       if ((scanQueue?.length ?? 0) > 0) await drainScanQueue();
-      return;
-    }
-    if (isScanStale(scanStartedAt, Date.now())) {
+    } else if (isScanStale(scanStartedAt, Date.now())) {
       await clearScanState();
       clearScanTick();
-      return;
+      await drainScanQueue();
+    } else {
+      armScanTick();
     }
-    armScanTick();
+    if (noticedOrigin) await openPendingHandoffs(noticedOrigin);
   })();
 }
 
