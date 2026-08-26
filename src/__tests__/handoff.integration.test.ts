@@ -110,7 +110,7 @@ describe("SW ↔ /x/sync handoff integration", () => {
     expect(stored.needs).toBe("noticed-signin");
 
     // 3. /x/sync page pulls the cached scan
-    const cached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension" }, noticedSender)) as Record<
+    const cached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension", accountId: "acct-1" }, noticedSender)) as Record<
       string,
       unknown
     >;
@@ -125,7 +125,7 @@ describe("SW ↔ /x/sync handoff integration", () => {
     expect(confirmed).toMatchObject({ ok: true });
 
     // pending cleared via getCachedScan
-    const afterCached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension" }, noticedSender)) as Record<
+    const afterCached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension", accountId: "acct-1" }, noticedSender)) as Record<
       string,
       unknown
     >;
@@ -154,7 +154,7 @@ describe("SW ↔ /x/sync handoff integration", () => {
     // 2. do NOT dispatch syncConfirmed (user not signed into noticed)
 
     // 3. pending still present, getStatus reports noticed-signin
-    const cached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension" }, noticedSender)) as Record<
+    const cached = (await dispatchExternal({ type: "getCachedScan", source: "linkedin_extension", accountId: "acct-1" }, noticedSender)) as Record<
       string,
       unknown
     >;

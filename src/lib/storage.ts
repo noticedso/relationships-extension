@@ -91,7 +91,9 @@ export type ScanRecipe = {
 };
 
 export type Account = {
-  id: string;
+  /** Stable noticed user id. Optional only for mixed-version server rollout. */
+  id?: string;
+  email?: string | null;
   displayName?: string;
   [key: string]: unknown;
 };
@@ -105,6 +107,8 @@ export type PendingScan = {
   ingestPath: string;
   payload: Record<string, unknown>;
   count: number;
+  /** Identity key of the noticed account that produced this payload. */
+  accountKey?: string | null;
 };
 
 export type State = {
@@ -141,6 +145,10 @@ export type State = {
   scanInProgress?: boolean;
   /** The source of the single in-flight scan. */
   scanSource?: string | null;
+  /** Sources still owed by the current user-triggered or automatic scan plan. */
+  scanQueue?: string[] | null;
+  /** noticed account that owns the current in-flight scan. */
+  scanAccountId?: string | null;
   /** Index into the source's phase plan (connection list(s) then messages). */
   scanPhaseIndex?: number | null;
   /** The cursor of the next page to fetch (resume point) — a numeric offset, or
@@ -172,6 +180,8 @@ export type State = {
    * Closed on syncConfirmed so the silent background tab doesn't linger.
    */
   syncTabId?: number | null;
+  /** Per-source handoff tabs. Kept alongside syncTabId for older installs. */
+  syncTabIds?: Record<string, number> | null;
 };
 
 const KEYS: (keyof State)[] = [
@@ -189,6 +199,8 @@ const KEYS: (keyof State)[] = [
   "testMode",
   "scanInProgress",
   "scanSource",
+  "scanQueue",
+  "scanAccountId",
   "scanPhaseIndex",
   "scanCursor",
   "scanItems",
@@ -197,6 +209,7 @@ const KEYS: (keyof State)[] = [
   "scanStartedAt",
   "scanNeedsRecipeRefresh",
   "syncTabId",
+  "syncTabIds",
 ];
 
 /** Typed read of the full stored state (any unset key is simply absent). */

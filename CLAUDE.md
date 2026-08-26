@@ -34,7 +34,8 @@ not at install.)
 
 **`src/service-worker.ts` is the brain.** It registers listeners (idempotently — re-binds when the test
 harness swaps the global `chrome`):
-- `onMessageExternal` — only from `*.noticed.so` origins (enforced by `isNoticedOrigin`): `ping`, `pair`
+- `onMessageExternal` — only from `*.noticed.so` origins (enforced by `isNoticedOrigin`): `ping`, `pair`,
+  `getOnboardingStatus`
   (store recipe+account+`noticedOrigin`, request the host permission, set the three-day alarm),
   `getCachedScan`, `syncConfirmed`.
 - `onMessage` (popup) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`.

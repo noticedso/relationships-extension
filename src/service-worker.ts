@@ -65,7 +65,8 @@ const MAX_CONSECUTIVE_PROBE_FAILURES = 5;
 type ExternalMessage =
   | { type: "ping" }
   | { type: "pair"; recipe: ScanRecipe; recipes?: ScanRecipe[]; account: Account }
-  | { type: "getCachedScan"; source?: string }
+  | { type: "getOnboardingStatus" }
+  | { type: "getCachedScan"; source?: string; accountId?: string }
   | { type: "syncConfirmed"; source?: string };
 
 type InternalMessage =
@@ -108,9 +109,42 @@ function recipesOf(state: Partial<State>): Record<string, ScanRecipe> {
   return {};
 }
 
+function recipeForSource(
+  recipes: Record<string, ScanRecipe>,
+  source: string,
+): ScanRecipe | undefined {
+  return recipes[source]
+    ?? (source === "x" ? recipes.x_extension : undefined)
+    ?? (source === "x_extension" ? recipes.x : undefined);
+}
+
+/** Preserve cached payloads while rebinding their upload destination to the
+ * newly paired run/session. The correlation lives in the served ingestPath. */
+function rebindPendingIngestPaths(
+  pendingScans: Record<string, PendingScan> | null | undefined,
+  recipes: Record<string, ScanRecipe>,
+  ownerKey?: string | null,
+): Record<string, PendingScan> | null {
+  if (!pendingScans) return null;
+  return Object.fromEntries(
+    Object.entries(pendingScans).map(([key, pending]) => {
+      const ingestPath = recipeForSource(recipes, pending.source)?.ingestPath;
+      return [
+        key,
+        {
+          ...pending,
+          ...(ingestPath ? { ingestPath } : {}),
+          ...(ownerKey !== undefined ? { accountKey: ownerKey } : {}),
+        },
+      ];
+    }),
+  );
+}
+
 /**
- * Pull the CURRENT recipes from noticed and store them, so a scan never runs on
- * a recipe from the previous sync. Recipes are served live precisely so endpoint
+ * Pull the CURRENT recipes from noticed, so a scan never runs on a recipe from
+ * the previous sync. The caller stores them with the scan checkpoint under the
+ * account mutation lock. Recipes are served live precisely so endpoint
  * drift (LinkedIn rotates its GraphQL `queryId`s) can be fixed without shipping
  * an extension; before this, recipes only ever arrived on the `pair` message —
  * and noticed's handoff order is scan → POST → re-pair → syncConfirmed, so every
@@ -127,7 +161,7 @@ function recipesOf(state: Partial<State>): Record<string, ScanRecipe> {
  */
 async function refreshRecipesFromServer(
   noticedOrigin: string | null | undefined,
-): Promise<Record<string, ScanRecipe> | null> {
+): Promise<{ recipe: ScanRecipe; recipes: Record<string, ScanRecipe> } | null> {
   if (!noticedOrigin) return null;
   try {
     const res = await fetch(noticedOrigin + RECIPE_PATH, { credentials: "include" });
@@ -136,9 +170,7 @@ async function refreshRecipesFromServer(
     // clobbering a known-good cached recipe.
     const parsed = parseServedRecipes(await res.json());
     if (!parsed) return null;
-    // Recipes only — `account` stays owned by the pair path.
-    await setState({ recipe: parsed.recipe, recipes: parsed.recipes });
-    return parsed.recipes;
+    return parsed;
   } catch {
     return null;
   }
@@ -269,6 +301,134 @@ function countMessageRaw(json: unknown, fieldMap: NonNullable<ScanRecipe["messag
 }
 
 let scanRunning = false;
+let accountStateMutation = Promise.resolve();
+let handoffReconcile: Promise<void> | null = null;
+
+class ScanSupersededError extends Error {}
+
+function accountKey(account: Account | null | undefined): string | null {
+  const id = typeof account?.id === "string" ? account.id.trim() : "";
+  if (id) return `id:${id}`;
+  const email = typeof account?.email === "string" ? account.email.trim().toLowerCase() : "";
+  return email ? `email:${email}` : null;
+}
+
+function stableAccountId(account: Account | null | undefined): string | null {
+  const id = typeof account?.id === "string" ? account.id.trim() : "";
+  return id || null;
+}
+
+/** Normalize the raw-id owner written by an unshipped intermediate build. */
+function normalizeAccountKey(value: string | null | undefined): string | null {
+  const key = typeof value === "string" ? value.trim() : "";
+  if (!key) return null;
+  if (key.startsWith("id:") || key.startsWith("email:")) return key;
+  return `id:${key}`;
+}
+
+function accountsMatch(
+  prior: Account | null | undefined,
+  next: Account | null | undefined,
+): boolean {
+  const priorId = typeof prior?.id === "string" ? prior.id.trim() : "";
+  const nextId = typeof next?.id === "string" ? next.id.trim() : "";
+  if (priorId && nextId) return priorId === nextId;
+  const priorEmail = typeof prior?.email === "string" ? prior.email.trim().toLowerCase() : "";
+  const nextEmail = typeof next?.email === "string" ? next.email.trim().toLowerCase() : "";
+  return priorEmail !== "" && priorEmail === nextEmail;
+}
+
+function accountOwnsKey(account: Account | null | undefined, ownerKey: string | null): boolean {
+  if (ownerKey == null) return true;
+  const id = typeof account?.id === "string" ? account.id.trim() : "";
+  if (id && ownerKey === `id:${id}`) return true;
+  const email = typeof account?.email === "string" ? account.email.trim().toLowerCase() : "";
+  return email !== "" && ownerKey === `email:${email}`;
+}
+
+function hasAccountBoundState(state: Partial<State>): boolean {
+  return Object.keys(state.pendingScans ?? {}).length > 0
+    || state.scanInProgress === true
+    || (state.scanQueue?.length ?? 0) > 0
+    || state.syncTabId != null
+    || Object.keys(state.syncTabIds ?? {}).length > 0
+    || state.lastScanAt != null
+    || state.lastScanCount != null
+    || state.lastScanStartedAt != null
+    || Object.keys(state.lastScanBySource ?? {}).length > 0
+    || Object.keys(state.hadReplyByConversation ?? {}).length > 0;
+}
+
+async function withAccountStateMutation<T>(action: () => Promise<T>): Promise<T> {
+  const previous = accountStateMutation;
+  let release: () => void = () => {};
+  accountStateMutation = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
+
+async function assertCurrentScan(source: string, accountId: string | null): Promise<void> {
+  const current = await getState();
+  if (
+    !current.scanInProgress
+    || current.scanSource !== source
+    || (accountId != null && accountKey(current.account) !== accountId)
+    || (current.scanAccountId != null && normalizeAccountKey(current.scanAccountId) !== accountId)
+  ) {
+    throw new ScanSupersededError();
+  }
+}
+
+/** Check ownership and persist a checkpoint as one mutation relative to pair/finalize. */
+async function updateCurrentScan(
+  source: string,
+  accountId: string | null,
+  patch: Partial<State>,
+): Promise<void> {
+  await withAccountStateMutation(async () => {
+    const current = await getState();
+    if (
+      !current.scanInProgress
+      || current.scanSource !== source
+      || (accountId != null && accountKey(current.account) !== accountId)
+      || (current.scanAccountId != null
+        && normalizeAccountKey(current.scanAccountId) !== accountId)
+    ) {
+      throw new ScanSupersededError();
+    }
+    await setState(patch);
+  });
+}
+
+function clearedScanState(extra?: { needs?: "network-signin" }): Partial<State> {
+  return {
+    scanInProgress: false,
+    scanSource: null,
+    scanAccountId: null,
+    scanPhaseIndex: null,
+    scanCursor: null,
+    scanItems: null,
+    scanPhaseResults: null,
+    scanSelfId: null,
+    scanStartedAt: null,
+    scanNeedsRecipeRefresh: false,
+    ...(extra?.needs !== undefined ? { needs: extra.needs } : {}),
+  };
+}
+
+async function clearCurrentScan(
+  source: string,
+  accountId: string | null,
+  extra?: { needs?: "network-signin" },
+): Promise<void> {
+  await updateCurrentScan(source, accountId, clearedScanState(extra));
+}
 
 function armScanTick(): void {
   chrome.alarms.create(SCAN_TICK_ALARM, { periodInMinutes: SCAN_TICK_PERIOD_MINUTES });
@@ -477,6 +637,8 @@ async function runLinkedInMessageEventsPass(
   fetchImpl: typeof fetch,
   selfId: string,
   sleep: (ms: number) => Promise<void>,
+  assertCurrent?: () => Promise<void>,
+  persistCache?: (cache: Record<string, { at: number; had_reply: boolean }>) => Promise<void>,
 ): Promise<Map<string, boolean>> {
   const out = new Map<string, boolean>();
   const m = recipe.messages;
@@ -485,6 +647,7 @@ async function runLinkedInMessageEventsPass(
   if (!m || !me || !selfId) return out;
   const fieldMap = m.messageFieldMap;
   if (!("mode" in fieldMap) || fieldMap.mode !== "participantConversations") return out;
+  await assertCurrent?.();
 
   // One conversations-list fetch to learn which conversations to probe.
   const listRes = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, 0, selfId), {
@@ -553,7 +716,11 @@ async function runLinkedInMessageEventsPass(
   }
   // Persist the pruned cache (only conversations still in the summary list) so
   // the next scan is delta-only and the cache stays bounded.
-  await setState({ hadReplyByConversation: nextCache });
+  if (persistCache) await persistCache(nextCache);
+  else {
+    await assertCurrent?.();
+    await setState({ hadReplyByConversation: nextCache });
+  }
   return out;
 }
 
@@ -576,19 +743,25 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     if (!scanInProgress || !scanSource) return { ok: true, note: "not-in-progress" };
     let recipe = recipesOf(state)[scanSource];
     if (!recipe) return { ok: false };
+    const scanAccountId = normalizeAccountKey(state.scanAccountId) ?? accountKey(state.account);
+    const assertCurrent = () => assertCurrentScan(scanSource, scanAccountId);
+    if (state.scanAccountId !== scanAccountId) {
+      await updateCurrentScan(scanSource, scanAccountId, { scanAccountId });
+    }
 
     if (isScanStale(state.scanStartedAt, now())) {
-      await clearScanState();
+      await clearCurrentScan(scanSource, scanAccountId);
       clearScanTick();
       return { ok: false, note: "stale" };
     }
 
     let headers = await buildCsrfHeaders(recipe);
     if (!headers) {
-      await clearScanState({ needs: "network-signin" });
+      await clearCurrentScan(scanSource, scanAccountId, { needs: "network-signin" });
       clearScanTick();
       return { ok: false, needs: "network-signin" };
     }
+    await assertCurrent();
 
     // ── Recipe refresh: ONCE, at the START of a scan ──────────────────────────
     // Gated on the persisted `scanNeedsRecipeRefresh` flag, which the scan
@@ -606,8 +779,13 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // and a scan that cannot run must not make a request to noticed either.
     if (state.scanNeedsRecipeRefresh) {
       const refreshed = await refreshRecipesFromServer(noticedOrigin);
-      await setState({ scanNeedsRecipeRefresh: false });
-      const fresh = refreshed?.[scanSource];
+      await updateCurrentScan(scanSource, scanAccountId, {
+        ...(refreshed
+          ? { recipe: refreshed.recipe, recipes: refreshed.recipes }
+          : {}),
+        scanNeedsRecipeRefresh: false,
+      });
+      const fresh = refreshed?.recipes[scanSource];
       if (fresh) {
         recipe = fresh;
         // The fresh recipe may carry a different csrfRule — rebuild, but keep the
@@ -660,7 +838,12 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
           startAt: resumeThisPhase ? (state.scanCursor ?? 0) : 0,
           initialItems: initialItems as ScanMessage[],
           onPage: async (its, nextCursor) => {
-            await setState({ scanPhaseIndex: phaseIndex, scanCursor: nextCursor, scanItems: its, scanSelfId: selfId });
+            await updateCurrentScan(scanSource, scanAccountId, {
+              scanPhaseIndex: phaseIndex,
+              scanCursor: nextCursor,
+              scanItems: its,
+              scanSelfId: selfId,
+            });
           },
         });
         results.messages = items;
@@ -686,7 +869,12 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
           startAt,
           initialItems: initialItems as ScanConnection[],
           onPage: async (its, nextCursor) => {
-            await setState({ scanPhaseIndex: phaseIndex, scanCursor: nextCursor, scanItems: its, scanSelfId: selfId });
+            await updateCurrentScan(scanSource, scanAccountId, {
+              scanPhaseIndex: phaseIndex,
+              scanCursor: nextCursor,
+              scanItems: its,
+              scanSelfId: selfId,
+            });
           },
         });
         results.connLists.push(items);
@@ -694,7 +882,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
       phaseIndex += 1;
       resumeThisPhase = false;
-      await setState({
+      await updateCurrentScan(scanSource, scanAccountId, {
         scanPhaseIndex: phaseIndex,
         scanCursor: null,
         scanItems: [],
@@ -715,6 +903,10 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         fetchImpl,
         selfId,
         sleep,
+        assertCurrent,
+        (cache) => updateCurrentScan(scanSource, scanAccountId, {
+          hadReplyByConversation: cache,
+        }),
       ).catch(() => new Map<string, boolean>());
       if (hadReplyByCounterpart.size > 0) {
         results.messages = results.messages.map((msg) =>
@@ -729,8 +921,10 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // a failure here can never abort a completed connections scan. Each is wrapped
     // so a throw degrades to "no extra" rather than wedging the scan.
     const extras: ScanExtras = {};
+    await assertCurrent();
     if (recipe.ownerProfile) {
       extras.ownerProfile = await runOwnerProfilePass(recipe, headers, fetchImpl).catch(() => undefined);
+      await assertCurrent();
     }
     if (recipe.tweets) {
       extras.tweetEdges = await runTweetsPass(
@@ -742,8 +936,10 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         jitter,
         effectiveMaxPages,
       ).catch(() => []);
+      await assertCurrent();
     }
 
+    await assertCurrent();
     return finalizeScan(
       recipe,
       results.connLists,
@@ -752,26 +948,14 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       noticedOrigin ?? null,
       now(),
       extras,
+      scanAccountId,
     );
+  } catch (error) {
+    if (error instanceof ScanSupersededError) return { ok: false, note: "superseded" };
+    throw error;
   } finally {
     scanRunning = false;
   }
-}
-
-/** Clear the in-flight scan checkpoint (and optionally set a `needs`). */
-async function clearScanState(extra?: { needs?: "network-signin" }): Promise<void> {
-  await setState({
-    scanInProgress: false,
-    scanSource: null,
-    scanPhaseIndex: null,
-    scanCursor: null,
-    scanItems: null,
-    scanPhaseResults: null,
-    scanSelfId: null,
-    scanStartedAt: null,
-    scanNeedsRecipeRefresh: false,
-    ...(extra?.needs !== undefined ? { needs: extra.needs } : {}),
-  });
 }
 
 /** Persist the finished scan, hand off, and tear down the keepalive tick. */
@@ -783,41 +967,64 @@ async function finalizeScan(
   noticedOrigin: string | null,
   startedAt: number,
   extras: ScanExtras = {},
+  scanAccountId: string | null = null,
 ): Promise<RunScanResult> {
-  clearScanTick();
   const source = sourceOf(recipe);
   const { ingestPath, payload, count } = assembleScanPayload(recipe, connLists, messages, selfId, extras);
-  const pending: PendingScan = { source, ingestPath, payload, count };
+  return withAccountStateMutation(async () => {
+    const state = await getState();
+    if (
+      !state.scanInProgress
+      || state.scanSource !== source
+      || (scanAccountId != null && accountKey(state.account) !== scanAccountId)
+      || (state.scanAccountId != null
+        && normalizeAccountKey(state.scanAccountId) !== scanAccountId)
+    ) {
+      return { ok: false, note: "superseded" };
+    }
 
-  const state = await getState();
-  const pendingScans = { ...(state.pendingScans ?? {}), [source]: pending };
+    clearScanTick();
+    const pending: PendingScan = {
+      source,
+      ingestPath,
+      payload,
+      count,
+      accountKey: scanAccountId,
+    };
+    const pendingScans = { ...(state.pendingScans ?? {}), [source]: pending };
+    const cleared = {
+      scanInProgress: false,
+      scanSource: null,
+      scanAccountId: null,
+      scanPhaseIndex: null,
+      scanCursor: null,
+      scanItems: null,
+      scanPhaseResults: null,
+      scanSelfId: null,
+      scanStartedAt: null,
+      scanNeedsRecipeRefresh: false,
+    } as const;
 
-  const cleared = {
-    scanInProgress: false,
-    scanSource: null,
-    scanPhaseIndex: null,
-    scanCursor: null,
-    scanItems: null,
-    scanPhaseResults: null,
-    scanSelfId: null,
-    scanStartedAt: null,
-    scanNeedsRecipeRefresh: false,
-  } as const;
+    if (!noticedOrigin) {
+      await setState({ pendingScans, needs: null, lastScanStartedAt: startedAt, ...cleared });
+      return { ok: true, count, note: "no-handoff-origin" };
+    }
 
-  if (!noticedOrigin) {
-    await setState({ pendingScans, needs: null, lastScanStartedAt: startedAt, ...cleared });
-    return { ok: true, count, note: "no-handoff-origin" };
-  }
-
-  await setState({ pendingScans, needs: "noticed-signin", lastScanStartedAt: startedAt, ...cleared });
-
-  // E7 silent handoff: open /x/sync?ext_id=…&source=<src> in a BACKGROUND tab.
-  const tab = await chrome.tabs.create({
-    url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`,
-    active: false,
+    await setState({ pendingScans, needs: "noticed-signin", lastScanStartedAt: startedAt, ...cleared });
+    // E7 silent handoff: open /x/sync?ext_id=…&source=<src> in a BACKGROUND tab.
+    const tab = await chrome.tabs.create({
+      url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`,
+      active: false,
+    });
+    await setState({
+      syncTabId: tab?.id ?? null,
+      syncTabIds:
+        tab?.id != null
+          ? { ...(state.syncTabIds ?? {}), [source]: tab.id }
+          : state.syncTabIds ?? {},
+    });
+    return { ok: true, count };
   });
-  await setState({ syncTabId: tab?.id ?? null });
-  return { ok: true, count };
 }
 
 /**
@@ -839,21 +1046,106 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
   }
 
   const now = deps.nowMs ?? (() => Date.now());
-  await setState({
-    scanInProgress: true,
-    scanSource: src,
-    scanPhaseIndex: 0,
-    scanCursor: null,
-    scanItems: [],
-    scanPhaseResults: { connLists: [], messages: [] },
-    scanSelfId: null,
-    scanStartedAt: now(),
-    // A genuine fresh start → owe a recipe refresh (continueScan performs it).
-    scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
-    needs: null,
+  const expectedAccountKey = accountKey(state.account);
+  const started = await withAccountStateMutation(async () => {
+    const current = await getState();
+    if (accountKey(current.account) !== expectedAccountKey || !recipesOf(current)[src]) return false;
+    await setState({
+      scanInProgress: true,
+      scanSource: src,
+      scanAccountId: expectedAccountKey,
+      scanPhaseIndex: 0,
+      scanCursor: null,
+      scanItems: [],
+      scanPhaseResults: { connLists: [], messages: [] },
+      scanSelfId: null,
+      scanStartedAt: now(),
+      // A genuine fresh start → owe a recipe refresh (continueScan performs it).
+      scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
+      needs: null,
+    });
+    return true;
   });
+  if (!started) return { ok: false, note: "superseded" };
   armScanTick();
   return continueScan(deps);
+}
+
+async function initializeScanPlan(
+  sources: string[],
+  refreshRecipes: boolean,
+): Promise<boolean> {
+  return withAccountStateMutation(async () => {
+    const state = await getState();
+    const recipes = recipesOf(state);
+    const list = sources.filter((source) => recipes[source] != null);
+    const first = list[0];
+    if (!first) {
+      await setState({ scanQueue: [] });
+      return false;
+    }
+    await setState({
+      scanInProgress: true,
+      scanSource: first,
+      scanQueue: list.slice(1),
+      scanAccountId: accountKey(state.account),
+      scanPhaseIndex: 0,
+      scanCursor: null,
+      scanItems: [],
+      scanPhaseResults: { connLists: [], messages: [] },
+      scanSelfId: null,
+      scanStartedAt: Date.now(),
+      scanNeedsRecipeRefresh: refreshRecipes,
+      needs: null,
+    });
+    armScanTick();
+    return true;
+  });
+}
+
+async function drainScanQueue(): Promise<void> {
+  for (;;) {
+    const next = await withAccountStateMutation(async () => {
+      const state = await getState();
+      if (state.scanInProgress) return null;
+      const [candidate, ...rest] = state.scanQueue ?? [];
+      if (!candidate) {
+        if (state.scanQueue != null) await setState({ scanQueue: [] });
+        return null;
+      }
+      const recipes = recipesOf(state);
+      if (!recipes[candidate]) {
+        await setState({ scanQueue: rest });
+        return "skip" as const;
+      }
+      await setState({
+        scanInProgress: true,
+        scanSource: candidate,
+        scanQueue: rest,
+        scanAccountId: accountKey(state.account),
+        scanPhaseIndex: 0,
+        scanCursor: null,
+        scanItems: [],
+        scanPhaseResults: { connLists: [], messages: [] },
+        scanSelfId: null,
+        scanStartedAt: Date.now(),
+        scanNeedsRecipeRefresh: false,
+        needs: null,
+      });
+      armScanTick();
+      return candidate;
+    });
+    if (next == null) return;
+    if (next === "skip") continue;
+    const result = await continueScan();
+    if (result.note === "already-running") return;
+  }
+}
+
+async function continueScanPlan(): Promise<void> {
+  const result = await continueScan();
+  if (result.note === "already-running") return;
+  await drainScanQueue();
 }
 
 /**
@@ -877,7 +1169,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
 async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promise<void> {
   const state = await getState();
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
-  let refreshRecipes = opts.refreshRecipes;
+  const targets: string[] = [];
   for (const src of await grantedSources(recipesOf(state))) {
     // A pending payload means this source already scanned and its first-party
     // handoff has not confirmed yet. Re-scanning it cannot help: it only replaces
@@ -885,9 +1177,85 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
     // stronger than the timestamp throttle and also covers legacy installs where
     // lastScanStartedAt was never persisted.
     if (state.pendingScans?.[src]) continue;
-    await runScan(src, { refreshRecipes });
-    refreshRecipes = false;
+    targets.push(src);
   }
+  if (targets.length === 0) return;
+  if (await initializeScanPlan(targets, opts.refreshRecipes)) await continueScanPlan();
+}
+
+async function reconcilePendingHandoffs(origin: string): Promise<void> {
+  await withAccountStateMutation(async () => {
+    const state = await getState();
+    const tabIds = { ...(state.syncTabIds ?? {}) };
+    for (const pending of Object.values(state.pendingScans ?? {})) {
+      if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
+      const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
+      const existingTabId = tabIds[pending.source];
+      if (existingTabId != null) {
+        try {
+          const existing = await chrome.tabs.get(existingTabId);
+          if (existing.url === handoffUrl) continue;
+          delete tabIds[pending.source];
+        } catch {
+          delete tabIds[pending.source];
+        }
+      }
+      const tab = await chrome.tabs.create({
+        url: handoffUrl,
+        active: false,
+      });
+      if (tab?.id != null) tabIds[pending.source] = tab.id;
+    }
+    await setState({ syncTabIds: tabIds });
+  });
+}
+
+async function openPendingHandoffs(origin: string): Promise<void> {
+  if (handoffReconcile) return handoffReconcile;
+  const reconcile = reconcilePendingHandoffs(origin);
+  handoffReconcile = reconcile;
+  try {
+    await reconcile;
+  } finally {
+    if (handoffReconcile === reconcile) handoffReconcile = null;
+  }
+}
+
+async function buildStatus(): Promise<Record<string, unknown>> {
+  const state = await getState();
+  const recipes = recipesOf(state);
+  const granted = await grantedSources(recipes);
+  const lastBy = state.lastScanBySource ?? {};
+  const sources = await Promise.all(
+    Object.values(recipes).map(async (recipe) => {
+      const source = sourceOf(recipe);
+      const isGranted = granted.includes(source);
+      return {
+        source,
+        networkLabel: recipe.networkLabel ?? source,
+        targetOrigin: recipe.targetOrigin,
+        granted: isGranted,
+        signedIn: isGranted ? await isSignedIn(recipe) : null,
+        pending: state.pendingScans?.[source] != null,
+        lastScanAt: lastBy[source]?.at ?? null,
+        lastScanCount: lastBy[source]?.count ?? null,
+      };
+    }),
+  );
+  const lastScanAt = state.lastScanAt ?? null;
+  return {
+    account: state.account ?? null,
+    recipe: state.recipe ?? null,
+    sources,
+    nextScanAt: lastScanAt != null ? lastScanAt + SCAN_PERIOD_MS : null,
+    lastScanAt,
+    lastScanCount: state.lastScanCount ?? null,
+    needs: state.needs ?? null,
+    testMode: state.testMode ?? false,
+    scanning: state.scanInProgress === true,
+    scanningSource: state.scanSource ?? null,
+    scannedCount: state.scanItems?.length ?? 0,
+  };
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -907,12 +1275,65 @@ async function handleExternal(
       // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
       // refresh (recipe-source.ts), so the two intake paths cannot drift.
       const recipes = toRecipeRecord(recipeList(message.recipe, message.recipes));
-      await setState({
-        recipe: message.recipe,
-        recipes,
-        account: message.account,
-        noticedOrigin: origin,
+      const oldTabIds = await withAccountStateMutation(async () => {
+        const prior = await getState();
+        // During a mixed-version rollout an older noticed instance may omit id.
+        // Preserve account-bound data only when id or normalized email proves
+        // this is the same user; ambiguity is handled conservatively as a switch.
+        const accountChanged = prior.account != null
+          ? !accountsMatch(prior.account, message.account)
+          : hasAccountBoundState(prior);
+        const nextAccountKey = accountKey(message.account);
+        const tabs = accountChanged
+          ? new Set([
+              ...(prior.syncTabId == null ? [] : [prior.syncTabId]),
+              ...Object.values(prior.syncTabIds ?? {}),
+            ])
+          : new Set<number>();
+        await setState({
+          recipe: message.recipe,
+          recipes,
+          account: message.account,
+          noticedOrigin: origin,
+          pendingScans: accountChanged
+            ? {}
+            : rebindPendingIngestPaths(prior.pendingScans, recipes, nextAccountKey),
+          ...(!accountChanged && prior.scanInProgress
+            ? { scanAccountId: nextAccountKey }
+            : {}),
+          ...(accountChanged
+            ? {
+                lastScanBySource: {},
+                lastScanAt: null,
+                lastScanCount: null,
+                lastScanStartedAt: null,
+                hadReplyByConversation: {},
+                needs: null,
+                scanInProgress: false,
+                scanSource: null,
+                scanQueue: [],
+                scanAccountId: null,
+                scanPhaseIndex: null,
+                scanCursor: null,
+                scanItems: null,
+                scanPhaseResults: null,
+                scanSelfId: null,
+                scanStartedAt: null,
+                scanNeedsRecipeRefresh: false,
+                syncTabId: null,
+                syncTabIds: {},
+              }
+            : {}),
+        });
+        return tabs;
       });
+      for (const tabId of oldTabIds) {
+        try {
+          await chrome.tabs.remove(tabId);
+        } catch {
+          // The old account's handoff tab may already be gone.
+        }
+      }
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
       sendResponse({ ok: true });
       // NT-66 auto-scan on pair: import the already-granted sources immediately so
@@ -928,41 +1349,79 @@ async function handleExternal(
       // pairs), so a pair-triggered scan must not re-fetch them. The throttle
       // above still guards the /x/sync re-pair → scan loop.
       void autoScanGrantedSources({ refreshRecipes: false });
+      void openPendingHandoffs(origin);
+      return;
+    }
+    case "getOnboardingStatus": {
+      sendResponse(await buildStatus());
       return;
     }
     case "getCachedScan": {
-      const { pendingScans } = await getState();
-      const src = message.source;
-      const pending = src
-        ? pendingScans?.[src]
-        : Object.values(pendingScans ?? {})[0];
-      if (!pending) {
+      const cached = await withAccountStateMutation(async () => {
+        const state = await getState();
+        const requestedAccountId =
+          typeof message.accountId === "string" ? message.accountId.trim() : "";
+        const currentAccountId = stableAccountId(state.account);
+        const requestedOwnerKey = requestedAccountId
+          ? `id:${requestedAccountId}`
+          : null;
+        const src = message.source;
+        const pending = src
+          ? state.pendingScans?.[src]
+          : Object.values(state.pendingScans ?? {})[0];
+        if (
+          !pending
+          || !currentAccountId
+          || currentAccountId !== requestedAccountId
+          || normalizeAccountKey(pending.accountKey) !== requestedOwnerKey
+        ) {
+          return null;
+        }
+        return {
+          source: pending.source,
+          accountId: currentAccountId,
+          ingestPath: pending.ingestPath,
+          payload: pending.payload,
+        };
+      });
+      if (!cached) {
         sendResponse({ ingestPath: null, payload: null });
         return;
       }
-      sendResponse({ source: pending.source, ingestPath: pending.ingestPath, payload: pending.payload });
+      sendResponse(cached);
       return;
     }
     case "syncConfirmed": {
-      const state = await getState();
-      const src = message.source ?? Object.keys(state.pendingScans ?? {})[0];
-      const pending = src ? state.pendingScans?.[src] : undefined;
-      const count = pending?.count ?? 0;
-      const pendingScans = { ...(state.pendingScans ?? {}) };
-      if (src) delete pendingScans[src];
-      const lastScanBySource = { ...(state.lastScanBySource ?? {}) };
-      if (src) lastScanBySource[src] = { at: Date.now(), count };
-      await setState({
-        pendingScans,
-        lastScanBySource,
-        needs: null,
-        lastScanAt: Date.now(),
-        lastScanCount: count,
+      const confirmed = await withAccountStateMutation(async () => {
+        const state = await getState();
+        const src = message.source ?? Object.keys(state.pendingScans ?? {})[0];
+        const pending = src ? state.pendingScans?.[src] : undefined;
+        if (!src || !pending || !accountOwnsKey(state.account, pending.accountKey ?? null)) {
+          return null;
+        }
+        const count = pending.count;
+        const pendingScans = { ...(state.pendingScans ?? {}) };
+        delete pendingScans[src];
+        const confirmedAt = Date.now();
+        const lastScanBySource = {
+          ...(state.lastScanBySource ?? {}),
+          [src]: { at: confirmedAt, count },
+        };
+        const syncTabIds = { ...(state.syncTabIds ?? {}) };
+        const tabId = syncTabIds[src] ?? state.syncTabId;
+        delete syncTabIds[src];
+        await setState({
+          pendingScans,
+          lastScanBySource,
+          needs: null,
+          lastScanAt: confirmedAt,
+          lastScanCount: count,
+          syncTabId: null,
+          syncTabIds,
+        });
+        return { tabId };
       });
-      if (state.syncTabId != null) {
-        await chrome.tabs.remove(state.syncTabId).catch(() => {});
-        await setState({ syncTabId: null });
-      }
+      if (confirmed?.tabId != null) await chrome.tabs.remove(confirmed.tabId).catch(() => {});
       sendResponse({ ok: true });
       return;
     }
@@ -975,42 +1434,7 @@ async function handleInternal(
 ): Promise<void> {
   switch (message.type) {
     case "getStatus": {
-      const state = await getState();
-      const recipes = recipesOf(state);
-      const granted = await grantedSources(recipes);
-      const lastBy = state.lastScanBySource ?? {};
-      const sources = await Promise.all(
-        Object.values(recipes).map(async (r) => {
-          const s = sourceOf(r);
-          const isGranted = granted.includes(s);
-          return {
-            source: s,
-            networkLabel: r.networkLabel ?? s,
-            targetOrigin: r.targetOrigin,
-            granted: isGranted,
-            // Only granted sources can be cookie-probed (host permission); leave
-            // others unknown so the popup defers to its grant flow, not a false
-            // "not signed in". Live so it survives the needs-clobbering bug.
-            signedIn: isGranted ? await isSignedIn(r) : null,
-            lastScanAt: lastBy[s]?.at ?? null,
-            lastScanCount: lastBy[s]?.count ?? null,
-          };
-        }),
-      );
-      const lastScanAt = state.lastScanAt ?? null;
-      sendResponse({
-        account: state.account ?? null,
-        recipe: state.recipe ?? null,
-        sources,
-        nextScanAt: lastScanAt != null ? lastScanAt + SCAN_PERIOD_MS : null,
-        lastScanAt,
-        lastScanCount: state.lastScanCount ?? null,
-        needs: state.needs ?? null,
-        testMode: state.testMode ?? false,
-        scanning: state.scanInProgress === true,
-        scanningSource: state.scanSource ?? null,
-        scannedCount: state.scanItems?.length ?? 0,
-      });
+      sendResponse(await buildStatus());
       return;
     }
     case "scanNow": {
@@ -1019,30 +1443,11 @@ async function handleInternal(
       const recipes = recipesOf(state);
       const targets = message.source ? [message.source] : await grantedSources(recipes);
       const list = targets.length > 0 ? targets : [state.recipe?.source ?? DEFAULT_SOURCE];
-      const first = list[0]!;
-
       // Cause B (scan-twice): set the in-flight scan state + arm the keepalive tick
       // SYNCHRONOUSLY — before the CSRF cookie round-trip in runScan — and ack
       // immediately, so the popup's first getStatus after this ack already reads
       // scanning:true and its poller doesn't bail to idle while the scan runs.
-      if (recipes[first]) {
-        await setState({
-          scanInProgress: true,
-          scanSource: first,
-          scanPhaseIndex: 0,
-          scanCursor: null,
-          scanItems: [],
-          scanPhaseResults: { connLists: [], messages: [] },
-          scanSelfId: null,
-          scanStartedAt: Date.now(),
-          // A user-gesture scan is a genuine fresh start → refresh the recipe.
-          // continueScan does the actual fetch AFTER the CSRF gate, so the ack
-          // below is never blocked on a round-trip to noticed (Cause B).
-          scanNeedsRecipeRefresh: true,
-          needs: null,
-        });
-        armScanTick();
-      }
+      const started = await initializeScanPlan(list, true);
       sendResponse({ ok: true });
 
       // Drive the scan(s) WITHOUT blocking the ack. continueScan picks up the state
@@ -1052,10 +1457,7 @@ async function handleInternal(
       // The remaining sources pass refreshRecipes:false — the first source's
       // refresh already stored EVERY source's recipe (one response carries them
       // all), so re-fetching per source would be a pure double-fetch.
-      void (async () => {
-        if (recipes[first]) await continueScan();
-        for (const src of list.slice(1)) await runScan(src, { refreshRecipes: false });
-      })();
+      if (started) void continueScanPlan();
       return;
     }
     case "setTestMode": {
@@ -1171,17 +1573,25 @@ export function registerListeners(): void {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === SCAN_TICK_ALARM) {
       void (async () => {
-        const { scanInProgress, scanStartedAt } = await getState();
+        const { scanInProgress, scanStartedAt, scanSource, scanAccountId, account } = await getState();
         if (!scanInProgress) {
           clearScanTick();
           return;
         }
         if (isScanStale(scanStartedAt, Date.now())) {
-          await clearScanState();
+          if (!scanSource) return;
+          const ownerKey = normalizeAccountKey(scanAccountId) ?? accountKey(account);
+          try {
+            await clearCurrentScan(scanSource, ownerKey);
+          } catch (error) {
+            if (error instanceof ScanSupersededError) return;
+            throw error;
+          }
           clearScanTick();
+          await drainScanQueue();
           return;
         }
-        await continueScan();
+        await continueScanPlan();
       })();
       return;
     }
@@ -1207,25 +1617,39 @@ export function registerListeners(): void {
       const targets = Object.entries(recipes)
         .filter(([, r]) => added.some((o) => grantCovers(o, r.targetOrigin)))
         .map(([src]) => src);
-      // Grant is a user gesture that starts a real scan → refresh (only the first
-      // source; one response carries every source's recipe).
-      let refreshRecipes = true;
-      for (const src of targets) {
-        await runScan(src, { refreshRecipes });
-        refreshRecipes = false;
-      }
+      // Grant is a user gesture that starts a real scan → refresh only the first
+      // source; the persisted queue survives worker teardown between sources.
+      if (await initializeScanPlan(targets, true)) await continueScanPlan();
     })();
   });
 
   void (async () => {
-    const { scanInProgress, scanStartedAt } = await getState();
-    if (!scanInProgress) return;
-    if (isScanStale(scanStartedAt, Date.now())) {
-      await clearScanState();
+    const {
+      scanInProgress,
+      scanStartedAt,
+      scanSource,
+      scanAccountId,
+      account,
+      scanQueue,
+      noticedOrigin,
+    } = await getState();
+    if (!scanInProgress) {
+      if ((scanQueue?.length ?? 0) > 0) await drainScanQueue();
+    } else if (isScanStale(scanStartedAt, Date.now())) {
+      if (!scanSource) return;
+      const ownerKey = normalizeAccountKey(scanAccountId) ?? accountKey(account);
+      try {
+        await clearCurrentScan(scanSource, ownerKey);
+      } catch (error) {
+        if (error instanceof ScanSupersededError) return;
+        throw error;
+      }
       clearScanTick();
-      return;
+      await drainScanQueue();
+    } else {
+      armScanTick();
     }
-    armScanTick();
+    if (noticedOrigin) await openPendingHandoffs(noticedOrigin);
   })();
 }
 

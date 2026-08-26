@@ -58,6 +58,7 @@ export interface ChromeMock {
   };
   tabs: {
     create: (createProperties: { url?: string; active?: boolean }) => Promise<{ id: number; url?: string }>;
+    get: (tabId: number) => Promise<{ id: number; url?: string }>;
     remove: (tabId: number) => Promise<void>;
   };
 }
@@ -126,6 +127,9 @@ function createChromeMock(): ChromeMock {
     tabs: {
       async create(createProperties: { url?: string; active?: boolean }): Promise<{ id: number; url?: string }> {
         return { id: 1, url: createProperties.url };
+      },
+      async get(tabId: number): Promise<{ id: number; url?: string }> {
+        return { id: tabId };
       },
       async remove(_tabId: number): Promise<void> {},
     },
