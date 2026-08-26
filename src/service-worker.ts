@@ -123,12 +123,20 @@ function recipeForSource(
 function rebindPendingIngestPaths(
   pendingScans: Record<string, PendingScan> | null | undefined,
   recipes: Record<string, ScanRecipe>,
+  ownerKey?: string | null,
 ): Record<string, PendingScan> | null {
   if (!pendingScans) return null;
   return Object.fromEntries(
     Object.entries(pendingScans).map(([key, pending]) => {
       const ingestPath = recipeForSource(recipes, pending.source)?.ingestPath;
-      return [key, ingestPath ? { ...pending, ingestPath } : pending];
+      return [
+        key,
+        {
+          ...pending,
+          ...(ingestPath ? { ingestPath } : {}),
+          ...(ownerKey !== undefined ? { accountKey: ownerKey } : {}),
+        },
+      ];
     }),
   );
 }
@@ -1186,6 +1194,7 @@ async function handleExternal(
         const accountChanged = prior.account != null
           ? !accountsMatch(prior.account, message.account)
           : hasAccountBoundState(prior);
+        const nextAccountKey = accountKey(message.account);
         const tabs = accountChanged
           ? new Set([
               ...(prior.syncTabId == null ? [] : [prior.syncTabId]),
@@ -1199,7 +1208,10 @@ async function handleExternal(
           noticedOrigin: origin,
           pendingScans: accountChanged
             ? {}
-            : rebindPendingIngestPaths(prior.pendingScans, recipes),
+            : rebindPendingIngestPaths(prior.pendingScans, recipes, nextAccountKey),
+          ...(!accountChanged && prior.scanInProgress
+            ? { scanAccountId: nextAccountKey }
+            : {}),
           ...(accountChanged
             ? {
                 lastScanBySource: {},

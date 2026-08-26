@@ -556,6 +556,60 @@ describe("service worker", () => {
     });
   });
 
+  it("3n. an id-owned pending scan survives the same account falling back to legacy email", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account: { id: "acct-1", email: "same@example.com" },
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [{ profileUrl: "same-owner" }] },
+          count: 1,
+          accountKey: "id:acct-1",
+        },
+      },
+    });
+
+    await dispatchExternal(
+      { type: "pair", recipe, account: { email: "same@example.com" } },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const cached = await dispatchExternal(
+      { type: "getCachedScan", source: "linkedin_extension" },
+      noticedSender,
+    );
+
+    expect(cached).toMatchObject({
+      payload: { connections: [{ profileUrl: "same-owner" }] },
+    });
+  });
+
+  it("3o. a proven same-account mixed-version pair rekeys an in-flight scan", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account: { id: "acct-1", email: "same@example.com" },
+      noticedOrigin: "https://app.noticed.so",
+      ...inProgress({ scanAccountId: "id:acct-1" }),
+    });
+
+    await dispatchExternal(
+      { type: "pair", recipe, account: { email: " SAME@example.com " } },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress).toBe(true);
+    expect(stored.scanAccountId).toBe("email:same@example.com");
+  });
+
   it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
     const chrome = getChrome();
     await pair();
