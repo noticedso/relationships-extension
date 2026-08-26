@@ -28,6 +28,14 @@ const recipe = {
   excludeSources: ["linkedin_export"],
 };
 
+const xRecipe = {
+  ...recipe,
+  source: "x",
+  ingestPath: "/api/x/import/extension",
+  networkLabel: "X",
+  targetOrigin: "https://x.example.com",
+};
+
 // The finished payload for the (messages-free) LinkedIn fixture is
 // pendingScans.linkedin_extension.payload.connections.
 function pendingConns(stored: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -304,6 +312,106 @@ describe("service worker", () => {
     });
     const stored = await chrome.storage.local.get(null);
     expect(stored.syncTabIds).toMatchObject({ linkedin_extension: 1 });
+  });
+
+  it("3h. pairing a different noticed account discards every account-bound scan and handoff", async () => {
+    const chrome = getChrome();
+    const removeTab = vi.spyOn(chrome.tabs, "remove");
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [{ profileUrl: "account-a" }] },
+          count: 1,
+        },
+      },
+      scanInProgress: true,
+      scanSource: "linkedin_extension",
+      scanQueue: ["x"],
+      scanPhaseIndex: 1,
+      scanCursor: 20,
+      scanItems: [{ profileUrl: "account-a" }],
+      scanPhaseResults: { connLists: [[{ profileUrl: "account-a" }]], messages: [] },
+      scanSelfId: "account-a-self",
+      scanStartedAt: Date.now(),
+      scanNeedsRecipeRefresh: false,
+      syncTabId: 98,
+      syncTabIds: { linkedin_extension: 99, x: 100 },
+      lastScanStartedAt: Date.now(),
+      lastScanAt: Date.now(),
+      lastScanCount: 1,
+      lastScanBySource: { linkedin_extension: { at: Date.now(), count: 1 } },
+      hadReplyByConversation: { conversation: { at: Date.now(), had_reply: true } },
+      needs: "noticed-signin",
+    });
+
+    await dispatchExternal(
+      { type: "pair", recipe, recipes: [recipe, xRecipe], account: { id: "acct-2" } },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(removeTab).toHaveBeenCalledWith(98);
+    expect(removeTab).toHaveBeenCalledWith(99);
+    expect(removeTab).toHaveBeenCalledWith(100);
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.account).toMatchObject({ id: "acct-2" });
+    expect(stored.pendingScans).toEqual({});
+    expect(stored.scanQueue).toEqual([]);
+    expect(stored.scanInProgress).toBe(false);
+    expect(stored.scanSource).toBeNull();
+    expect(stored.syncTabId).toBeNull();
+    expect(stored.syncTabIds).toEqual({});
+    expect(stored.lastScanStartedAt).toBeNull();
+    expect(stored.lastScanAt).toBeNull();
+    expect(stored.lastScanCount).toBeNull();
+    expect(stored.lastScanBySource).toEqual({});
+    expect(stored.hadReplyByConversation).toEqual({});
+    expect(stored.needs).toBeNull();
+  });
+
+  it("3i. an account switch cancels a network response that was already in flight", async () => {
+    const chrome = getChrome();
+    await seedPaired();
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    let releaseFirstPage: () => void = () => {};
+    let page = 0;
+    const fetchImpl = vi.fn(async () => {
+      page += 1;
+      if (page === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFirstPage = resolve;
+        });
+        return { ok: true, json: async () => ({ elements: [makeElement("account-a")] }) } as Response;
+      }
+      return { ok: true, json: async () => ({ elements: [] }) } as Response;
+    });
+
+    const scan = sw.runScan(undefined, {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async () => {},
+      jitter: () => 0,
+    });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledTimes(1));
+
+    await dispatchExternal(
+      { type: "pair", recipe, account: { id: "acct-2" } },
+      noticedSender,
+    );
+    releaseFirstPage();
+    await scan;
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.account).toMatchObject({ id: "acct-2" });
+    expect(stored.pendingScans).toEqual({});
+    expect(stored.scanInProgress).toBe(false);
+    expect(stored.scanItems).toBeNull();
+    expect(stored.scanPhaseResults).toBeNull();
   });
 
   it("4. scanNow with no cookie -> acks immediately, then continueScan sets needs network-signin (no fetch)", async () => {
@@ -1058,6 +1166,70 @@ describe("service worker", () => {
     const stored = await chrome.storage.local.get(null);
     expect(stored.scanInProgress ?? false).toBe(false);
     expect(pendingConns(stored).length).toBeGreaterThan(0);
+  });
+
+  it("27b. scanNow persists remaining sources before the first source starts", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+    });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    let releaseCookie: () => void = () => {};
+    const cookieGate = new Promise<{ name: string; value: string }>((resolve) => {
+      releaseCookie = () => resolve({ name: "tok", value: "abc" });
+    });
+    vi.spyOn(chrome.cookies, "get").mockReturnValue(cookieGate);
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [] }),
+    })) as unknown as typeof fetch;
+
+    await dispatchInternal({ type: "scanNow" });
+    const started = await chrome.storage.local.get(null);
+    releaseCookie();
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    expect(started.scanSource).toBe("linkedin_extension");
+    expect(started.scanQueue).toEqual(["x"]);
+  });
+
+  it("27c. startup drains a persisted remaining-source queue after the previous source finalized", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [] },
+          count: 0,
+        },
+      },
+      scanInProgress: false,
+      scanSource: null,
+      scanQueue: ["x"],
+    });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [] }),
+    })) as unknown as typeof fetch;
+
+    sw.registerListenersForTest();
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanQueue).toEqual([]);
+    expect(stored.pendingScans).toMatchObject({
+      linkedin_extension: { count: 0 },
+      x: { count: 0 },
+    });
   });
 
   // ── NT-63 owner-profile pass (LinkedIn) + tweets pass (X) ────────────────────

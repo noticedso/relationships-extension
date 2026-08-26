@@ -141,6 +141,10 @@ export type State = {
   scanInProgress?: boolean;
   /** The source of the single in-flight scan. */
   scanSource?: string | null;
+  /** Sources still owed by the current user-triggered or automatic scan plan. */
+  scanQueue?: string[] | null;
+  /** noticed account that owns the current in-flight scan. */
+  scanAccountId?: string | null;
   /** Index into the source's phase plan (connection list(s) then messages). */
   scanPhaseIndex?: number | null;
   /** The cursor of the next page to fetch (resume point) — a numeric offset, or
@@ -191,6 +195,8 @@ const KEYS: (keyof State)[] = [
   "testMode",
   "scanInProgress",
   "scanSource",
+  "scanQueue",
+  "scanAccountId",
   "scanPhaseIndex",
   "scanCursor",
   "scanItems",
