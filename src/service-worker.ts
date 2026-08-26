@@ -66,7 +66,7 @@ type ExternalMessage =
   | { type: "ping" }
   | { type: "pair"; recipe: ScanRecipe; recipes?: ScanRecipe[]; account: Account }
   | { type: "getOnboardingStatus" }
-  | { type: "getCachedScan"; source?: string }
+  | { type: "getCachedScan"; source?: string; accountId?: string }
   | { type: "syncConfirmed"; source?: string };
 
 type InternalMessage =
@@ -311,6 +311,11 @@ function accountKey(account: Account | null | undefined): string | null {
   if (id) return `id:${id}`;
   const email = typeof account?.email === "string" ? account.email.trim().toLowerCase() : "";
   return email ? `email:${email}` : null;
+}
+
+function stableAccountId(account: Account | null | undefined): string | null {
+  const id = typeof account?.id === "string" ? account.id.trim() : "";
+  return id || null;
 }
 
 /** Normalize the raw-id owner written by an unshipped intermediate build. */
@@ -1354,12 +1359,30 @@ async function handleExternal(
     case "getCachedScan": {
       const cached = await withAccountStateMutation(async () => {
         const state = await getState();
+        const requestedAccountId =
+          typeof message.accountId === "string" ? message.accountId.trim() : "";
+        const currentAccountId = stableAccountId(state.account);
+        const requestedOwnerKey = requestedAccountId
+          ? `id:${requestedAccountId}`
+          : null;
         const src = message.source;
         const pending = src
           ? state.pendingScans?.[src]
           : Object.values(state.pendingScans ?? {})[0];
-        if (!pending || !accountOwnsKey(state.account, pending.accountKey ?? null)) return null;
-        return { source: pending.source, ingestPath: pending.ingestPath, payload: pending.payload };
+        if (
+          !pending
+          || !currentAccountId
+          || currentAccountId !== requestedAccountId
+          || normalizeAccountKey(pending.accountKey) !== requestedOwnerKey
+        ) {
+          return null;
+        }
+        return {
+          source: pending.source,
+          accountId: currentAccountId,
+          ingestPath: pending.ingestPath,
+          payload: pending.payload,
+        };
       });
       if (!cached) {
         sendResponse({ ingestPath: null, payload: null });

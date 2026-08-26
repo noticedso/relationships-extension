@@ -547,7 +547,7 @@ describe("service worker", () => {
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     const cached = await dispatchExternal(
-      { type: "getCachedScan", source: "linkedin_extension" },
+      { type: "getCachedScan", source: "linkedin_extension", accountId: "acct-1" },
       noticedSender,
     );
 
@@ -580,12 +580,12 @@ describe("service worker", () => {
     );
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     const cached = await dispatchExternal(
-      { type: "getCachedScan", source: "linkedin_extension" },
+      { type: "getCachedScan", source: "linkedin_extension", accountId: "acct-1" },
       noticedSender,
     );
 
     expect(cached).toMatchObject({
-      payload: { connections: [{ profileUrl: "same-owner" }] },
+      payload: null,
     });
   });
 
@@ -768,6 +768,7 @@ describe("service worker", () => {
           ingestPath: "/api/linkedin/import/extension",
           payload: { source: "linkedin_extension", connections: payloadConns, messages: [] },
           count,
+          accountKey: "id:acct-1",
         },
       },
     };
@@ -780,9 +781,10 @@ describe("service worker", () => {
     await chrome.storage.local.set({ ...pending(conns), needs: null });
 
     const cached = (await dispatchExternal(
-      { type: "getCachedScan", source: "linkedin_extension" },
+      { type: "getCachedScan", source: "linkedin_extension", accountId: "acct-1" },
       noticedSender,
     )) as Record<string, unknown>;
+    expect(cached.accountId).toBe("acct-1");
     expect(cached.ingestPath).toBe("/api/linkedin/import/extension");
     expect((cached.payload as { connections: unknown }).connections).toEqual(conns);
 
@@ -797,6 +799,24 @@ describe("service worker", () => {
     expect(stored.needs ?? null).toBeNull();
     expect(stored.lastScanAt).not.toBeNull();
     expect(stored.lastScanCount).toBe(1);
+  });
+
+  it("6a. getCachedScan fails closed without the current stable noticed account id", async () => {
+    const chrome = getChrome();
+    await pair();
+    await chrome.storage.local.set({ ...pending([{ profileUrl: "private" }]), needs: null });
+
+    const missingOwner = await dispatchExternal(
+      { type: "getCachedScan", source: "linkedin_extension" },
+      noticedSender,
+    );
+    const wrongOwner = await dispatchExternal(
+      { type: "getCachedScan", source: "linkedin_extension", accountId: "acct-2" },
+      noticedSender,
+    );
+
+    expect(missingOwner).toMatchObject({ ingestPath: null, payload: null });
+    expect(wrongOwner).toMatchObject({ ingestPath: null, payload: null });
   });
 
   it("6b. syncConfirmed closes the background handoff tab and clears syncTabId (E7)", async () => {
