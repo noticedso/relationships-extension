@@ -142,8 +142,9 @@ function rebindPendingIngestPaths(
 }
 
 /**
- * Pull the CURRENT recipes from noticed and store them, so a scan never runs on
- * a recipe from the previous sync. Recipes are served live precisely so endpoint
+ * Pull the CURRENT recipes from noticed, so a scan never runs on a recipe from
+ * the previous sync. The caller stores them with the scan checkpoint under the
+ * account mutation lock. Recipes are served live precisely so endpoint
  * drift (LinkedIn rotates its GraphQL `queryId`s) can be fixed without shipping
  * an extension; before this, recipes only ever arrived on the `pair` message —
  * and noticed's handoff order is scan → POST → re-pair → syncConfirmed, so every
@@ -160,8 +161,7 @@ function rebindPendingIngestPaths(
  */
 async function refreshRecipesFromServer(
   noticedOrigin: string | null | undefined,
-  assertCurrent?: () => Promise<void>,
-): Promise<Record<string, ScanRecipe> | null> {
+): Promise<{ recipe: ScanRecipe; recipes: Record<string, ScanRecipe> } | null> {
   if (!noticedOrigin) return null;
   try {
     const res = await fetch(noticedOrigin + RECIPE_PATH, { credentials: "include" });
@@ -170,10 +170,7 @@ async function refreshRecipesFromServer(
     // clobbering a known-good cached recipe.
     const parsed = parseServedRecipes(await res.json());
     if (!parsed) return null;
-    await assertCurrent?.();
-    // Recipes only — `account` stays owned by the pair path.
-    await setState({ recipe: parsed.recipe, recipes: parsed.recipes });
-    return parsed.recipes;
+    return parsed;
   } catch {
     return null;
   }
@@ -305,6 +302,7 @@ function countMessageRaw(json: unknown, fieldMap: NonNullable<ScanRecipe["messag
 
 let scanRunning = false;
 let accountStateMutation = Promise.resolve();
+let handoffReconcile: Promise<void> | null = null;
 
 class ScanSupersededError extends Error {}
 
@@ -313,6 +311,14 @@ function accountKey(account: Account | null | undefined): string | null {
   if (id) return `id:${id}`;
   const email = typeof account?.email === "string" ? account.email.trim().toLowerCase() : "";
   return email ? `email:${email}` : null;
+}
+
+/** Normalize the raw-id owner written by an unshipped intermediate build. */
+function normalizeAccountKey(value: string | null | undefined): string | null {
+  const key = typeof value === "string" ? value.trim() : "";
+  if (!key) return null;
+  if (key.startsWith("id:") || key.startsWith("email:")) return key;
+  return `id:${key}`;
 }
 
 function accountsMatch(
@@ -368,10 +374,55 @@ async function assertCurrentScan(source: string, accountId: string | null): Prom
     !current.scanInProgress
     || current.scanSource !== source
     || (accountId != null && accountKey(current.account) !== accountId)
-    || (current.scanAccountId != null && current.scanAccountId !== accountId)
+    || (current.scanAccountId != null && normalizeAccountKey(current.scanAccountId) !== accountId)
   ) {
     throw new ScanSupersededError();
   }
+}
+
+/** Check ownership and persist a checkpoint as one mutation relative to pair/finalize. */
+async function updateCurrentScan(
+  source: string,
+  accountId: string | null,
+  patch: Partial<State>,
+): Promise<void> {
+  await withAccountStateMutation(async () => {
+    const current = await getState();
+    if (
+      !current.scanInProgress
+      || current.scanSource !== source
+      || (accountId != null && accountKey(current.account) !== accountId)
+      || (current.scanAccountId != null
+        && normalizeAccountKey(current.scanAccountId) !== accountId)
+    ) {
+      throw new ScanSupersededError();
+    }
+    await setState(patch);
+  });
+}
+
+function clearedScanState(extra?: { needs?: "network-signin" }): Partial<State> {
+  return {
+    scanInProgress: false,
+    scanSource: null,
+    scanAccountId: null,
+    scanPhaseIndex: null,
+    scanCursor: null,
+    scanItems: null,
+    scanPhaseResults: null,
+    scanSelfId: null,
+    scanStartedAt: null,
+    scanNeedsRecipeRefresh: false,
+    ...(extra?.needs !== undefined ? { needs: extra.needs } : {}),
+  };
+}
+
+async function clearCurrentScan(
+  source: string,
+  accountId: string | null,
+  extra?: { needs?: "network-signin" },
+): Promise<void> {
+  await updateCurrentScan(source, accountId, clearedScanState(extra));
 }
 
 function armScanTick(): void {
@@ -582,6 +633,7 @@ async function runLinkedInMessageEventsPass(
   selfId: string,
   sleep: (ms: number) => Promise<void>,
   assertCurrent?: () => Promise<void>,
+  persistCache?: (cache: Record<string, { at: number; had_reply: boolean }>) => Promise<void>,
 ): Promise<Map<string, boolean>> {
   const out = new Map<string, boolean>();
   const m = recipe.messages;
@@ -659,8 +711,11 @@ async function runLinkedInMessageEventsPass(
   }
   // Persist the pruned cache (only conversations still in the summary list) so
   // the next scan is delta-only and the cache stays bounded.
-  await assertCurrent?.();
-  await setState({ hadReplyByConversation: nextCache });
+  if (persistCache) await persistCache(nextCache);
+  else {
+    await assertCurrent?.();
+    await setState({ hadReplyByConversation: nextCache });
+  }
   return out;
 }
 
@@ -683,18 +738,21 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     if (!scanInProgress || !scanSource) return { ok: true, note: "not-in-progress" };
     let recipe = recipesOf(state)[scanSource];
     if (!recipe) return { ok: false };
-    const scanAccountId = state.scanAccountId ?? accountKey(state.account);
+    const scanAccountId = normalizeAccountKey(state.scanAccountId) ?? accountKey(state.account);
     const assertCurrent = () => assertCurrentScan(scanSource, scanAccountId);
+    if (state.scanAccountId !== scanAccountId) {
+      await updateCurrentScan(scanSource, scanAccountId, { scanAccountId });
+    }
 
     if (isScanStale(state.scanStartedAt, now())) {
-      await clearScanState();
+      await clearCurrentScan(scanSource, scanAccountId);
       clearScanTick();
       return { ok: false, note: "stale" };
     }
 
     let headers = await buildCsrfHeaders(recipe);
     if (!headers) {
-      await clearScanState({ needs: "network-signin" });
+      await clearCurrentScan(scanSource, scanAccountId, { needs: "network-signin" });
       clearScanTick();
       return { ok: false, needs: "network-signin" };
     }
@@ -715,10 +773,14 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // It sits AFTER the CSRF gate on purpose: no network session means no scan,
     // and a scan that cannot run must not make a request to noticed either.
     if (state.scanNeedsRecipeRefresh) {
-      const refreshed = await refreshRecipesFromServer(noticedOrigin, assertCurrent);
-      await assertCurrent();
-      await setState({ scanNeedsRecipeRefresh: false });
-      const fresh = refreshed?.[scanSource];
+      const refreshed = await refreshRecipesFromServer(noticedOrigin);
+      await updateCurrentScan(scanSource, scanAccountId, {
+        ...(refreshed
+          ? { recipe: refreshed.recipe, recipes: refreshed.recipes }
+          : {}),
+        scanNeedsRecipeRefresh: false,
+      });
+      const fresh = refreshed?.recipes[scanSource];
       if (fresh) {
         recipe = fresh;
         // The fresh recipe may carry a different csrfRule — rebuild, but keep the
@@ -771,8 +833,12 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
           startAt: resumeThisPhase ? (state.scanCursor ?? 0) : 0,
           initialItems: initialItems as ScanMessage[],
           onPage: async (its, nextCursor) => {
-            await assertCurrent();
-            await setState({ scanPhaseIndex: phaseIndex, scanCursor: nextCursor, scanItems: its, scanSelfId: selfId });
+            await updateCurrentScan(scanSource, scanAccountId, {
+              scanPhaseIndex: phaseIndex,
+              scanCursor: nextCursor,
+              scanItems: its,
+              scanSelfId: selfId,
+            });
           },
         });
         results.messages = items;
@@ -798,8 +864,12 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
           startAt,
           initialItems: initialItems as ScanConnection[],
           onPage: async (its, nextCursor) => {
-            await assertCurrent();
-            await setState({ scanPhaseIndex: phaseIndex, scanCursor: nextCursor, scanItems: its, scanSelfId: selfId });
+            await updateCurrentScan(scanSource, scanAccountId, {
+              scanPhaseIndex: phaseIndex,
+              scanCursor: nextCursor,
+              scanItems: its,
+              scanSelfId: selfId,
+            });
           },
         });
         results.connLists.push(items);
@@ -807,8 +877,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
       phaseIndex += 1;
       resumeThisPhase = false;
-      await assertCurrent();
-      await setState({
+      await updateCurrentScan(scanSource, scanAccountId, {
         scanPhaseIndex: phaseIndex,
         scanCursor: null,
         scanItems: [],
@@ -830,6 +899,9 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         selfId,
         sleep,
         assertCurrent,
+        (cache) => updateCurrentScan(scanSource, scanAccountId, {
+          hadReplyByConversation: cache,
+        }),
       ).catch(() => new Map<string, boolean>());
       if (hadReplyByCounterpart.size > 0) {
         results.messages = results.messages.map((msg) =>
@@ -881,23 +953,6 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
   }
 }
 
-/** Clear the in-flight scan checkpoint (and optionally set a `needs`). */
-async function clearScanState(extra?: { needs?: "network-signin" }): Promise<void> {
-  await setState({
-    scanInProgress: false,
-    scanSource: null,
-    scanAccountId: null,
-    scanPhaseIndex: null,
-    scanCursor: null,
-    scanItems: null,
-    scanPhaseResults: null,
-    scanSelfId: null,
-    scanStartedAt: null,
-    scanNeedsRecipeRefresh: false,
-    ...(extra?.needs !== undefined ? { needs: extra.needs } : {}),
-  });
-}
-
 /** Persist the finished scan, hand off, and tear down the keepalive tick. */
 async function finalizeScan(
   recipe: ScanRecipe,
@@ -917,7 +972,8 @@ async function finalizeScan(
       !state.scanInProgress
       || state.scanSource !== source
       || (scanAccountId != null && accountKey(state.account) !== scanAccountId)
-      || (state.scanAccountId != null && state.scanAccountId !== scanAccountId)
+      || (state.scanAccountId != null
+        && normalizeAccountKey(state.scanAccountId) !== scanAccountId)
     ) {
       return { ok: false, note: "superseded" };
     }
@@ -985,20 +1041,27 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
   }
 
   const now = deps.nowMs ?? (() => Date.now());
-  await setState({
-    scanInProgress: true,
-    scanSource: src,
-    scanAccountId: accountKey(state.account),
-    scanPhaseIndex: 0,
-    scanCursor: null,
-    scanItems: [],
-    scanPhaseResults: { connLists: [], messages: [] },
-    scanSelfId: null,
-    scanStartedAt: now(),
-    // A genuine fresh start → owe a recipe refresh (continueScan performs it).
-    scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
-    needs: null,
+  const expectedAccountKey = accountKey(state.account);
+  const started = await withAccountStateMutation(async () => {
+    const current = await getState();
+    if (accountKey(current.account) !== expectedAccountKey || !recipesOf(current)[src]) return false;
+    await setState({
+      scanInProgress: true,
+      scanSource: src,
+      scanAccountId: expectedAccountKey,
+      scanPhaseIndex: 0,
+      scanCursor: null,
+      scanItems: [],
+      scanPhaseResults: { connLists: [], messages: [] },
+      scanSelfId: null,
+      scanStartedAt: now(),
+      // A genuine fresh start → owe a recipe refresh (continueScan performs it).
+      scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
+      needs: null,
+    });
+    return true;
   });
+  if (!started) return { ok: false, note: "superseded" };
   armScanTick();
   return continueScan(deps);
 }
@@ -1007,50 +1070,19 @@ async function initializeScanPlan(
   sources: string[],
   refreshRecipes: boolean,
 ): Promise<boolean> {
-  const state = await getState();
-  const recipes = recipesOf(state);
-  const list = sources.filter((source) => recipes[source] != null);
-  const first = list[0];
-  if (!first) {
-    await setState({ scanQueue: [] });
-    return false;
-  }
-  await setState({
-    scanInProgress: true,
-    scanSource: first,
-    scanQueue: list.slice(1),
-    scanAccountId: accountKey(state.account),
-    scanPhaseIndex: 0,
-    scanCursor: null,
-    scanItems: [],
-    scanPhaseResults: { connLists: [], messages: [] },
-    scanSelfId: null,
-    scanStartedAt: Date.now(),
-    scanNeedsRecipeRefresh: refreshRecipes,
-    needs: null,
-  });
-  armScanTick();
-  return true;
-}
-
-async function drainScanQueue(): Promise<void> {
-  for (;;) {
+  return withAccountStateMutation(async () => {
     const state = await getState();
-    if (state.scanInProgress) return;
-    const [next, ...rest] = state.scanQueue ?? [];
-    if (!next) {
-      if (state.scanQueue != null) await setState({ scanQueue: [] });
-      return;
-    }
     const recipes = recipesOf(state);
-    if (!recipes[next]) {
-      await setState({ scanQueue: rest });
-      continue;
+    const list = sources.filter((source) => recipes[source] != null);
+    const first = list[0];
+    if (!first) {
+      await setState({ scanQueue: [] });
+      return false;
     }
     await setState({
       scanInProgress: true,
-      scanSource: next,
-      scanQueue: rest,
+      scanSource: first,
+      scanQueue: list.slice(1),
       scanAccountId: accountKey(state.account),
       scanPhaseIndex: 0,
       scanCursor: null,
@@ -1058,10 +1090,48 @@ async function drainScanQueue(): Promise<void> {
       scanPhaseResults: { connLists: [], messages: [] },
       scanSelfId: null,
       scanStartedAt: Date.now(),
-      scanNeedsRecipeRefresh: false,
+      scanNeedsRecipeRefresh: refreshRecipes,
       needs: null,
     });
     armScanTick();
+    return true;
+  });
+}
+
+async function drainScanQueue(): Promise<void> {
+  for (;;) {
+    const next = await withAccountStateMutation(async () => {
+      const state = await getState();
+      if (state.scanInProgress) return null;
+      const [candidate, ...rest] = state.scanQueue ?? [];
+      if (!candidate) {
+        if (state.scanQueue != null) await setState({ scanQueue: [] });
+        return null;
+      }
+      const recipes = recipesOf(state);
+      if (!recipes[candidate]) {
+        await setState({ scanQueue: rest });
+        return "skip" as const;
+      }
+      await setState({
+        scanInProgress: true,
+        scanSource: candidate,
+        scanQueue: rest,
+        scanAccountId: accountKey(state.account),
+        scanPhaseIndex: 0,
+        scanCursor: null,
+        scanItems: [],
+        scanPhaseResults: { connLists: [], messages: [] },
+        scanSelfId: null,
+        scanStartedAt: Date.now(),
+        scanNeedsRecipeRefresh: false,
+        needs: null,
+      });
+      armScanTick();
+      return candidate;
+    });
+    if (next == null) return;
+    if (next === "skip") continue;
     const result = await continueScan();
     if (result.note === "already-running") return;
   }
@@ -1104,32 +1174,46 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
     if (state.pendingScans?.[src]) continue;
     targets.push(src);
   }
+  if (targets.length === 0) return;
   if (await initializeScanPlan(targets, opts.refreshRecipes)) await continueScanPlan();
 }
 
-async function openPendingHandoffs(origin: string): Promise<void> {
-  const state = await getState();
-  const tabIds = { ...(state.syncTabIds ?? {}) };
-  for (const pending of Object.values(state.pendingScans ?? {})) {
-    if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
-    const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
-    const existingTabId = tabIds[pending.source];
-    if (existingTabId != null) {
-      try {
-        const existing = await chrome.tabs.get(existingTabId);
-        if (existing.url === handoffUrl) continue;
-        delete tabIds[pending.source];
-      } catch {
-        delete tabIds[pending.source];
+async function reconcilePendingHandoffs(origin: string): Promise<void> {
+  await withAccountStateMutation(async () => {
+    const state = await getState();
+    const tabIds = { ...(state.syncTabIds ?? {}) };
+    for (const pending of Object.values(state.pendingScans ?? {})) {
+      if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
+      const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
+      const existingTabId = tabIds[pending.source];
+      if (existingTabId != null) {
+        try {
+          const existing = await chrome.tabs.get(existingTabId);
+          if (existing.url === handoffUrl) continue;
+          delete tabIds[pending.source];
+        } catch {
+          delete tabIds[pending.source];
+        }
       }
+      const tab = await chrome.tabs.create({
+        url: handoffUrl,
+        active: false,
+      });
+      if (tab?.id != null) tabIds[pending.source] = tab.id;
     }
-    const tab = await chrome.tabs.create({
-      url: handoffUrl,
-      active: false,
-    });
-    if (tab?.id != null) tabIds[pending.source] = tab.id;
+    await setState({ syncTabIds: tabIds });
+  });
+}
+
+async function openPendingHandoffs(origin: string): Promise<void> {
+  if (handoffReconcile) return handoffReconcile;
+  const reconcile = reconcilePendingHandoffs(origin);
+  handoffReconcile = reconcile;
+  try {
+    await reconcile;
+  } finally {
+    if (handoffReconcile === reconcile) handoffReconcile = null;
   }
-  await setState({ syncTabIds: tabIds });
 }
 
 async function buildStatus(): Promise<Record<string, unknown>> {
@@ -1268,44 +1352,53 @@ async function handleExternal(
       return;
     }
     case "getCachedScan": {
-      const state = await getState();
-      const { pendingScans } = state;
-      const src = message.source;
-      const pending = src
-        ? pendingScans?.[src]
-        : Object.values(pendingScans ?? {})[0];
-      if (
-        !pending
-        || !accountOwnsKey(state.account, pending.accountKey ?? null)
-      ) {
+      const cached = await withAccountStateMutation(async () => {
+        const state = await getState();
+        const src = message.source;
+        const pending = src
+          ? state.pendingScans?.[src]
+          : Object.values(state.pendingScans ?? {})[0];
+        if (!pending || !accountOwnsKey(state.account, pending.accountKey ?? null)) return null;
+        return { source: pending.source, ingestPath: pending.ingestPath, payload: pending.payload };
+      });
+      if (!cached) {
         sendResponse({ ingestPath: null, payload: null });
         return;
       }
-      sendResponse({ source: pending.source, ingestPath: pending.ingestPath, payload: pending.payload });
+      sendResponse(cached);
       return;
     }
     case "syncConfirmed": {
-      const state = await getState();
-      const src = message.source ?? Object.keys(state.pendingScans ?? {})[0];
-      const pending = src ? state.pendingScans?.[src] : undefined;
-      const count = pending?.count ?? 0;
-      const pendingScans = { ...(state.pendingScans ?? {}) };
-      if (src) delete pendingScans[src];
-      const lastScanBySource = { ...(state.lastScanBySource ?? {}) };
-      if (src) lastScanBySource[src] = { at: Date.now(), count };
-      await setState({
-        pendingScans,
-        lastScanBySource,
-        needs: null,
-        lastScanAt: Date.now(),
-        lastScanCount: count,
+      const confirmed = await withAccountStateMutation(async () => {
+        const state = await getState();
+        const src = message.source ?? Object.keys(state.pendingScans ?? {})[0];
+        const pending = src ? state.pendingScans?.[src] : undefined;
+        if (!src || !pending || !accountOwnsKey(state.account, pending.accountKey ?? null)) {
+          return null;
+        }
+        const count = pending.count;
+        const pendingScans = { ...(state.pendingScans ?? {}) };
+        delete pendingScans[src];
+        const confirmedAt = Date.now();
+        const lastScanBySource = {
+          ...(state.lastScanBySource ?? {}),
+          [src]: { at: confirmedAt, count },
+        };
+        const syncTabIds = { ...(state.syncTabIds ?? {}) };
+        const tabId = syncTabIds[src] ?? state.syncTabId;
+        delete syncTabIds[src];
+        await setState({
+          pendingScans,
+          lastScanBySource,
+          needs: null,
+          lastScanAt: confirmedAt,
+          lastScanCount: count,
+          syncTabId: null,
+          syncTabIds,
+        });
+        return { tabId };
       });
-      const sourceTabId = src ? state.syncTabIds?.[src] : undefined;
-      const tabId = sourceTabId ?? state.syncTabId;
-      if (tabId != null) await chrome.tabs.remove(tabId).catch(() => {});
-      const syncTabIds = { ...(state.syncTabIds ?? {}) };
-      if (src) delete syncTabIds[src];
-      await setState({ syncTabId: null, syncTabIds });
+      if (confirmed?.tabId != null) await chrome.tabs.remove(confirmed.tabId).catch(() => {});
       sendResponse({ ok: true });
       return;
     }
@@ -1457,13 +1550,20 @@ export function registerListeners(): void {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === SCAN_TICK_ALARM) {
       void (async () => {
-        const { scanInProgress, scanStartedAt } = await getState();
+        const { scanInProgress, scanStartedAt, scanSource, scanAccountId, account } = await getState();
         if (!scanInProgress) {
           clearScanTick();
           return;
         }
         if (isScanStale(scanStartedAt, Date.now())) {
-          await clearScanState();
+          if (!scanSource) return;
+          const ownerKey = normalizeAccountKey(scanAccountId) ?? accountKey(account);
+          try {
+            await clearCurrentScan(scanSource, ownerKey);
+          } catch (error) {
+            if (error instanceof ScanSupersededError) return;
+            throw error;
+          }
           clearScanTick();
           await drainScanQueue();
           return;
@@ -1501,11 +1601,26 @@ export function registerListeners(): void {
   });
 
   void (async () => {
-    const { scanInProgress, scanStartedAt, scanQueue, noticedOrigin } = await getState();
+    const {
+      scanInProgress,
+      scanStartedAt,
+      scanSource,
+      scanAccountId,
+      account,
+      scanQueue,
+      noticedOrigin,
+    } = await getState();
     if (!scanInProgress) {
       if ((scanQueue?.length ?? 0) > 0) await drainScanQueue();
     } else if (isScanStale(scanStartedAt, Date.now())) {
-      await clearScanState();
+      if (!scanSource) return;
+      const ownerKey = normalizeAccountKey(scanAccountId) ?? accountKey(account);
+      try {
+        await clearCurrentScan(scanSource, ownerKey);
+      } catch (error) {
+        if (error instanceof ScanSupersededError) return;
+        throw error;
+      }
       clearScanTick();
       await drainScanQueue();
     } else {

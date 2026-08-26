@@ -1018,6 +1018,75 @@ describe("service worker", () => {
     expect(stored.scanInProgress ?? false).toBe(false);
   });
 
+  it("17b. resumes an intermediate-version checkpoint whose owner was stored as a raw account id", async () => {
+    const chrome = getChrome();
+    await pair();
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    await chrome.storage.local.set(
+      inProgress({
+        scanAccountId: "acct-1",
+        scanCursor: 0,
+        scanItems: [],
+      }),
+    );
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [] }),
+    })) as unknown as typeof fetch;
+
+    await sw.continueScan({ sleep: async () => {}, jitter: () => 0 });
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress ?? false).toBe(false);
+    expect(stored.pendingScans).toMatchObject({ linkedin_extension: { count: 0 } });
+  });
+
+  it("17c. an account switch cannot be overwritten by an old scan checkpoint", async () => {
+    const chrome = getChrome();
+    await pair();
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    await chrome.storage.local.set(inProgress({ scanAccountId: "id:acct-1" }));
+    (globalThis as unknown as { fetch: typeof fetch }).fetch = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ elements: [makeElement("old-account")] }),
+    })) as unknown as typeof fetch;
+
+    const originalSet = chrome.storage.local.set.bind(chrome.storage.local);
+    let releaseCheckpoint: () => void = () => {};
+    let checkpointStarted: () => void = () => {};
+    const checkpointGate = new Promise<void>((resolve) => {
+      releaseCheckpoint = resolve;
+    });
+    const sawCheckpoint = new Promise<void>((resolve) => {
+      checkpointStarted = resolve;
+    });
+    vi.spyOn(chrome.storage.local, "set").mockImplementation(async (items) => {
+      if (Array.isArray(items.scanItems) && items.scanItems.length > 0) {
+        checkpointStarted();
+        await checkpointGate;
+      }
+      await originalSet(items);
+    });
+
+    const scan = sw.continueScan({ sleep: async () => {}, jitter: () => 0 });
+    await sawCheckpoint;
+    const nextAccount = { id: "acct-2", displayName: "Other User" };
+    const rePair = dispatchExternal(
+      { type: "pair", recipe, account: nextAccount },
+      noticedSender,
+    );
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    releaseCheckpoint();
+    await Promise.all([scan, rePair]);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.account).toMatchObject({ id: "acct-2" });
+    expect(stored.scanInProgress ?? false).toBe(false);
+    expect(stored.scanItems ?? null).toBeNull();
+    expect(stored.pendingScans ?? {}).toEqual({});
+  });
+
   it("18. re-entrant continueScan returns early while one is already running in this SW instance", async () => {
     const chrome = getChrome();
     await pair();
@@ -1517,6 +1586,56 @@ describe("service worker", () => {
     });
     const stored = await chrome.storage.local.get(null);
     expect(stored.syncTabIds).toMatchObject({ linkedin_extension: 1 });
+  });
+
+  it("27g. startup and a simultaneous pair open only one durable handoff tab", async () => {
+    const chrome = getChrome();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      pendingScans: {
+        linkedin_extension: {
+          source: "linkedin_extension",
+          ingestPath: recipe.ingestPath,
+          payload: { connections: [] },
+          count: 0,
+          accountKey: "id:acct-1",
+        },
+      },
+      scanInProgress: false,
+      scanQueue: [],
+      syncTabIds: {},
+    });
+    let releaseCreate: () => void = () => {};
+    let firstCreateStarted: () => void = () => {};
+    const createGate = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const sawFirstCreate = new Promise<void>((resolve) => {
+      firstCreateStarted = resolve;
+    });
+    const createTab = vi.spyOn(chrome.tabs, "create").mockImplementation(async (props) => {
+      firstCreateStarted();
+      await createGate;
+      return { id: 1, url: props.url };
+    });
+    vi.spyOn(chrome.tabs, "get").mockResolvedValue({
+      id: 1,
+      url: "https://app.noticed.so/x/sync?ext_id=test-extension-id&source=linkedin_extension",
+    });
+
+    sw.registerListenersForTest();
+    await sawFirstCreate;
+    await dispatchExternal({ type: "pair", recipe, account }, noticedSender);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    expect(createTab).toHaveBeenCalledTimes(1);
+    releaseCreate();
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(createTab).toHaveBeenCalledTimes(1);
   });
 
   // ── NT-63 owner-profile pass (LinkedIn) + tweets pass (X) ────────────────────
