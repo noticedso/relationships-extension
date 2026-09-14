@@ -45,10 +45,12 @@ describe("recipe-source", () => {
       {}, { selfIdPath: "user.id" }, { selfIdCookie: null }, { selfIdCookie: {} },
       { selfIdCookie: { name: "", pattern: "u=(.*)" } },
       { selfIdCookie: { name: "twid", pattern: "[" } },
+      { selfIdCookie: { name: "twid", pattern: "u=)([0-9]+" } },
       { selfIdCookie: { name: "twid", pattern: "u=[0-9]+" } },
       { selfIdSource: {} }, { selfIdSource: { listPathTemplate: "/me", idPath: "" } },
       { selfIdSource: { listPathTemplate: "https://x.com/me", idPath: "id" } },
       { selfIdSource: { listPathTemplate: "//me", idPath: "id" } },
+      { selfIdSource: { listPathTemplate: "/me", idPath: "id", extract: "u=)([0-9]+" } },
       { selfIdSource: { listPathTemplate: "/me", idPath: "id", extract: "[" } },
       { selfIdSource: { listPathTemplate: "/me", idPath: "id", extract: "[0-9]+" } },
     ])("rejects history without a usable eager owner resolver: %j", (owner) => {

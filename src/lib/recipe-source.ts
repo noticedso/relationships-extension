@@ -49,6 +49,7 @@ function isFiniteNumber(v: unknown): v is number {
 function capturePattern(value: unknown): boolean {
   if (typeof value !== "string" || !value.trim()) return false;
   try {
+    new RegExp(value); // Check the exact expression resolveSelfId will compile.
     // The empty alternative exposes capture slots without requiring a sample cookie.
     return (new RegExp(`(?:${value})|`).exec("")?.length ?? 0) > 1;
   } catch { return false; }
