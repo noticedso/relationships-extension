@@ -464,7 +464,7 @@ function historyFailureMessage(error: unknown): string {
   const code = error instanceof Error ? error.message : "";
   if (code === "x_history_permission_required") return "Grant access in the extension, then retry the scan.";
   if (code === "x_history_account_changed") return "The signed-in network account changed. Sign in to the original account and retry.";
-  if (code === "x_history_message_limit" || code === "x_history_page_limit") return "This history exceeds the browser scan limit. Import your archive in noticed.";
+  if (code === "x_history_message_limit" || code === "x_history_page_limit") return "This history exceeds the browser scan limit. Contact contact@noticed.so for help.";
   return "History collection stopped before it was complete. Retry the scan; update the extension if it keeps failing.";
 }
 

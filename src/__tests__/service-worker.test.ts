@@ -2618,6 +2618,21 @@ describe("X history handoff", () => {
     expect((await chrome.storage.local.get(null)).scanFailures).toMatchObject({ x: { message: "Retry required" } });
   });
 
+  it("reports a scan cap with a supported contact path and keeps its checkpoint", async () => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const checkpoint = { version: 1, ownerId: "10", jobs: [{ kind: "initial" }], messages: {}, conversations: [], excluded: [],
+      visited: Array.from({ length: 5_000 }, (_, i) => `page-${i}`) };
+    await chrome.storage.local.set({ scanItems: [checkpoint] });
+    const fetchImpl = vi.fn();
+    expect(await sw.continueScan({ fetchImpl })).toMatchObject({ note: "history-failed" });
+    const state = await chrome.storage.local.get(null);
+    expect(state.scanFailures).toMatchObject({ x: { message: expect.stringContaining("contact@noticed.so"), checkpoint } });
+    expect(JSON.stringify(state.scanFailures)).not.toContain("Import your archive");
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(state.scanInProgress).toBe(false);
+  });
+
   it("resumes a bounded history pass and only hands off after every source is exhausted", async () => {
     const chrome = getChrome();
     const r = completeHistoryRecipe();
