@@ -2625,14 +2625,45 @@ describe("X history handoff", () => {
         : { elements: [] };
       return { ok: true, json: async () => json } as Response;
     });
-    if (entry === "runScan") await sw.runScan("x", { fetchImpl: globalThis.fetch, refreshRecipes: false, sleep: async () => {}, jitter: () => 0 });
+    if (entry === "runScan") await sw.runScan("x", { fetchImpl: globalThis.fetch, sleep: async () => {}, jitter: () => 0 });
     else await dispatchInternal({ type: "scanNow", source: "x" });
     await vi.waitFor(() => expect(retriedPaths.length).toBeGreaterThan(0));
-    expect(retriedPaths).toEqual(["/requests"]);
+    await vi.waitFor(() => expect(retriedPaths).toEqual([RECIPE_PATH, "/requests"]));
     await vi.waitFor(async () => expect((await chrome.storage.local.get(null)).scanItems).toMatchObject([{ visited: [expect.stringContaining("/initial"), expect.stringContaining("/requests")] }]));
     const stored = await chrome.storage.local.get(null);
     expect(stored.scanFailures).toEqual({});
     expect(stored.scanPhaseResults).toEqual({ connLists: [[]], messages: [] });
+  });
+
+  it.each(["runScan", "scanNow"])("%s adopts a server-repaired recipe before resuming failed history", async (entry) => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const first = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }) })
+      .mockResolvedValue({ ok: false, status: 404 });
+    await sw.continueScan({ fetchImpl: first });
+    await sw.continueScan({ fetchImpl: first });
+    const previous = completeHistoryRecipe();
+    const repaired = { ...previous, listPathTemplate: "/repaired-connections", messages: { ...previous.messages, xHistory: { ...previous.messages.xHistory, initialPath: "https://api.x.com/repaired-initial" } } };
+    const paths: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      paths.push(path);
+      const json = path === RECIPE_PATH ? { recipe: repaired, recipes: [repaired] }
+        : path === "/repaired-initial" ? { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }
+        : { elements: [] };
+      return { ok: true, json: async () => json } as Response;
+    });
+    if (entry === "runScan") await sw.runScan("x", { sleep: async () => {}, jitter: () => 0 });
+    else await dispatchInternal({ type: "scanNow", source: "x" });
+    await vi.waitFor(() => expect(paths).toContain("/repaired-initial"));
+    expect(paths[0]).toBe(RECIPE_PATH);
+    expect(paths.indexOf("/repaired-connections")).toBeGreaterThan(0);
+    expect(paths.indexOf("/repaired-connections")).toBeLessThan(paths.indexOf("/repaired-initial"));
+    expect(paths).not.toContain("/requests");
+    const state = await chrome.storage.local.get(null);
+    expect(state.recipes).toEqual({ x: repaired });
+    expect(state.scanFailures).toEqual({});
   });
 
   it("bounds transient retries and waits before retrying a server failure", async () => {

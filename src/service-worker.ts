@@ -477,7 +477,6 @@ function retrySourceState(state: Partial<State>, source: string): Partial<State>
     scanItems: [checkpoint],
     scanPhaseResults: resume.phaseResults,
     scanSelfId: checkpoint.ownerId,
-    scanNeedsRecipeRefresh: false,
   };
 }
 
@@ -799,7 +798,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     const sleep = deps.sleep ?? realSleep;
     const now = deps.nowMs ?? (() => Date.now());
 
-    const state = await getState();
+    let state = await getState();
     const { noticedOrigin, testMode, scanInProgress, scanSource } = state;
     if (!scanInProgress || !scanSource) return { ok: true, note: "not-in-progress" };
     let recipe = recipesOf(state)[scanSource];
@@ -833,20 +832,26 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     //   • a RESUMED scan (keepalive tick / MV3 restart / re-entrant continueScan)
     //     sees the flag already false → no re-fetch, and the recipe it started
     //     with cannot be swapped under its phase index + cursor;
-    //   • the flag being true implies zero pages have been fetched, so adopting a
-    //     new recipe here can never contradict an existing checkpoint.
+    //   • explicit retries refresh before fetching resumed pages. If the server
+    //     changed the recipe, discard the old phase plan and checkpoint first.
     //
     // It sits AFTER the CSRF gate on purpose: no network session means no scan,
     // and a scan that cannot run must not make a request to noticed either.
     if (state.scanNeedsRecipeRefresh) {
       const refreshed = await refreshRecipesFromServer(noticedOrigin);
-      await updateCurrentScan(scanSource, scanAccountId, {
+      const fresh = refreshed?.recipes[scanSource];
+      const patch: Partial<State> = {
         ...(refreshed
           ? { recipe: refreshed.recipe, recipes: refreshed.recipes }
           : {}),
+        ...(fresh && JSON.stringify(fresh) !== JSON.stringify(recipe)
+          ? { scanPhaseIndex: 0, scanCursor: null, scanItems: [],
+              scanPhaseResults: { connLists: [], messages: [] }, scanSelfId: null }
+          : {}),
         scanNeedsRecipeRefresh: false,
-      });
-      const fresh = refreshed?.recipes[scanSource];
+      };
+      await updateCurrentScan(scanSource, scanAccountId, patch);
+      state = { ...state, ...patch };
       if (fresh) {
         recipe = fresh;
         // The fresh recipe may carry a different csrfRule — rebuild, but keep the
