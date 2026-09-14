@@ -2666,6 +2666,62 @@ describe("X history handoff", () => {
     expect(state.scanFailures).toEqual({});
   });
 
+  it.each(["network", "server"])("bounds %s failures from the history owner source", async (failure) => {
+    const chrome = await prepareHistory();
+    const original = completeHistoryRecipe();
+    const r = { ...original, messages: { ...original.messages, selfIdCookie: undefined, selfIdSource: { listPathTemplate: "/owner", idPath: "id" } } };
+    await chrome.storage.local.set({ recipe: r, recipes: { x: r }, scanSelfId: "" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    let now = Date.now();
+    const fetchImpl = vi.fn(async () => {
+      if (failure === "network") throw new TypeError("offline");
+      return { ok: false, status: 503, headers: new Headers() } as Response;
+    });
+    const deps = { fetchImpl, nowMs: () => now };
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-retrying" });
+    await sw.continueScan(deps);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    now += 60_000;
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-retrying" });
+    now += 120_000;
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-failed" });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false);
+  });
+
+  it("retains a recovered source owner through a complete history handoff", async () => {
+    const chrome = await prepareHistory();
+    const original = completeHistoryRecipe();
+    const r = { ...original, pacing: { ...original.pacing, maxPagesPerSession: 10 },
+      messages: { ...original.messages, selfIdCookie: undefined, selfIdSource: { listPathTemplate: "/owner", idPath: "id" } } };
+    await chrome.storage.local.set({ recipe: r, recipes: { x: r }, scanSelfId: "" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    let ownerRequests = 0;
+    let now = Date.now();
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/owner") {
+        ownerRequests++;
+        return ownerRequests === 1 ? { ok: false, status: 503, headers: new Headers() } as Response
+          : { ok: true, json: async () => ({ id: "10" }) } as Response;
+      }
+      const pages: Record<string, unknown> = {
+        "/initial": { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } },
+        "/requests": { data: { get_message_requests_page: { message_request_items: [], cursor: { __typename: "XChatGetMessageRequestsPageEndCursor", pull_finished: true } } } },
+        "/legacy": { inbox_initial_state: { entries: [], conversations: {}, inbox_timelines: { trusted: { status: "AT_END" }, untrusted: { status: "AT_END" } } } },
+      };
+      if (!pages[path]) throw new Error(`Unexpected ${path}`);
+      return { ok: true, json: async () => pages[path] } as Response;
+    });
+    const deps = { fetchImpl, nowMs: () => now, sleep: async () => {}, jitter: () => 0 };
+    await sw.continueScan(deps);
+    now += 60_000;
+    await sw.continueScan(deps);
+    const state = await chrome.storage.local.get(null);
+    expect(state.pendingScans).toMatchObject({ x: { payload: { ownerAccountId: "10", messageHistory: { version: 1, complete: true } } } });
+    expect(state.scanInProgress).toBe(false);
+  });
+
   it("bounds transient retries and waits before retrying a server failure", async () => {
     const chrome = await prepareHistory();
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);

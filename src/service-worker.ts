@@ -880,15 +880,24 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
       if (phase.kind === "messages") {
         const m = recipe.messages!;
-        // Resolve the owner id once (cookie or pre-fetch) so direction works AND
-        // {self} can be interpolated into the URL (LinkedIn mailboxUrn).
-        if (!selfId) selfId = await resolveSelfId(recipe, headers, fetchImpl);
         if (m.xHistory) {
           if ((state.scanRetryAt ?? 0) > now()) return { ok: false, note: "history-retrying" };
           try {
             if (!(await chrome.permissions.contains({ origins: requiredOrigins(recipe).map((origin) => origin + "/*") }))) throw new Error("x_history_permission_required");
-            const ownerId = await resolveSelfId(recipe, headers, fetchImpl);
+            // Owner-source and history requests share the same bounded recovery.
+            const fetchHistory: typeof fetch = async (input, init) => {
+              const response = await fetchImpl(input, init).catch(() => { throw new HistoryFetchError(0); });
+              if (!response.ok) {
+                const retryAfter = response.headers?.get("retry-after");
+                const delay = retryAfter ? (/^[0-9]+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - now()) : 0;
+                throw new HistoryFetchError(response.status, Number.isFinite(delay) ? Math.max(0, delay) : 0);
+              }
+              return response;
+            };
+            const resolveOwner = () => resolveSelfId(recipe, headers, fetchHistory);
+            const ownerId = await resolveOwner();
             if (selfId && ownerId !== selfId) throw new Error("x_history_account_changed");
+            selfId = ownerId;
             const history = await scanXMessageHistory({
               config: m.xHistory,
               ownerId,
@@ -898,15 +907,10 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
               jitter,
               fetchJson: async (path) => {
                 await assertCurrent();
-                if (await resolveSelfId(recipe, headers, fetchImpl) !== ownerId) throw new Error("x_history_account_changed");
-                const response = await fetchImpl(new URL(path, recipe.targetOrigin).href, {
+                if (await resolveOwner() !== ownerId) throw new Error("x_history_account_changed");
+                const response = await fetchHistory(new URL(path, recipe.targetOrigin).href, {
                   credentials: "include", headers,
-                }).catch(() => { throw new HistoryFetchError(0); });
-                if (!response.ok) {
-                  const retryAfter = response.headers?.get("retry-after");
-                  const delay = retryAfter ? (/^[0-9]+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - now()) : 0;
-                  throw new HistoryFetchError(response.status, Number.isFinite(delay) ? Math.max(0, delay) : 0);
-                }
+                });
                 return response.json();
               },
               onPage: async (checkpoint) => {
@@ -936,6 +940,8 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
             return { ok: false, note: "history-failed" };
           }
         } else {
+          // Legacy messages resolve once for direction and {self} interpolation.
+          if (!selfId) selfId = await resolveSelfId(recipe, headers, fetchImpl);
           const items = await scanConnections<ScanMessage>({
             fetchPage: async (cursor) => {
               const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor, selfId), {
