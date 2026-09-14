@@ -14,11 +14,11 @@ export function thriftStruct(id: number, ...fields: Buffer[]): Buffer {
   return Buffer.concat([header, ...fields, Buffer.from([0])]);
 }
 export function chatEvent(options: {
-  sequence?: string; sender?: string; conversation?: string; time?: string; kind?: number;
+  messageId?: string; sequence?: string; sender?: string; conversation?: string; time?: string; kind?: number;
 } = {}): string {
   return Buffer.concat([
     thriftString(1, options.sequence ?? "100"),
-    thriftString(2, "message-uuid"),
+    thriftString(2, options.messageId ?? `message-${options.sequence ?? "100"}`),
     thriftString(3, options.sender ?? "10"),
     thriftString(4, options.conversation ?? "10:20"),
     thriftString(5, "private-conversation-token"),

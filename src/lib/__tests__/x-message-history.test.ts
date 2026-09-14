@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { scanXMessageHistory, type XHistoryCheckpoint } from "../x-message-history";
+import { assembleScanPayload } from "../scan-plan";
+import type { ScanRecipe } from "../storage";
 import { chatEvent } from "./fixtures/x-chat";
 
 const config = {
@@ -47,6 +49,29 @@ describe("complete X DM history", () => {
       else expect(JSON.parse(url.searchParams.get("variables")!)).toBeTruthy();
       throw new Error("request-verified");
     } })).rejects.toThrow("request-verified");
+  });
+
+  it("preserves distinct provider IDs at the same time and merges the same ID across sources", async () => {
+    const pages = {
+      "/initial": { data: { get_initial_chat_page: { items: [item("10:20", [chatEvent({ messageId: "101" }), chatEvent({ messageId: "102", sequence: "101" })])], inboxCursor: end } } },
+      "/requests": requests,
+      "/legacy": { inbox_initial_state: { ...legacyEnd.inbox_initial_state, entries: [{ message: { id: "101", conversation_id: "10-20", message_data: { sender_id: "10", time: "1787304720000" } } }] } },
+    };
+    const result = await scanXMessageHistory({ ...base, fetchJson: transport(pages) });
+    expect(result.messages).toHaveLength(2);
+    expect(result.messages.map((m) => m.messageId)).toEqual(["101", "102"]);
+    const wire = assembleScanPayload({ source: "x" } as ScanRecipe, [], result.messages, "10").payload.messages;
+    expect(wire).toEqual(result.messages.map((m) => ({ counterpartAccountId: "20", lastMessageAt: m.lastMessageAt, direction: "sent", had_reply: false, messageId: m.messageId, conversationId: "10-20" })));
+  });
+  it("restarts old timestamp-only checkpoints before claiming complete history", async () => {
+    const checkpoint = { version: 1 as const, ownerId: "10", jobs: [], messages: { old: { counterpart: "20", time: "2026-08-21T09:32:00.000Z", direction: "sent" as const } }, conversations: [], excluded: [], visited: ["old-page"] };
+    const seen: string[] = [];
+    const result = await scanXMessageHistory({ ...base, checkpoint, fetchJson: transport({
+      "/initial": { data: { get_initial_chat_page: { items: [item("10:20", [chatEvent()])], inboxCursor: end } } },
+      "/requests": requests, "/legacy": legacyEnd,
+    }, seen) });
+    expect(seen.some((path) => path.startsWith("/initial?"))).toBe(true);
+    expect(result.messages[0]).toMatchObject({ messageId: "message-100", conversationId: "10-20" });
   });
 
   it("follows a short current inbox page, retains every message and resumes at its checkpoint", async () => {
@@ -114,7 +139,7 @@ describe("complete X DM history", () => {
       "/legacy": legacyEnd,
     };
     const result = await scanXMessageHistory({ ...base, fetchJson: transport(pages) });
-    expect(result.messages).toEqual([{ counterpartProfileUrl: "30", lastMessageAt: "2026-08-21T09:32:00.000Z", direction: "received", had_reply: false }]);
+    expect(result.messages).toEqual([{ counterpartProfileUrl: "30", messageId: "message-100", conversationId: "10-30", lastMessageAt: "2026-08-21T09:32:00.000Z", direction: "received", had_reply: false }]);
   });
 
   it.each([

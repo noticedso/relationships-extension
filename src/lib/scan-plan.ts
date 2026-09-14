@@ -99,6 +99,7 @@ export function assembleScanPayload(
     // the wire signal the server reads as "unknown / legacy, score as today".
     const msgs = messages.map((m) => ({
       counterpartAccountId: m.counterpartProfileUrl,
+      ...(m.messageId ? { messageId: m.messageId, conversationId: m.conversationId } : {}),
       lastMessageAt: m.lastMessageAt,
       direction: m.direction,
       ...(m.had_reply !== undefined ? { had_reply: m.had_reply } : {}),

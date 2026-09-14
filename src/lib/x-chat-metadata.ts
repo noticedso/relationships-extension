@@ -1,12 +1,13 @@
 /**
  * Metadata-only reader for X Chat's Thrift binary MessageEvent envelope.
  * Field numbers verified against X's public xchat-kmp client (2026-09-14).
- * Strings 1/3/4/6 identify sequence, sender, conversation and time. Field 7 is
+ * Strings 1/2/3/4/6 identify sequence, message ID, sender, conversation and time. Field 7 is
  * the event union (1 = message creation). Bodies, keys, tokens and signatures
  * are skipped by byte length; they are never decoded or returned.
  */
 export type ChatEventMetadata = {
   sequenceId: string;
+  messageId: string;
   conversationId: string;
   senderId: string;
   occurredAt: string;
@@ -65,7 +66,7 @@ export function decodeChatEvent(encoded: string): ChatEventMetadata {
   let kind = 0;
   for (let type = byte(); type !== 0; type = byte()) {
     const id = short();
-    if (type === 11 && [1, 3, 4, 6].includes(id)) {
+    if (type === 11 && [1, 2, 3, 4, 6].includes(id)) {
       const n = size();
       if (n > 128) throw new Error("x_chat_invalid_metadata");
       const start = take(n);
@@ -80,13 +81,14 @@ export function decodeChatEvent(encoded: string): ChatEventMetadata {
     } else skip(type);
   }
   const sequenceId = fields[1] ?? "";
+  const messageId = fields[2] ?? "";
   const senderId = fields[3] ?? "";
   const conversationId = fields[4] ?? "";
   const time = fields[6] ?? "";
   const date = new Date(Number(time));
   if (offset !== bytes.length || !/^[0-9]+$/.test(sequenceId) || !/^[0-9]+$/.test(time)
-    || Number.isNaN(date.getTime()) || !conversationId || !kind) {
+    || Number.isNaN(date.getTime()) || !conversationId || !kind || (kind === 1 && !messageId)) {
     throw new Error("x_chat_invalid_metadata");
   }
-  return { sequenceId, senderId, conversationId, occurredAt: date.toISOString(), kind };
+  return { sequenceId, messageId, senderId, conversationId, occurredAt: date.toISOString(), kind };
 }

@@ -11,7 +11,7 @@ type Job = {
   conversation?: string;
   timeline?: "trusted" | "untrusted";
 };
-type Observation = { counterpart: string; time: string; direction: "sent" | "received" };
+type Observation = { messageId?: string; conversationId?: string; counterpart: string; time: string; direction: "sent" | "received" };
 export type XHistoryCheckpoint = {
   version: 1;
   ownerId: string;
@@ -89,26 +89,29 @@ export async function scanXMessageHistory(opts: {
 }): Promise<{ complete: boolean; messages: ScanMessage[] }> {
   if (!/^\d+$/.test(opts.ownerId)) throw new Error("x_history_owner_required");
   if (opts.checkpoint && (opts.checkpoint.version !== 1 || opts.checkpoint.ownerId !== opts.ownerId)) throw new Error("x_history_account_changed");
-  const state: XHistoryCheckpoint = opts.checkpoint ? structuredClone(opts.checkpoint) : {
+  // Old checkpoints already collapsed same-time messages; rescan instead of
+  // claiming complete provider history from lossy timestamp-only observations.
+  const reusable = opts.checkpoint && Object.values(opts.checkpoint.messages).every((m) => m.messageId && m.conversationId);
+  const state: XHistoryCheckpoint = reusable ? structuredClone(opts.checkpoint!) : {
     version: 1, ownerId: opts.ownerId,
     jobs: [{ kind: "initial" }, { kind: "requests" }, { kind: "legacyInitial" }],
     messages: {}, conversations: [], excluded: [], visited: [],
   };
-  const add = (id: string, sender: string, time: string) => {
+  const add = (id: string, sender: string, time: string, messageId: string) => {
     const other = counterpart(id, opts.ownerId);
     if (!other || state.excluded.includes(other)) return;
     if (sender !== opts.ownerId && sender !== other) throw new Error("x_history_invalid_sender");
     const direction = sender === opts.ownerId ? "sent" : "received";
-    // Retain the established ingest identity so rescans and overlap between
-    // legacy and Chat cannot duplicate previously imported interactions.
-    state.messages[[other, time, direction].join("|")] = { counterpart: other, time, direction };
+    if (!messageId || messageId.length > 128) throw new Error("x_history_missing_message_id");
+    const conversationId = id.replace(":", "-");
+    state.messages[JSON.stringify([conversationId, messageId])] = { counterpart: other, time, direction, messageId, conversationId };
     if (Object.keys(state.messages).length > 10_000) throw new Error("x_history_message_limit");
   };
   const events = (raw: unknown, id: string): ChatEventMetadata[] => array(raw).map((value) => {
     if (typeof value !== "string") throw new Error("x_history_invalid_event");
     const event = decodeChatEvent(value);
     if (event.conversationId !== id) throw new Error("x_history_conversation_mismatch");
-    if (event.kind === 1) add(id, event.senderId, event.occurredAt);
+    if (event.kind === 1) add(id, event.senderId, event.occurredAt, event.messageId);
     return event;
   });
   const minimum = (entries: ChatEventMetadata[]): string => {
@@ -129,7 +132,7 @@ export async function scanXMessageHistory(opts: {
       if (!counterpart(id, opts.ownerId)) continue;
       const time = toIso(data.time);
       if (!time) throw new Error("x_history_invalid_time");
-      add(id, text(data.sender_id), time);
+      add(id, text(data.sender_id), time, text(data.id) || text(message.id));
     }
     const conversations = object(page.conversations ?? {});
     for (const [id, raw] of Object.entries(conversations)) {
@@ -227,6 +230,7 @@ export async function scanXMessageHistory(opts: {
     set.add(m.direction); directions.set(m.counterpart, set);
   }
   return { complete: true, messages: observations.map((m) => ({
+    messageId: m.messageId, conversationId: m.conversationId,
     counterpartProfileUrl: m.counterpart, lastMessageAt: m.time, direction: m.direction,
     had_reply: directions.get(m.counterpart)!.size === 2,
   })) };
