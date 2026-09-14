@@ -178,7 +178,16 @@ export type State = {
    */
   scanNeedsRecipeRefresh?: boolean | null;
   /** Actionable failures and metadata-only checkpoints, scoped to this account. */
-  scanFailures?: Record<string, { message: string; checkpoint?: XHistoryCheckpoint }> | null;
+  scanFailures?: Record<string, {
+    message: string;
+    checkpoint?: XHistoryCheckpoint;
+    resume?: {
+      accountId: string;
+      recipe: ScanRecipe;
+      phaseIndex: number;
+      phaseResults: NonNullable<State["scanPhaseResults"]>;
+    };
+  }> | null;
   scanRetryCount?: number | null;
   scanRetryAt?: number | null;
   /**

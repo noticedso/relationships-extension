@@ -2589,6 +2589,35 @@ describe("X history handoff", () => {
     expect(await dispatchInternal({ type: "getStatus" })).toMatchObject({ scanning: false, sources: [{ failure: expect.stringContaining("Sign in") }] });
   });
 
+  it.each(["runScan", "scanNow"])("%s resumes a failed history checkpoint instead of fetching completed pages again", async (entry) => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const first = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }) })
+      .mockResolvedValue({ ok: false, status: 403 });
+    await sw.continueScan({ fetchImpl: first, sleep: async () => {}, jitter: () => 0 });
+    await sw.continueScan({ fetchImpl: first, sleep: async () => {}, jitter: () => 0 });
+    const r = completeHistoryRecipe();
+    const retriedPaths: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      retriedPaths.push(path);
+      const json = path.includes("/recipe") ? { recipe: r, recipes: [r] }
+        : path === "/requests" ? { data: { get_message_requests_page: { message_request_items: [], cursor: { __typename: "XChatGetMessageRequestsPageEndCursor", pull_finished: true } } } }
+        : path === "/initial" ? { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }
+        : { elements: [] };
+      return { ok: true, json: async () => json } as Response;
+    });
+    if (entry === "runScan") await sw.runScan("x", { fetchImpl: globalThis.fetch, refreshRecipes: false, sleep: async () => {}, jitter: () => 0 });
+    else await dispatchInternal({ type: "scanNow", source: "x" });
+    await vi.waitFor(() => expect(retriedPaths.length).toBeGreaterThan(0));
+    expect(retriedPaths).toEqual(["/requests"]);
+    await vi.waitFor(async () => expect((await chrome.storage.local.get(null)).scanItems).toMatchObject([{ visited: [expect.stringContaining("/initial"), expect.stringContaining("/requests")] }]));
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanFailures).toEqual({});
+    expect(stored.scanPhaseResults).toEqual({ connLists: [[]], messages: [] });
+  });
+
   it("bounds transient retries and waits before retrying a server failure", async () => {
     const chrome = await prepareHistory();
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
@@ -2604,6 +2633,39 @@ describe("X history handoff", () => {
     expect(await sw.continueScan(deps)).toMatchObject({ note: "history-failed" });
     expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false);
+  });
+
+  it.each(["noticed account", "recipe", "X account"])("does not reuse failed progress across a changed %s", async (changed) => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const first = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }) })
+      .mockResolvedValue({ ok: false, status: 403 });
+    await sw.continueScan({ fetchImpl: first });
+    await sw.continueScan({ fetchImpl: first });
+    if (changed === "noticed account") await chrome.storage.local.set({ account: { id: "acct-other", displayName: "Other" } });
+    if (changed === "recipe") {
+      const recipe = { ...completeHistoryRecipe(), listPathTemplate: "/changed-connections" };
+      await chrome.storage.local.set({ recipe, recipes: { x: recipe } });
+    }
+    if (changed === "X account") vi.mocked(chrome.cookies.get).mockImplementation(async ({ name }) => ({ name, value: name === "twid" ? "u=11" : "csrf" }));
+    const paths: string[] = [];
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      paths.push(path);
+      return { ok: true, json: async () => path === "/initial"
+        ? { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }
+        : { elements: [] } } as Response;
+    });
+    const result = await sw.runScan("x", { fetchImpl, refreshRecipes: false, sleep: async () => {}, jitter: () => 0 });
+    if (changed === "X account") {
+      expect(result).toMatchObject({ note: "history-failed" });
+      expect(paths).toEqual([]);
+      expect((await chrome.storage.local.get(null)).scanFailures).toMatchObject({ x: { message: expect.stringContaining("original account") } });
+    } else {
+      expect(paths[0]).toContain("connections");
+      expect(paths).not.toContain("/requests");
+    }
   });
 
   it("does not restart an actionable failed scan when the app pairs again", async () => {

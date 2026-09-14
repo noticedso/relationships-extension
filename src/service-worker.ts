@@ -445,10 +445,13 @@ class HistoryFetchError extends Error {
   get transient() { return this.status === 0 || this.status === 429 || this.status >= 500; }
 }
 
-function historyFailureState(state: Partial<State>, source: string, message: string): Partial<State> {
+function historyFailureState(state: Partial<State>, source: string, message: string, recipe = recipesOf(state)[source]): Partial<State> {
   const checkpoint = state.scanItems?.[0] as XHistoryCheckpoint | undefined;
+  const accountId = accountKey(state.account);
   return { scanFailures: { ...state.scanFailures, [source]: {
     message, ...(checkpoint?.version === 1 ? { checkpoint } : {}),
+    ...(checkpoint?.version === 1 && accountId && recipe && state.scanPhaseIndex != null && state.scanPhaseResults
+      ? { resume: { accountId, recipe, phaseIndex: state.scanPhaseIndex, phaseResults: state.scanPhaseResults } } : {}),
   } } };
 }
 
@@ -456,6 +459,28 @@ function resetSourceFailure(state: Partial<State>, source: string): Partial<Stat
   const failures = { ...state.scanFailures };
   delete failures[source];
   return { scanFailures: failures, scanRetryCount: 0, scanRetryAt: null };
+}
+
+/** Restore the exact failed scan only for its noticed account and recipe.
+ * The history reader separately verifies the signed-in X owner before fetching.
+ * Changed recipes start fresh so saved phase indexes never address a new plan. */
+function retrySourceState(state: Partial<State>, source: string): Partial<State> {
+  const failure = state.scanFailures?.[source];
+  const resume = failure?.resume;
+  const checkpoint = failure?.checkpoint;
+  const recipe = recipesOf(state)[source];
+  if (checkpoint?.version !== 1 || !resume
+    || resume.accountId !== accountKey(state.account)
+    || JSON.stringify(resume.recipe) !== JSON.stringify(recipe)) return resetSourceFailure(state, source);
+  return {
+    ...resetSourceFailure(state, source),
+    scanPhaseIndex: resume.phaseIndex,
+    scanCursor: 0,
+    scanItems: [checkpoint],
+    scanPhaseResults: resume.phaseResults,
+    scanSelfId: checkpoint.ownerId,
+    scanNeedsRecipeRefresh: false,
+  };
 }
 
 function historyFailureMessage(error: unknown): string {
@@ -902,7 +927,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
               return { ok: false, note: "history-retrying" };
             }
             await updateCurrentScan(scanSource, scanAccountId, {
-              ...clearedScanState(), ...historyFailureState(current, scanSource, historyFailureMessage(error)),
+              ...clearedScanState(), ...historyFailureState(current, scanSource, historyFailureMessage(error), recipe),
             });
             clearScanTick();
             return { ok: false, note: "history-failed" };
@@ -1143,7 +1168,6 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
     const current = await getState();
     if (accountKey(current.account) !== expectedAccountKey || !recipesOf(current)[src]) return false;
     await setState({
-      ...resetSourceFailure(current, src),
       scanInProgress: true,
       scanSource: src,
       scanAccountId: expectedAccountKey,
@@ -1156,6 +1180,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
       // A genuine fresh start → owe a recipe refresh (continueScan performs it).
       scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
       needs: null,
+      ...retrySourceState(current, src),
     });
     return true;
   });
@@ -1178,7 +1203,6 @@ async function initializeScanPlan(
       return false;
     }
     await setState({
-      ...resetSourceFailure(state, first),
       scanInProgress: true,
       scanSource: first,
       scanQueue: list.slice(1),
@@ -1191,6 +1215,7 @@ async function initializeScanPlan(
       scanStartedAt: Date.now(),
       scanNeedsRecipeRefresh: refreshRecipes,
       needs: null,
+      ...retrySourceState(state, first),
     });
     armScanTick();
     return true;
@@ -1213,7 +1238,6 @@ async function drainScanQueue(): Promise<void> {
         return "skip" as const;
       }
       await setState({
-        ...resetSourceFailure(state, candidate),
         scanInProgress: true,
         scanSource: candidate,
         scanQueue: rest,
@@ -1226,6 +1250,7 @@ async function drainScanQueue(): Promise<void> {
         scanStartedAt: Date.now(),
         scanNeedsRecipeRefresh: false,
         needs: null,
+        ...retrySourceState(state, candidate),
       });
       armScanTick();
       return candidate;

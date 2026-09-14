@@ -16,6 +16,10 @@
  * source), so the two can never drift.
  */
 import type { ScanRecipe } from "./storage";
+import type { XHistoryConfig } from "./x-message-history";
+
+const HISTORY_PATHS = ["initialPath", "inboxPath", "requestsPath", "conversationPath",
+  "legacyInitialPath", "legacyInboxPath", "legacyConversationPath"] as const satisfies readonly (keyof XHistoryConfig)[];
 
 /** The first-party endpoint that serves the live scan recipes. */
 export const RECIPE_PATH = "/api/linkedin/extension/recipe";
@@ -29,8 +33,9 @@ export function sourceOf(recipe: ScanRecipe): string {
 
 /** Every origin required by the recipe, including a separate history API host. */
 export function requiredOrigins(recipe: ScanRecipe): string[] {
-  return [...new Set([recipe.targetOrigin, ...Object.values(recipe.messages?.xHistory ?? {})
-    .map((path) => new URL(path, recipe.targetOrigin).origin)])];
+  const history = recipe.messages?.xHistory;
+  return [...new Set([recipe.targetOrigin, ...(history ? HISTORY_PATHS
+    .map((key) => new URL(history[key], recipe.targetOrigin).origin) : [])])];
 }
 
 function isNonEmptyString(v: unknown): v is string {
@@ -55,6 +60,7 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
   const r = value as Record<string, unknown>;
 
   if (!isNonEmptyString(r.targetOrigin) || !r.targetOrigin.startsWith("https://")) return false;
+  try { if (new URL(r.targetOrigin).protocol !== "https:") return false; } catch { return false; }
   if (!isNonEmptyString(r.listPathTemplate)) return false;
 
   const pagination = r.paginationParams as Record<string, unknown> | undefined;
@@ -73,6 +79,18 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
     return false;
   }
 
+  const messages = r.messages as Record<string, unknown> | undefined;
+  if (messages?.xHistory !== undefined) {
+    const history = messages.xHistory;
+    if (!history || typeof history !== "object" || Array.isArray(history)) return false;
+    for (const key of HISTORY_PATHS) {
+      const path = (history as Record<string, unknown>)[key];
+      if (typeof path !== "string" || !path.trim()) return false;
+      try {
+        if (new URL(path, r.targetOrigin).protocol !== "https:") return false;
+      } catch { return false; }
+    }
+  }
   return true;
 }
 

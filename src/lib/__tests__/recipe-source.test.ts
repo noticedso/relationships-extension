@@ -35,6 +35,25 @@ describe("recipe-source", () => {
   });
 
   describe("isValidScanRecipe", () => {
+    const history = {
+      initialPath: "https://api.x.com/initial", inboxPath: "/inbox", requestsPath: "/requests",
+      conversationPath: "/conversation", legacyInitialPath: "/legacy",
+      legacyInboxPath: "/legacy/{timeline}", legacyConversationPath: "/legacy/{conversation}",
+    };
+    it("accepts complete X history endpoints and legacy recipes without history", () => {
+      expect(isValidScanRecipe(makeRecipe({ messages: { xHistory: history } } as Partial<ScanRecipe>))).toBe(true);
+      expect(isValidScanRecipe(makeRecipe())).toBe(true);
+    });
+    it.each(Object.keys(history))("rejects missing or malformed %s before replacing cached recipes", (key) => {
+      for (const value of [undefined, null, "", "   ", 42, "https://[", "http://x.com/insecure", "javascript:alert(1)"]) {
+        const malformed = makeRecipe({ messages: { xHistory: { ...history, [key]: value } } } as unknown as Partial<ScanRecipe>);
+        expect(isValidScanRecipe(malformed)).toBe(false);
+        expect(parseServedRecipes({ recipes: [makeRecipe(), malformed] })).toBeNull();
+      }
+    });
+    it.each([null, [], "broken", {}])("rejects an invalid X history container: %j", (xHistory) => {
+      expect(isValidScanRecipe(makeRecipe({ messages: { xHistory } } as unknown as Partial<ScanRecipe>))).toBe(false);
+    });
     it("accepts a well-formed recipe", () => {
       expect(isValidScanRecipe(makeRecipe())).toBe(true);
     });
