@@ -44,6 +44,18 @@ describe("recipe-source", () => {
       expect(isValidScanRecipe(makeRecipe({ messages: { xHistory: history } } as Partial<ScanRecipe>))).toBe(true);
       expect(isValidScanRecipe(makeRecipe())).toBe(true);
     });
+    it.each([
+      ["legacyInboxPath", "{timeline}"],
+      ["legacyConversationPath", "{conversation}"],
+    ])("requires the %s substitution in the request URL", (key, placeholder) => {
+      for (const value of ["/legacy/static", "/legacy/{wrong}", `/legacy/static#${placeholder}`]) {
+        const malformed = makeRecipe({ messages: { xHistory: { ...history, [key]: value } } } as Partial<ScanRecipe>);
+        expect(isValidScanRecipe(malformed)).toBe(false);
+        expect(parseServedRecipes({ recipes: [makeRecipe(), malformed] })).toBeNull();
+      }
+      const valid = makeRecipe({ messages: { xHistory: { ...history, [key]: `/legacy/${placeholder}?flags=1#section` } } } as Partial<ScanRecipe>);
+      expect(isValidScanRecipe(valid)).toBe(true);
+    });
     it.each(Object.keys(history))("rejects missing or malformed %s before replacing cached recipes", (key) => {
       for (const value of [undefined, null, "", "   ", 42, "https://[", "http://x.com/insecure", "javascript:alert(1)"]) {
         const malformed = makeRecipe({ messages: { xHistory: { ...history, [key]: value } } } as unknown as Partial<ScanRecipe>);

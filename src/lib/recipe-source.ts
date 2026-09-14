@@ -86,8 +86,15 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
     for (const key of HISTORY_PATHS) {
       const path = (history as Record<string, unknown>)[key];
       if (typeof path !== "string" || !path.trim()) return false;
+      const placeholder = key === "legacyInboxPath" ? "{timeline}"
+        : key === "legacyConversationPath" ? "{conversation}" : null;
+      if (placeholder && !path.split("#")[0]!.includes(placeholder)) return false;
       try {
-        if (new URL(path, r.targetOrigin).protocol !== "https:") return false;
+        const url = new URL(path, r.targetOrigin);
+        if (url.protocol !== "https:") return false;
+        // Substitutions must affect the request path/query, not its host or fragment.
+        const request = url.pathname + url.search;
+        if (placeholder && !request.includes(placeholder) && !request.includes(encodeURIComponent(placeholder))) return false;
       } catch { return false; }
     }
   }
