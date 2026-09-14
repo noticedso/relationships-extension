@@ -14,6 +14,7 @@ import type { ScanRecipe } from "./storage";
  * Both are optional — a failed side-pass never blocks the connections import.
  */
 export type ScanExtras = {
+  messageHistory?: { version: 1; complete: true };
   ownerProfile?: Record<string, unknown>;
   tweetEdges?: XTweetEdgeRow[];
 };
@@ -108,7 +109,9 @@ export function assembleScanPayload(
     const mentions = extras.tweetEdges ?? [];
     return {
       ingestPath,
-      payload: { source, mutuals, messages: msgs, mentions, ownerAccountId: selfId },
+      payload: { source, mutuals, messages: msgs, mentions, ownerAccountId: selfId,
+        ...(extras.messageHistory ? { messageHistory: extras.messageHistory } : {}),
+      },
       count: mutuals.length + msgs.length,
     };
   }

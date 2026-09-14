@@ -1,8 +1,10 @@
+import type { XHistoryConfig } from "./x-message-history";
 import type { ScanConnection, ScanMessage } from "./recipe";
 import type { AnyMessageFieldMap, MessageEventsConfig, TweetEdgesFieldMap } from "./message-extract";
 
 /** A "messages" pass appended after the connection pass(es). Metadata only. */
 export type MessagesTarget = {
+  xHistory?: XHistoryConfig;
   /** Supports `{self}` (owner id) + `{cursor}`/`{start}`/`{count}`. */
   listPathTemplate: string;
   pageSize: number;
@@ -157,7 +159,7 @@ export type State = {
   /** Items accumulated so far for the CURRENT phase. */
   scanItems?: unknown[] | null;
   /** Completed-phase outputs: one ScanConnection[] per connection list + messages. */
-  scanPhaseResults?: { connLists: ScanConnection[][]; messages: ScanMessage[] } | null;
+  scanPhaseResults?: { connLists: ScanConnection[][]; messages: ScanMessage[]; messageHistory?: { version: 1; complete: true } } | null;
   /** The owner's own id resolved for the messages pass (direction). */
   scanSelfId?: string | null;
   /** When the current scan began — drives the stale-zombie guard. */

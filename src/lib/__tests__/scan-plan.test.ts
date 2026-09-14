@@ -170,3 +170,9 @@ describe("assembleScanPayload", () => {
     expect(out.count).toBe(1); // 1 mutual (bob), 0 messages
   });
 });
+
+it("includes history completion evidence only when the history reader completed", () => {
+  const complete = assembleScanPayload(xRecipe, [], [], "10", { messageHistory: { version: 1, complete: true } });
+  expect(complete.payload.messageHistory).toEqual({ version: 1, complete: true });
+  expect(assembleScanPayload(xRecipe, [], [], "10").payload.messageHistory).toBeUndefined();
+});

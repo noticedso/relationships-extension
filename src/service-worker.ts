@@ -1,3 +1,4 @@
+import { scanXMessageHistory, type XHistoryCheckpoint } from "./lib/x-message-history";
 /**
  * The extension's brain. Stores per-source recipes + an account (from pairing
  * with a first-party noticed page), runs paced scans as the logged-in user
@@ -817,36 +818,66 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         // Resolve the owner id once (cookie or pre-fetch) so direction works AND
         // {self} can be interpolated into the URL (LinkedIn mailboxUrn).
         if (!selfId) selfId = await resolveSelfId(recipe, headers, fetchImpl);
-        const items = await scanConnections<ScanMessage>({
-          fetchPage: async (cursor) => {
-            const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor, selfId), {
-              credentials: "include",
-              headers,
-            });
-            if (!res.ok) throw new Error(`messages page fetch failed: ${res.status}`);
-            const json = await res.json();
-            if (!selfId && m.selfIdPath) selfId = String(getByPath(json, m.selfIdPath) ?? "");
-            const items = extractMessages(json, m.messageFieldMap, selfId, m.excludeUnreplied ?? false);
-            const rawCount = countMessageRaw(json, m.messageFieldMap);
-            const nextCursor = m.cursorPath ? normalizeCursor(getByPath(json, m.cursorPath)) : undefined;
-            return { items, rawCount, nextCursor };
-          },
-          pageSize: m.pageSize,
-          maxPages: effectiveMaxPages,
-          sleep,
-          jitter,
-          startAt: resumeThisPhase ? (state.scanCursor ?? 0) : 0,
-          initialItems: initialItems as ScanMessage[],
-          onPage: async (its, nextCursor) => {
-            await updateCurrentScan(scanSource, scanAccountId, {
-              scanPhaseIndex: phaseIndex,
-              scanCursor: nextCursor,
-              scanItems: its,
-              scanSelfId: selfId,
-            });
-          },
-        });
-        results.messages = items;
+        if (m.xHistory) {
+          const ownerId = await resolveSelfId(recipe, headers, fetchImpl);
+          if (selfId && ownerId !== selfId) throw new Error("x_history_account_changed");
+          const history = await scanXMessageHistory({
+            config: m.xHistory,
+            ownerId,
+            maxPages: effectiveMaxPages,
+            checkpoint: initialItems[0] as XHistoryCheckpoint | undefined,
+            sleep,
+            jitter,
+            fetchJson: async (path) => {
+              await assertCurrent();
+              if (await resolveSelfId(recipe, headers, fetchImpl) !== ownerId) throw new Error("x_history_account_changed");
+              const response = await fetchImpl(new URL(path, recipe.targetOrigin).href, {
+                credentials: "include", headers,
+              });
+              if (!response.ok) throw new Error(`X history fetch failed: ${response.status}`);
+              return response.json();
+            },
+            onPage: async (checkpoint) => {
+              await updateCurrentScan(scanSource, scanAccountId, {
+                scanPhaseIndex: phaseIndex, scanCursor: 0, scanItems: [checkpoint], scanSelfId: ownerId,
+              });
+            },
+          });
+          if (!history.complete) return { ok: true, note: "history-in-progress" };
+          results.messages = history.messages;
+          results.messageHistory = { version: 1, complete: true };
+        } else {
+          const items = await scanConnections<ScanMessage>({
+            fetchPage: async (cursor) => {
+              const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor, selfId), {
+                credentials: "include",
+                headers,
+              });
+              if (!res.ok) throw new Error(`messages page fetch failed: ${res.status}`);
+              const json = await res.json();
+              if (!selfId && m.selfIdPath) selfId = String(getByPath(json, m.selfIdPath) ?? "");
+              const items = extractMessages(json, m.messageFieldMap, selfId, m.excludeUnreplied ?? false);
+              const rawCount = countMessageRaw(json, m.messageFieldMap);
+              const nextCursor = m.cursorPath ? normalizeCursor(getByPath(json, m.cursorPath)) : undefined;
+              return { items, rawCount, nextCursor };
+            },
+            pageSize: m.pageSize,
+            maxPages: effectiveMaxPages,
+            sleep,
+            jitter,
+            startAt: resumeThisPhase ? (state.scanCursor ?? 0) : 0,
+            initialItems: initialItems as ScanMessage[],
+            onPage: async (its, nextCursor) => {
+              await updateCurrentScan(scanSource, scanAccountId, {
+                scanPhaseIndex: phaseIndex,
+                scanCursor: nextCursor,
+                scanItems: its,
+                scanSelfId: selfId,
+              });
+            },
+          });
+          results.messages = items;
+        }
       } else {
         const items = await scanConnections<ScanConnection>({
           fetchPage: async (cursor) => {
@@ -920,7 +951,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // NT-63 best-effort owner side-passes, AFTER the connection/message phases so
     // a failure here can never abort a completed connections scan. Each is wrapped
     // so a throw degrades to "no extra" rather than wedging the scan.
-    const extras: ScanExtras = {};
+    const extras: ScanExtras = { messageHistory: results.messageHistory };
     await assertCurrent();
     if (recipe.ownerProfile) {
       extras.ownerProfile = await runOwnerProfilePass(recipe, headers, fetchImpl).catch(() => undefined);

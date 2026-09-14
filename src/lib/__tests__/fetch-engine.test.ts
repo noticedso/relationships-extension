@@ -163,3 +163,11 @@ describe("scanConnections", () => {
     expect(out.length).toBe(2);
   });
 });
+
+it("follows an explicit cursor even when the provider returns a short page", async () => {
+  const fetchPage = vi.fn()
+    .mockResolvedValueOnce({ items: [1], rawCount: 1, nextCursor: "more" })
+    .mockResolvedValueOnce({ items: [2], rawCount: 1, nextCursor: null });
+  const result = await scanConnections({ fetchPage, pageSize: 200, maxPages: 3, sleep: async () => {}, jitter: () => 0 });
+  expect(result).toEqual([1, 2]);
+});

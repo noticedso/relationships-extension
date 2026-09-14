@@ -2506,3 +2506,44 @@ describe("service worker", () => {
     expect(tabSpy).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("X history handoff", () => {
+  it("resumes a bounded history pass and only hands off after every source is exhausted", async () => {
+    const chrome = getChrome();
+    const history = {
+      initialPath: "/initial", inboxPath: "/inbox", requestsPath: "/requests", conversationPath: "/conversation",
+      legacyInitialPath: "/legacy", legacyInboxPath: "/legacy/{timeline}", legacyConversationPath: "/legacy/conversation/{conversation}",
+    };
+    const r = { ...xRecipe, targetOrigin: "https://x.com", pacing: { maxPagesPerSession: 1, minDelayMs: 0, maxDelayMs: 0 },
+      messages: { listPathTemplate: "/legacy", pageSize: 1000, xHistory: history,
+        selfIdCookie: { name: "twid", pattern: "u=([0-9]+)" },
+        messageFieldMap: { mode: "dmEntries", entriesPath: "inbox_initial_state.entries", conversationIdPath: "message.conversation_id", senderIdPath: "message.message_data.sender_id", recipientIdPath: "message.message_data.recipient_id", timePath: "message.message_data.time" },
+      },
+    };
+    await chrome.storage.local.set({ recipe: r, recipes: { x: r }, account, noticedOrigin: "https://app.noticed.so",
+      ...inProgress({ scanSource: "x", scanPhaseIndex: 1, scanSelfId: "10", scanPhaseResults: { connLists: [[]], messages: [] } }),
+    });
+    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }: { name: string }) => ({ name, value: name === "twid" ? "u=10" : "csrf" }));
+    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      const pages: Record<string, unknown> = {
+        "/initial": { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } },
+        "/requests": { data: { get_message_requests_page: { message_request_items: [], cursor: { __typename: "XChatGetMessageRequestsPageEndCursor", pull_finished: true } } } },
+        "/legacy": { inbox_initial_state: { entries: [], conversations: {}, inbox_timelines: { trusted: { status: "AT_END" }, untrusted: { status: "AT_END" } } } },
+      };
+      if (!pages[path]) throw new Error(`Unexpected ${path}`);
+      return { ok: true, json: async () => pages[path] } as Response;
+    });
+    const deps = { fetchImpl: fetchImpl as typeof fetch, sleep: async () => {}, jitter: () => 0 };
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-in-progress" });
+    let state = await chrome.storage.local.get(null);
+    expect((state.pendingScans as Record<string, unknown> | undefined)?.x).toBeUndefined();
+    expect(state.scanInProgress).toBe(true);
+    await sw.continueScan(deps);
+    await sw.continueScan(deps);
+    state = await chrome.storage.local.get(null);
+    expect(state.pendingScans).toMatchObject({ x: { payload: { messageHistory: { version: 1, complete: true } } } });
+    expect(state.scanInProgress).toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+});
