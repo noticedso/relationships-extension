@@ -38,6 +38,12 @@ function counterpart(id: string, owner: string): string | null {
   return ids.find((i) => i !== owner) ?? null;
 }
 const settings = { inbox_conversation_limit: 100, inbox_conversation_event_limit: 5, conversation_event_limit: 200 };
+function withQuery(path: string, name: string, value: string): string {
+  const url = new URL(path, "https://recipe.invalid");
+  url.searchParams.set(name, value);
+  return /^[a-z][a-z0-9+.-]*:|^\/\//i.test(path)
+    ? url.href : `${url.pathname}${url.search}${url.hash}`;
+}
 function requestPath(job: Job, config: XHistoryConfig): string {
   let path: string;
   let variables: Record<string, unknown>;
@@ -47,10 +53,13 @@ function requestPath(job: Job, config: XHistoryConfig): string {
     case "requests": path = config.requestsPath; variables = { cursor: job.cursor ?? { descending: true }, query_settings: settings }; break;
     case "conversation": path = config.conversationPath; variables = { conversation_id: job.conversation, min_local_sequence_id: job.cursor, min_conversation_key_version: "0", query_settings: settings }; break;
     case "legacyInitial": return config.legacyInitialPath;
-    case "legacyInbox": return config.legacyInboxPath.replace("{timeline}", job.timeline!) + "?max_id=" + encodeURIComponent(String(job.cursor));
-    case "legacyConversation": return config.legacyConversationPath.replace("{conversation}", encodeURIComponent(job.conversation!)) + (job.cursor ? "?max_id=" + encodeURIComponent(String(job.cursor)) : "");
+    case "legacyInbox": return withQuery(config.legacyInboxPath.replace("{timeline}", job.timeline!), "max_id", String(job.cursor));
+    case "legacyConversation": {
+      const path = config.legacyConversationPath.replace("{conversation}", encodeURIComponent(job.conversation!));
+      return job.cursor ? withQuery(path, "max_id", String(job.cursor)) : path;
+    }
   }
-  return path + "?variables=" + encodeURIComponent(JSON.stringify(variables));
+  return withQuery(path, "variables", JSON.stringify(variables));
 }
 function nextInboxCursor(raw: unknown, requests = false): Record<string, string | boolean> | null {
   const cursor = object(raw);

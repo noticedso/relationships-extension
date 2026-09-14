@@ -29,6 +29,26 @@ function transport(pages: Record<string, unknown | ((url: URL) => unknown)>, see
 const base = { config, ownerId: "10", maxPages: 20, sleep: async () => {}, jitter: () => 0 };
 
 describe("complete X DM history", () => {
+  it.each([
+    { kind: "initial" as const },
+    { kind: "inbox" as const, cursor: { cursor_id: "next", graph_snapshot_id: "snapshot" } },
+    { kind: "requests" as const },
+    { kind: "conversation" as const, conversation: "10:20", cursor: "123" },
+    { kind: "legacyInbox" as const, timeline: "trusted" as const, cursor: "123" },
+    { kind: "legacyConversation" as const, conversation: "10-20", cursor: "123" },
+  ])("preserves fixed parameters and fragments for $kind history URLs", async (job) => {
+    const withQuery = Object.fromEntries(Object.entries(config).map(([key, path]) => [key, `${path}?flags=1#fragment`])) as typeof config;
+    const checkpoint: XHistoryCheckpoint = { version: 1, ownerId: "10", jobs: [job], messages: {}, conversations: [], excluded: [], visited: [] };
+    await expect(scanXMessageHistory({ ...base, config: withQuery, checkpoint, fetchJson: async (path) => {
+      const url = new URL(path, "https://x.com");
+      expect(url.searchParams.get("flags")).toBe("1");
+      expect(url.hash).toBe("#fragment");
+      if (job.kind.startsWith("legacy")) expect(url.searchParams.get("max_id")).toBe("123");
+      else expect(JSON.parse(url.searchParams.get("variables")!)).toBeTruthy();
+      throw new Error("request-verified");
+    } })).rejects.toThrow("request-verified");
+  });
+
   it("follows a short current inbox page, retains every message and resumes at its checkpoint", async () => {
     const pages = {
       "/initial": { data: { get_initial_chat_page: { items: [item("10:20", [chatEvent()], true)],
