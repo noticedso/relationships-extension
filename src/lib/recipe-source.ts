@@ -46,6 +46,30 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
 
+function capturePattern(value: unknown): boolean {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    // The empty alternative exposes capture slots without requiring a sample cookie.
+    return (new RegExp(`(?:${value})|`).exec("")?.length ?? 0) > 1;
+  } catch { return false; }
+}
+
+function eagerHistoryOwner(messages: Record<string, unknown>): boolean {
+  const cookie = messages.selfIdCookie as Record<string, unknown> | undefined;
+  const source = messages.selfIdSource as Record<string, unknown> | undefined;
+  const validCookie = cookie != null && typeof cookie === "object" && !Array.isArray(cookie)
+    && typeof cookie.name === "string" && !!cookie.name.trim() && capturePattern(cookie.pattern);
+  const validSource = source != null && typeof source === "object" && !Array.isArray(source)
+    && typeof source.listPathTemplate === "string" && source.listPathTemplate.startsWith("/")
+    && !source.listPathTemplate.startsWith("//")
+    && typeof source.idPath === "string" && !!source.idPath.trim()
+    && (source.extract === undefined || capturePattern(source.extract));
+  // Validate both configured alternatives so fallback cannot call malformed state.
+  if (messages.selfIdCookie !== undefined && !validCookie) return false;
+  if (messages.selfIdSource !== undefined && !validSource) return false;
+  return validCookie || validSource;
+}
+
 /**
  * Loose structural guard for a served recipe. Deliberately checks only the
  * fields a scan cannot run without — it is a garbage filter, not a schema.
@@ -81,6 +105,7 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
 
   const messages = r.messages as Record<string, unknown> | undefined;
   if (messages?.xHistory !== undefined) {
+    if (!eagerHistoryOwner(messages)) return false;
     const history = messages.xHistory;
     if (!history || typeof history !== "object" || Array.isArray(history)) return false;
     for (const key of HISTORY_PATHS) {

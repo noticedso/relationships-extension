@@ -35,13 +35,37 @@ describe("recipe-source", () => {
   });
 
   describe("isValidScanRecipe", () => {
+    const selfIdCookie = { name: "twid", pattern: "u=([0-9]+)" };
     const history = {
       initialPath: "https://api.x.com/initial", inboxPath: "/inbox", requestsPath: "/requests",
       conversationPath: "/conversation", legacyInitialPath: "/legacy",
       legacyInboxPath: "/legacy/{timeline}", legacyConversationPath: "/legacy/{conversation}",
     };
+    it.each([
+      {}, { selfIdPath: "user.id" }, { selfIdCookie: null }, { selfIdCookie: {} },
+      { selfIdCookie: { name: "", pattern: "u=(.*)" } },
+      { selfIdCookie: { name: "twid", pattern: "[" } },
+      { selfIdCookie: { name: "twid", pattern: "u=[0-9]+" } },
+      { selfIdSource: {} }, { selfIdSource: { listPathTemplate: "/me", idPath: "" } },
+      { selfIdSource: { listPathTemplate: "https://x.com/me", idPath: "id" } },
+      { selfIdSource: { listPathTemplate: "//me", idPath: "id" } },
+      { selfIdSource: { listPathTemplate: "/me", idPath: "id", extract: "[" } },
+      { selfIdSource: { listPathTemplate: "/me", idPath: "id", extract: "[0-9]+" } },
+    ])("rejects history without a usable eager owner resolver: %j", (owner) => {
+      const malformed = makeRecipe({ messages: { xHistory: history, ...owner } } as Partial<ScanRecipe>);
+      expect(isValidScanRecipe(malformed)).toBe(false);
+      expect(parseServedRecipes({ recipes: [makeRecipe(), malformed] })).toBeNull();
+    });
+    it.each([
+      { selfIdCookie },
+      { selfIdCookie: { name: "twid", pattern: "u=(?<id>[0-9]+)" } },
+      { selfIdSource: { listPathTemplate: "/me", idPath: "user.id" } },
+      { selfIdSource: { listPathTemplate: "/me", idPath: "user.urn", extract: "([^:]+)$" } },
+    ])("accepts an eager owner resolver: %j", (owner) => {
+      expect(isValidScanRecipe(makeRecipe({ messages: { xHistory: history, ...owner } } as Partial<ScanRecipe>))).toBe(true);
+    });
     it("accepts complete X history endpoints and legacy recipes without history", () => {
-      expect(isValidScanRecipe(makeRecipe({ messages: { xHistory: history } } as Partial<ScanRecipe>))).toBe(true);
+      expect(isValidScanRecipe(makeRecipe({ messages: { selfIdCookie, xHistory: history } } as Partial<ScanRecipe>))).toBe(true);
       expect(isValidScanRecipe(makeRecipe())).toBe(true);
     });
     it.each([
@@ -49,22 +73,22 @@ describe("recipe-source", () => {
       ["legacyConversationPath", "{conversation}"],
     ])("requires the %s substitution in the request URL", (key, placeholder) => {
       for (const value of ["/legacy/static", "/legacy/{wrong}", `/legacy/static#${placeholder}`]) {
-        const malformed = makeRecipe({ messages: { xHistory: { ...history, [key]: value } } } as Partial<ScanRecipe>);
+        const malformed = makeRecipe({ messages: { selfIdCookie, xHistory: { ...history, [key]: value } } } as Partial<ScanRecipe>);
         expect(isValidScanRecipe(malformed)).toBe(false);
         expect(parseServedRecipes({ recipes: [makeRecipe(), malformed] })).toBeNull();
       }
-      const valid = makeRecipe({ messages: { xHistory: { ...history, [key]: `/legacy/${placeholder}?flags=1#section` } } } as Partial<ScanRecipe>);
+      const valid = makeRecipe({ messages: { selfIdCookie, xHistory: { ...history, [key]: `/legacy/${placeholder}?flags=1#section` } } } as Partial<ScanRecipe>);
       expect(isValidScanRecipe(valid)).toBe(true);
     });
     it.each(Object.keys(history))("rejects missing or malformed %s before replacing cached recipes", (key) => {
       for (const value of [undefined, null, "", "   ", 42, "https://[", "http://x.com/insecure", "javascript:alert(1)"]) {
-        const malformed = makeRecipe({ messages: { xHistory: { ...history, [key]: value } } } as unknown as Partial<ScanRecipe>);
+        const malformed = makeRecipe({ messages: { selfIdCookie, xHistory: { ...history, [key]: value } } } as unknown as Partial<ScanRecipe>);
         expect(isValidScanRecipe(malformed)).toBe(false);
         expect(parseServedRecipes({ recipes: [makeRecipe(), malformed] })).toBeNull();
       }
     });
     it.each([null, [], "broken", {}])("rejects an invalid X history container: %j", (xHistory) => {
-      expect(isValidScanRecipe(makeRecipe({ messages: { xHistory } } as unknown as Partial<ScanRecipe>))).toBe(false);
+      expect(isValidScanRecipe(makeRecipe({ messages: { selfIdCookie, xHistory } } as unknown as Partial<ScanRecipe>))).toBe(false);
     });
     it("accepts a well-formed recipe", () => {
       expect(isValidScanRecipe(makeRecipe())).toBe(true);
