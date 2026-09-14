@@ -2507,19 +2507,121 @@ describe("service worker", () => {
   });
 });
 
-describe("X history handoff", () => {
-  it("resumes a bounded history pass and only hands off after every source is exhausted", async () => {
-    const chrome = getChrome();
-    const history = {
-      initialPath: "/initial", inboxPath: "/inbox", requestsPath: "/requests", conversationPath: "/conversation",
+function completeHistoryRecipe() {
+  const history = {
+      initialPath: "https://api.x.com/initial", inboxPath: "/inbox", requestsPath: "/requests", conversationPath: "/conversation",
       legacyInitialPath: "/legacy", legacyInboxPath: "/legacy/{timeline}", legacyConversationPath: "/legacy/conversation/{conversation}",
     };
-    const r = { ...xRecipe, targetOrigin: "https://x.com", pacing: { maxPagesPerSession: 1, minDelayMs: 0, maxDelayMs: 0 },
+  const r = { ...xRecipe, targetOrigin: "https://x.com", pacing: { maxPagesPerSession: 1, minDelayMs: 0, maxDelayMs: 0 },
       messages: { listPathTemplate: "/legacy", pageSize: 1000, xHistory: history,
         selfIdCookie: { name: "twid", pattern: "u=([0-9]+)" },
         messageFieldMap: { mode: "dmEntries", entriesPath: "inbox_initial_state.entries", conversationIdPath: "message.conversation_id", senderIdPath: "message.message_data.sender_id", recipientIdPath: "message.message_data.recipient_id", timePath: "message.message_data.time" },
       },
     };
+  return r;
+}
+
+describe("X history handoff", () => {
+  async function prepareHistory() {
+    const chrome = getChrome();
+    sw.registerListeners();
+    const r = completeHistoryRecipe();
+    await chrome.storage.local.set({ recipe: r, recipes: { x: r }, account, noticedOrigin: "https://app.noticed.so",
+      ...inProgress({ scanSource: "x", scanPhaseIndex: 1, scanSelfId: "10", scanPhaseResults: { connLists: [[]], messages: [] } }),
+    });
+    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }: { name: string }) => ({ name, value: name === "twid" ? "u=10" : "csrf" }));
+    return chrome;
+  }
+
+  it("requires the Chat subdomain grant on existing installations before any history fetch", async () => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockImplementation(async (permission) =>
+      (permission as { origins: string[] }).origins.every((o) => o === "https://x.com/*"));
+    const status = await dispatchInternal({ type: "getStatus" });
+    expect(status).toMatchObject({ sources: [{ granted: false, requiredOrigins: ["https://x.com", "https://api.x.com"] }] });
+    const fetchImpl = vi.fn();
+    const result = await sw.continueScan({ fetchImpl });
+    expect(result).toMatchObject({ ok: false, note: "history-failed" });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("starts the upgraded reader when the user grants only the newly required API origin", async () => {
+    const chrome = await prepareHistory();
+    const r = completeHistoryRecipe();
+    await chrome.storage.local.set({ scanInProgress: false });
+    const granted = new Set(["https://x.com/*", "https://app.noticed.so/*"]);
+    vi.spyOn(chrome.permissions, "contains").mockImplementation(async (permission) =>
+      (permission as { origins: string[] }).origins.every((origin) => granted.has(origin)));
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(String(input));
+      if (!granted.has(url.origin + "/*")) throw new TypeError("Missing host permission");
+      const json = url.pathname === RECIPE_PATH ? { recipe: r, recipes: [r] }
+        : url.pathname === "/initial" ? { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }
+        : { elements: [] };
+      return { ok: true, json: async () => json } as Response;
+    });
+    granted.add("https://api.x.com/*");
+    chrome.permissions.onAdded.dispatch({ origins: ["https://api.x.com/*"] });
+    await vi.waitFor(async () => {
+      const state = await chrome.storage.local.get(null);
+      expect(state.scanItems).toMatchObject([{ version: 1, visited: [expect.stringContaining("https://api.x.com/")] }]);
+    });
+    expect(fetchSpy.mock.calls.some(([input]) => String(input).startsWith("https://api.x.com/"))).toBe(true);
+  });
+
+  it("stops a denied history scan, retains its metadata checkpoint and exposes a failure without alarm retries", async () => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } }) })
+      .mockResolvedValue({ ok: false, status: 403 });
+    const deps = { fetchImpl, sleep: async () => {}, jitter: () => 0 };
+    await sw.continueScan(deps);
+    expect(await sw.continueScan(deps)).toMatchObject({ ok: false, note: "history-failed" });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress).toBe(false);
+    expect(stored.scanFailures).toMatchObject({ x: { message: expect.stringContaining("Sign in"), checkpoint: { version: 1, visited: [expect.any(String)] } } });
+    expect(stored.pendingScans).toBeUndefined();
+    const backgroundFetch = vi.spyOn(globalThis, "fetch");
+    chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(backgroundFetch).not.toHaveBeenCalled();
+    expect(await dispatchInternal({ type: "getStatus" })).toMatchObject({ scanning: false, sources: [{ failure: expect.stringContaining("Sign in") }] });
+  });
+
+  it("bounds transient retries and waits before retrying a server failure", async () => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    let now = Date.now();
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 503, headers: new Headers() }) as Response);
+    const deps = { fetchImpl, nowMs: () => now };
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-retrying" });
+    await sw.continueScan(deps);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    now += 60_000;
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-retrying" });
+    now += 120_000;
+    expect(await sw.continueScan(deps)).toMatchObject({ note: "history-failed" });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false);
+  });
+
+  it("does not restart an actionable failed scan when the app pairs again", async () => {
+    const chrome = await prepareHistory();
+    const r = completeHistoryRecipe();
+    await chrome.storage.local.set({ scanInProgress: false, scanFailures: { x: { message: "Retry required" } } });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({ ok: true, json: async () => ({ elements: [] }) } as Response);
+    await dispatchExternal({ type: "pair", recipe: r, recipes: [r], account }, noticedSender);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect((await chrome.storage.local.get(null)).scanFailures).toMatchObject({ x: { message: "Retry required" } });
+  });
+
+  it("resumes a bounded history pass and only hands off after every source is exhausted", async () => {
+    const chrome = getChrome();
+    const r = completeHistoryRecipe();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     await chrome.storage.local.set({ recipe: r, recipes: { x: r }, account, noticedOrigin: "https://app.noticed.so",
       ...inProgress({ scanSource: "x", scanPhaseIndex: 1, scanSelfId: "10", scanPhaseResults: { connLists: [[]], messages: [] } }),
     });

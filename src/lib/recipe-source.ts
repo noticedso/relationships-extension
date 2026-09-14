@@ -27,6 +27,12 @@ export function sourceOf(recipe: ScanRecipe): string {
   return recipe.source ?? DEFAULT_SOURCE;
 }
 
+/** Every origin required by the recipe, including a separate history API host. */
+export function requiredOrigins(recipe: ScanRecipe): string[] {
+  return [...new Set([recipe.targetOrigin, ...Object.values(recipe.messages?.xHistory ?? {})
+    .map((path) => new URL(path, recipe.targetOrigin).origin)])];
+}
+
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.length > 0;
 }

@@ -1,4 +1,4 @@
-import type { XHistoryConfig } from "./x-message-history";
+import type { XHistoryConfig, XHistoryCheckpoint } from "./x-message-history";
 import type { ScanConnection, ScanMessage } from "./recipe";
 import type { AnyMessageFieldMap, MessageEventsConfig, TweetEdgesFieldMap } from "./message-extract";
 
@@ -177,6 +177,10 @@ export type State = {
    * and never swaps it mid-flight.
    */
   scanNeedsRecipeRefresh?: boolean | null;
+  /** Actionable failures and metadata-only checkpoints, scoped to this account. */
+  scanFailures?: Record<string, { message: string; checkpoint?: XHistoryCheckpoint }> | null;
+  scanRetryCount?: number | null;
+  scanRetryAt?: number | null;
   /**
    * The id of the background handoff tab opened at finalize (the /x/sync page).
    * Closed on syncConfirmed so the silent background tab doesn't linger.
@@ -210,6 +214,9 @@ const KEYS: (keyof State)[] = [
   "scanSelfId",
   "scanStartedAt",
   "scanNeedsRecipeRefresh",
+  "scanFailures",
+  "scanRetryCount",
+  "scanRetryAt",
   "syncTabId",
   "syncTabIds",
 ];
