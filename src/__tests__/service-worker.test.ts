@@ -2545,6 +2545,23 @@ describe("X history handoff", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it.each([{}, { initialPath: "https://[" }])("rejects malformed paired history before changing cached state: %j", async (overrides) => {
+    const chrome = await prepareHistory();
+    await chrome.storage.local.set({ scanInProgress: false, syncTabIds: { x: 17 } });
+    const before = await chrome.storage.local.get(null);
+    const removeTab = vi.spyOn(chrome.tabs, "remove");
+    const createAlarm = vi.spyOn(chrome.alarms, "create");
+    const r = completeHistoryRecipe();
+    const xHistory = Object.keys(overrides).length === 0 ? {} : { ...r.messages.xHistory, ...overrides };
+    const bad = { ...r, messages: { ...r.messages, xHistory } };
+    const result = await dispatchExternal({ type: "pair", recipe: r, recipes: [r, bad], account: { id: "acct-other" } }, noticedSender);
+    expect(result).toEqual({ ok: false, error: "invalid_recipe" });
+    expect(await chrome.storage.local.get(null)).toEqual(before);
+    expect(removeTab).not.toHaveBeenCalled();
+    expect(createAlarm).not.toHaveBeenCalled();
+    await expect(dispatchInternal({ type: "getStatus" })).resolves.toMatchObject({ account });
+  });
+
   it("starts the upgraded reader when the user grants only the newly required API origin", async () => {
     const chrome = await prepareHistory();
     const r = completeHistoryRecipe();

@@ -33,10 +33,8 @@ import {
   DEFAULT_SOURCE,
   RECIPE_PATH,
   parseServedRecipes,
-  recipeList,
   requiredOrigins,
   sourceOf,
-  toRecipeRecord,
 } from "./lib/recipe-source";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
@@ -1397,9 +1395,14 @@ async function handleExternal(
     case "pair": {
       // Store the per-source recipes + account and arm the three-day alarm. The
       // host permission is requested from a user gesture in the popup, not here.
-      // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
-      // refresh (recipe-source.ts), so the two intake paths cannot drift.
-      const recipes = toRecipeRecord(recipeList(message.recipe, message.recipes));
+      // Pairing and refresh use the same atomic validation. Reject a malformed
+      // served recipe before changing the account, cache, alarms, or handoff tabs.
+      const parsed = parseServedRecipes(message);
+      if (!parsed) {
+        sendResponse({ ok: false, error: "invalid_recipe" });
+        return;
+      }
+      const { recipe, recipes } = parsed;
       const oldTabIds = await withAccountStateMutation(async () => {
         const prior = await getState();
         // During a mixed-version rollout an older noticed instance may omit id.
@@ -1416,7 +1419,7 @@ async function handleExternal(
             ])
           : new Set<number>();
         await setState({
-          recipe: message.recipe,
+          recipe,
           recipes,
           account: message.account,
           noticedOrigin: origin,
