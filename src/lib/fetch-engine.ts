@@ -54,7 +54,7 @@ export async function scanConnections<T>(opts: {
     // of our running accumulator.
     if (onPage) await onPage([...all], advanced);
     // End of list: a short page, OR a cursor source signalling no more (null).
-    const lastPage = rawCount < pageSize || nextCursor === null;
+    const lastPage = nextCursor === null || (nextCursor === undefined && rawCount < pageSize);
     const capReached = page + 1 >= maxPages;
     if (lastPage || capReached) break;
     await sleep(jitter());

@@ -1,8 +1,10 @@
+import type { XHistoryConfig, XHistoryCheckpoint } from "./x-message-history";
 import type { ScanConnection, ScanMessage } from "./recipe";
 import type { AnyMessageFieldMap, MessageEventsConfig, TweetEdgesFieldMap } from "./message-extract";
 
 /** A "messages" pass appended after the connection pass(es). Metadata only. */
 export type MessagesTarget = {
+  xHistory?: XHistoryConfig;
   /** Supports `{self}` (owner id) + `{cursor}`/`{start}`/`{count}`. */
   listPathTemplate: string;
   pageSize: number;
@@ -157,7 +159,7 @@ export type State = {
   /** Items accumulated so far for the CURRENT phase. */
   scanItems?: unknown[] | null;
   /** Completed-phase outputs: one ScanConnection[] per connection list + messages. */
-  scanPhaseResults?: { connLists: ScanConnection[][]; messages: ScanMessage[] } | null;
+  scanPhaseResults?: { connLists: ScanConnection[][]; messages: ScanMessage[]; messageHistory?: { version: 1; complete: true } } | null;
   /** The owner's own id resolved for the messages pass (direction). */
   scanSelfId?: string | null;
   /** When the current scan began — drives the stale-zombie guard. */
@@ -175,6 +177,19 @@ export type State = {
    * and never swaps it mid-flight.
    */
   scanNeedsRecipeRefresh?: boolean | null;
+  /** Actionable failures and metadata-only checkpoints, scoped to this account. */
+  scanFailures?: Record<string, {
+    message: string;
+    checkpoint?: XHistoryCheckpoint;
+    resume?: {
+      accountId: string;
+      recipe: ScanRecipe;
+      phaseIndex: number;
+      phaseResults: NonNullable<State["scanPhaseResults"]>;
+    };
+  }> | null;
+  scanRetryCount?: number | null;
+  scanRetryAt?: number | null;
   /**
    * The id of the background handoff tab opened at finalize (the /x/sync page).
    * Closed on syncConfirmed so the silent background tab doesn't linger.
@@ -208,6 +223,9 @@ const KEYS: (keyof State)[] = [
   "scanSelfId",
   "scanStartedAt",
   "scanNeedsRecipeRefresh",
+  "scanFailures",
+  "scanRetryCount",
+  "scanRetryAt",
   "syncTabId",
   "syncTabIds",
 ];

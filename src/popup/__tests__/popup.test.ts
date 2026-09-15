@@ -144,6 +144,37 @@ describe("popup", () => {
     expect(sendMessage).toHaveBeenCalledWith({ type: "scanNow" });
   });
 
+  it("asks an existing installation to grant the additional history origin before scanning", async () => {
+    const withOrigins = { ...status, sources: [{ source: "x", networkLabel: "X", targetOrigin: "https://x.com",
+      requiredOrigins: ["https://x.com", "https://api.x.com"] }] };
+    const sendMessage = vi.fn(async (m: { type: string }) => m.type === "getSyncHistory" ? { runs: [] } : m.type === "scanNow" ? { ok: true } : withOrigins);
+    const request = vi.fn(async () => true);
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" }, tabs: { create: vi.fn() },
+      permissions: { request, contains: vi.fn(async ({ origins }: { origins: string[] }) => origins.every((o) => o === "https://x.com/*")) },
+    };
+    (document.getElementById("scan-now") as HTMLButtonElement).disabled = true;
+    await init(document);
+    expect(document.getElementById("scan-now")!.textContent).toBe("grant access");
+    expect((document.getElementById("scan-now") as HTMLButtonElement).disabled).toBe(false);
+    document.getElementById("scan-now")!.dispatchEvent(new Event("click"));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(request).toHaveBeenCalledWith({ origins: ["https://x.com/*", "https://api.x.com/*"] });
+  });
+
+  it("shows an actionable source failure with an enabled retry button", async () => {
+    const failed = { ...status, scanning: false, sources: [{ source: "x", networkLabel: "X", targetOrigin: "https://x.com",
+      granted: true, signedIn: true, failure: "Sign in again, then retry this scan." }] };
+    const sendMessage = vi.fn(async (m: { type: string }) => m.type === "getSyncHistory" ? { runs: [] } : failed);
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage }, tabs: { create: vi.fn() }, permissions: { contains: vi.fn(async () => true) },
+    };
+    await init(document);
+    expect(document.getElementById("network-status")!.textContent).toContain("Sign in again, then retry this scan.");
+    expect((document.getElementById("scan-now") as HTMLButtonElement).disabled).toBe(false);
+    expect(document.getElementById("scan-now")!.textContent).toBe("retry scan");
+  });
+
   it("grant-access that is DENIED does not scan — only re-renders", async () => {
     const withOrigin = {
       ...status,

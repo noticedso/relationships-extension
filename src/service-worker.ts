@@ -1,3 +1,4 @@
+import { scanXMessageHistory, type XHistoryCheckpoint } from "./lib/x-message-history";
 /**
  * The extension's brain. Stores per-source recipes + an account (from pairing
  * with a first-party noticed page), runs paced scans as the logged-in user
@@ -32,9 +33,8 @@ import {
   DEFAULT_SOURCE,
   RECIPE_PATH,
   parseServedRecipes,
-  recipeList,
+  requiredOrigins,
   sourceOf,
-  toRecipeRecord,
 } from "./lib/recipe-source";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
@@ -225,7 +225,7 @@ async function grantedSources(
   const out: string[] = [];
   for (const [src, recipe] of Object.entries(recipes)) {
     try {
-      const ok = await chrome.permissions.contains({ origins: [recipe.targetOrigin + "/*"] });
+      const ok = await chrome.permissions.contains({ origins: requiredOrigins(recipe).map((origin) => origin + "/*") });
       if (ok) out.push(src);
     } catch {
       // ignore — treat as not granted
@@ -418,6 +418,8 @@ function clearedScanState(extra?: { needs?: "network-signin" }): Partial<State> 
     scanSelfId: null,
     scanStartedAt: null,
     scanNeedsRecipeRefresh: false,
+    scanRetryCount: 0,
+    scanRetryAt: null,
     ...(extra?.needs !== undefined ? { needs: extra.needs } : {}),
   };
 }
@@ -427,7 +429,65 @@ async function clearCurrentScan(
   accountId: string | null,
   extra?: { needs?: "network-signin" },
 ): Promise<void> {
-  await updateCurrentScan(source, accountId, clearedScanState(extra));
+  const state = await getState();
+  const failure = recipesOf(state)[source]?.messages?.xHistory
+    ? historyFailureState(state, source, extra?.needs === "network-signin"
+      ? "Sign in to the network, then retry the scan."
+      : "History collection timed out. Retry the scan.")
+    : {};
+  await updateCurrentScan(source, accountId, { ...clearedScanState(extra), ...failure });
+}
+
+class HistoryFetchError extends Error {
+  constructor(readonly status: number, readonly retryAfterMs = 0) { super("history_fetch_failed"); }
+  get transient() { return this.status === 0 || this.status === 429 || this.status >= 500; }
+}
+
+function historyFailureState(state: Partial<State>, source: string, message: string, recipe = recipesOf(state)[source]): Partial<State> {
+  const checkpoint = state.scanItems?.[0] as XHistoryCheckpoint | undefined;
+  const accountId = accountKey(state.account);
+  return { scanFailures: { ...state.scanFailures, [source]: {
+    message, ...(checkpoint?.version === 1 ? { checkpoint } : {}),
+    ...(checkpoint?.version === 1 && accountId && recipe && state.scanPhaseIndex != null && state.scanPhaseResults
+      ? { resume: { accountId, recipe, phaseIndex: state.scanPhaseIndex, phaseResults: state.scanPhaseResults } } : {}),
+  } } };
+}
+
+function resetSourceFailure(state: Partial<State>, source: string): Partial<State> {
+  const failures = { ...state.scanFailures };
+  delete failures[source];
+  return { scanFailures: failures, scanRetryCount: 0, scanRetryAt: null };
+}
+
+/** Restore the exact failed scan only for its noticed account and recipe.
+ * The history reader separately verifies the signed-in X owner before fetching.
+ * Changed recipes start fresh so saved phase indexes never address a new plan. */
+function retrySourceState(state: Partial<State>, source: string): Partial<State> {
+  const failure = state.scanFailures?.[source];
+  const resume = failure?.resume;
+  const checkpoint = failure?.checkpoint;
+  const recipe = recipesOf(state)[source];
+  if (checkpoint?.version !== 1 || !resume
+    || resume.accountId !== accountKey(state.account)
+    || JSON.stringify(resume.recipe) !== JSON.stringify(recipe)) return resetSourceFailure(state, source);
+  return {
+    ...resetSourceFailure(state, source),
+    scanPhaseIndex: resume.phaseIndex,
+    scanCursor: 0,
+    scanItems: [checkpoint],
+    scanPhaseResults: resume.phaseResults,
+    scanSelfId: checkpoint.ownerId,
+  };
+}
+
+function historyFailureMessage(error: unknown): string {
+  if (error instanceof HistoryFetchError && [401, 403].includes(error.status)) return "Sign in to the network again, then retry the scan.";
+  if (error instanceof HistoryFetchError && error.status === 429) return "The network limited this scan. Wait a few minutes, then retry.";
+  const code = error instanceof Error ? error.message : "";
+  if (code === "x_history_permission_required") return "Grant access in the extension, then retry the scan.";
+  if (code === "x_history_account_changed") return "The signed-in network account changed. Sign in to the original account and retry.";
+  if (code === "x_history_message_limit" || code === "x_history_page_limit") return "This history exceeds the browser scan limit. Contact contact@noticed.so for help.";
+  return "History collection stopped before it was complete. Retry the scan; update the extension if it keeps failing.";
 }
 
 function armScanTick(): void {
@@ -738,7 +798,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     const sleep = deps.sleep ?? realSleep;
     const now = deps.nowMs ?? (() => Date.now());
 
-    const state = await getState();
+    let state = await getState();
     const { noticedOrigin, testMode, scanInProgress, scanSource } = state;
     if (!scanInProgress || !scanSource) return { ok: true, note: "not-in-progress" };
     let recipe = recipesOf(state)[scanSource];
@@ -772,20 +832,26 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     //   • a RESUMED scan (keepalive tick / MV3 restart / re-entrant continueScan)
     //     sees the flag already false → no re-fetch, and the recipe it started
     //     with cannot be swapped under its phase index + cursor;
-    //   • the flag being true implies zero pages have been fetched, so adopting a
-    //     new recipe here can never contradict an existing checkpoint.
+    //   • explicit retries refresh before fetching resumed pages. If the server
+    //     changed the recipe, discard the old phase plan and checkpoint first.
     //
     // It sits AFTER the CSRF gate on purpose: no network session means no scan,
     // and a scan that cannot run must not make a request to noticed either.
     if (state.scanNeedsRecipeRefresh) {
       const refreshed = await refreshRecipesFromServer(noticedOrigin);
-      await updateCurrentScan(scanSource, scanAccountId, {
+      const fresh = refreshed?.recipes[scanSource];
+      const patch: Partial<State> = {
         ...(refreshed
           ? { recipe: refreshed.recipe, recipes: refreshed.recipes }
           : {}),
+        ...(fresh && JSON.stringify(fresh) !== JSON.stringify(recipe)
+          ? { scanPhaseIndex: 0, scanCursor: null, scanItems: [],
+              scanPhaseResults: { connLists: [], messages: [] }, scanSelfId: null }
+          : {}),
         scanNeedsRecipeRefresh: false,
-      });
-      const fresh = refreshed?.recipes[scanSource];
+      };
+      await updateCurrentScan(scanSource, scanAccountId, patch);
+      state = { ...state, ...patch };
       if (fresh) {
         recipe = fresh;
         // The fresh recipe may carry a different csrfRule — rebuild, but keep the
@@ -814,39 +880,99 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
       if (phase.kind === "messages") {
         const m = recipe.messages!;
-        // Resolve the owner id once (cookie or pre-fetch) so direction works AND
-        // {self} can be interpolated into the URL (LinkedIn mailboxUrn).
-        if (!selfId) selfId = await resolveSelfId(recipe, headers, fetchImpl);
-        const items = await scanConnections<ScanMessage>({
-          fetchPage: async (cursor) => {
-            const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor, selfId), {
-              credentials: "include",
-              headers,
+        if (m.xHistory) {
+          if ((state.scanRetryAt ?? 0) > now()) return { ok: false, note: "history-retrying" };
+          try {
+            if (!(await chrome.permissions.contains({ origins: requiredOrigins(recipe).map((origin) => origin + "/*") }))) throw new Error("x_history_permission_required");
+            // Owner-source and history requests share the same bounded recovery.
+            const fetchHistory: typeof fetch = async (input, init) => {
+              const response = await fetchImpl(input, init).catch(() => { throw new HistoryFetchError(0); });
+              if (!response.ok) {
+                const retryAfter = response.headers?.get("retry-after");
+                const delay = retryAfter ? (/^[0-9]+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Date.parse(retryAfter) - now()) : 0;
+                throw new HistoryFetchError(response.status, Number.isFinite(delay) ? Math.max(0, delay) : 0);
+              }
+              return response;
+            };
+            const resolveOwner = () => resolveSelfId(recipe, headers, fetchHistory);
+            const ownerId = await resolveOwner();
+            if (selfId && ownerId !== selfId) throw new Error("x_history_account_changed");
+            selfId = ownerId;
+            const history = await scanXMessageHistory({
+              config: m.xHistory,
+              ownerId,
+              maxPages: effectiveMaxPages,
+              checkpoint: initialItems[0] as XHistoryCheckpoint | undefined,
+              sleep,
+              jitter,
+              fetchJson: async (path) => {
+                await assertCurrent();
+                if (await resolveOwner() !== ownerId) throw new Error("x_history_account_changed");
+                const response = await fetchHistory(new URL(path, recipe.targetOrigin).href, {
+                  credentials: "include", headers,
+                });
+                return response.json();
+              },
+              onPage: async (checkpoint) => {
+                await updateCurrentScan(scanSource, scanAccountId, {
+                  scanPhaseIndex: phaseIndex, scanCursor: 0, scanItems: [checkpoint], scanSelfId: ownerId, scanRetryCount: 0, scanRetryAt: null,
+                });
+              },
             });
-            if (!res.ok) throw new Error(`messages page fetch failed: ${res.status}`);
-            const json = await res.json();
-            if (!selfId && m.selfIdPath) selfId = String(getByPath(json, m.selfIdPath) ?? "");
-            const items = extractMessages(json, m.messageFieldMap, selfId, m.excludeUnreplied ?? false);
-            const rawCount = countMessageRaw(json, m.messageFieldMap);
-            const nextCursor = m.cursorPath ? normalizeCursor(getByPath(json, m.cursorPath)) : undefined;
-            return { items, rawCount, nextCursor };
-          },
-          pageSize: m.pageSize,
-          maxPages: effectiveMaxPages,
-          sleep,
-          jitter,
-          startAt: resumeThisPhase ? (state.scanCursor ?? 0) : 0,
-          initialItems: initialItems as ScanMessage[],
-          onPage: async (its, nextCursor) => {
+            if (!history.complete) return { ok: true, note: "history-in-progress" };
+            results.messages = history.messages;
+            results.messageHistory = { version: 1, complete: true };
+          } catch (error) {
+            if (error instanceof ScanSupersededError) throw error;
+            const current = await getState();
+            const retries = current.scanRetryCount ?? 0;
+            if (error instanceof HistoryFetchError && error.transient && retries < 2) {
+              await updateCurrentScan(scanSource, scanAccountId, {
+                scanRetryCount: retries + 1,
+                scanRetryAt: now() + Math.max(30_000 * (retries + 1), error.retryAfterMs),
+              });
+              return { ok: false, note: "history-retrying" };
+            }
             await updateCurrentScan(scanSource, scanAccountId, {
-              scanPhaseIndex: phaseIndex,
-              scanCursor: nextCursor,
-              scanItems: its,
-              scanSelfId: selfId,
+              ...clearedScanState(), ...historyFailureState(current, scanSource, historyFailureMessage(error), recipe),
             });
-          },
-        });
-        results.messages = items;
+            clearScanTick();
+            return { ok: false, note: "history-failed" };
+          }
+        } else {
+          // Legacy messages resolve once for direction and {self} interpolation.
+          if (!selfId) selfId = await resolveSelfId(recipe, headers, fetchImpl);
+          const items = await scanConnections<ScanMessage>({
+            fetchPage: async (cursor) => {
+              const res = await fetchImpl(substituteCursor(m.listPathTemplate, recipe, cursor, selfId), {
+                credentials: "include",
+                headers,
+              });
+              if (!res.ok) throw new Error(`messages page fetch failed: ${res.status}`);
+              const json = await res.json();
+              if (!selfId && m.selfIdPath) selfId = String(getByPath(json, m.selfIdPath) ?? "");
+              const items = extractMessages(json, m.messageFieldMap, selfId, m.excludeUnreplied ?? false);
+              const rawCount = countMessageRaw(json, m.messageFieldMap);
+              const nextCursor = m.cursorPath ? normalizeCursor(getByPath(json, m.cursorPath)) : undefined;
+              return { items, rawCount, nextCursor };
+            },
+            pageSize: m.pageSize,
+            maxPages: effectiveMaxPages,
+            sleep,
+            jitter,
+            startAt: resumeThisPhase ? (state.scanCursor ?? 0) : 0,
+            initialItems: initialItems as ScanMessage[],
+            onPage: async (its, nextCursor) => {
+              await updateCurrentScan(scanSource, scanAccountId, {
+                scanPhaseIndex: phaseIndex,
+                scanCursor: nextCursor,
+                scanItems: its,
+                scanSelfId: selfId,
+              });
+            },
+          });
+          results.messages = items;
+        }
       } else {
         const items = await scanConnections<ScanConnection>({
           fetchPage: async (cursor) => {
@@ -920,7 +1046,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // NT-63 best-effort owner side-passes, AFTER the connection/message phases so
     // a failure here can never abort a completed connections scan. Each is wrapped
     // so a throw degrades to "no extra" rather than wedging the scan.
-    const extras: ScanExtras = {};
+    const extras: ScanExtras = { messageHistory: results.messageHistory };
     await assertCurrent();
     if (recipe.ownerProfile) {
       extras.ownerProfile = await runOwnerProfilePass(recipe, headers, fetchImpl).catch(() => undefined);
@@ -1063,6 +1189,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
       // A genuine fresh start → owe a recipe refresh (continueScan performs it).
       scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
       needs: null,
+      ...retrySourceState(current, src),
     });
     return true;
   });
@@ -1097,6 +1224,7 @@ async function initializeScanPlan(
       scanStartedAt: Date.now(),
       scanNeedsRecipeRefresh: refreshRecipes,
       needs: null,
+      ...retrySourceState(state, first),
     });
     armScanTick();
     return true;
@@ -1131,6 +1259,7 @@ async function drainScanQueue(): Promise<void> {
         scanStartedAt: Date.now(),
         scanNeedsRecipeRefresh: false,
         needs: null,
+        ...retrySourceState(state, candidate),
       });
       armScanTick();
       return candidate;
@@ -1171,6 +1300,9 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   const targets: string[] = [];
   for (const src of await grantedSources(recipesOf(state))) {
+    // A terminal failure requires a user retry (or a fresh permission grant).
+    // Re-pairing and scheduled scans must not restart the failed checkpoint.
+    if (state.scanFailures?.[src]) continue;
     // A pending payload means this source already scanned and its first-party
     // handoff has not confirmed yet. Re-scanning it cannot help: it only replaces
     // the pending payload and opens another handoff tab. This state guard is
@@ -1234,6 +1366,8 @@ async function buildStatus(): Promise<Record<string, unknown>> {
         source,
         networkLabel: recipe.networkLabel ?? source,
         targetOrigin: recipe.targetOrigin,
+        requiredOrigins: requiredOrigins(recipe),
+        failure: state.scanFailures?.[source]?.message ?? null,
         granted: isGranted,
         signedIn: isGranted ? await isSignedIn(recipe) : null,
         pending: state.pendingScans?.[source] != null,
@@ -1272,9 +1406,14 @@ async function handleExternal(
     case "pair": {
       // Store the per-source recipes + account and arm the three-day alarm. The
       // host permission is requested from a user gesture in the popup, not here.
-      // The served ARRAY → stored RECORD mapping is shared with the start-of-scan
-      // refresh (recipe-source.ts), so the two intake paths cannot drift.
-      const recipes = toRecipeRecord(recipeList(message.recipe, message.recipes));
+      // Pairing and refresh use the same atomic validation. Reject a malformed
+      // served recipe before changing the account, cache, alarms, or handoff tabs.
+      const parsed = parseServedRecipes(message);
+      if (!parsed) {
+        sendResponse({ ok: false, error: "invalid_recipe" });
+        return;
+      }
+      const { recipe, recipes } = parsed;
       const oldTabIds = await withAccountStateMutation(async () => {
         const prior = await getState();
         // During a mixed-version rollout an older noticed instance may omit id.
@@ -1291,7 +1430,7 @@ async function handleExternal(
             ])
           : new Set<number>();
         await setState({
-          recipe: message.recipe,
+          recipe,
           recipes,
           account: message.account,
           noticedOrigin: origin,
@@ -1308,6 +1447,9 @@ async function handleExternal(
                 lastScanCount: null,
                 lastScanStartedAt: null,
                 hadReplyByConversation: {},
+                scanFailures: {},
+                scanRetryCount: 0,
+                scanRetryAt: null,
                 needs: null,
                 scanInProgress: false,
                 scanSource: null,
@@ -1614,8 +1756,9 @@ export function registerListeners(): void {
       const state = await getState();
       if (state.scanInProgress) return;
       const recipes = recipesOf(state);
+      const granted = await grantedSources(recipes);
       const targets = Object.entries(recipes)
-        .filter(([, r]) => added.some((o) => grantCovers(o, r.targetOrigin)))
+        .filter(([source, r]) => granted.includes(source) && requiredOrigins(r).some((origin) => added.some((o) => grantCovers(o, origin))))
         .map(([src]) => src);
       // Grant is a user gesture that starts a real scan → refresh only the first
       // source; the persisted queue survives worker teardown between sources.

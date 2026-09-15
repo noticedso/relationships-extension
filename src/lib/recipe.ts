@@ -85,6 +85,8 @@ function composePictureUrl(element: unknown, fieldMap: FieldMap): string | null 
  * extension. There is no content field, so message text cannot be captured.
  */
 export type ScanMessage = {
+  messageId?: string;
+  conversationId?: string;
   counterpartProfileUrl: string;
   lastMessageAt: string; // ISO 8601
   direction: "sent" | "received";

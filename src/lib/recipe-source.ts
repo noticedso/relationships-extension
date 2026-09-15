@@ -16,6 +16,10 @@
  * source), so the two can never drift.
  */
 import type { ScanRecipe } from "./storage";
+import type { XHistoryConfig } from "./x-message-history";
+
+const HISTORY_PATHS = ["initialPath", "inboxPath", "requestsPath", "conversationPath",
+  "legacyInitialPath", "legacyInboxPath", "legacyConversationPath"] as const satisfies readonly (keyof XHistoryConfig)[];
 
 /** The first-party endpoint that serves the live scan recipes. */
 export const RECIPE_PATH = "/api/linkedin/extension/recipe";
@@ -27,12 +31,44 @@ export function sourceOf(recipe: ScanRecipe): string {
   return recipe.source ?? DEFAULT_SOURCE;
 }
 
+/** Every origin required by the recipe, including a separate history API host. */
+export function requiredOrigins(recipe: ScanRecipe): string[] {
+  const history = recipe.messages?.xHistory;
+  return [...new Set([recipe.targetOrigin, ...(history ? HISTORY_PATHS
+    .map((key) => new URL(history[key], recipe.targetOrigin).origin) : [])])];
+}
+
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.length > 0;
 }
 
 function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
+}
+
+function capturePattern(value: unknown): boolean {
+  if (typeof value !== "string" || !value.trim()) return false;
+  try {
+    new RegExp(value); // Check the exact expression resolveSelfId will compile.
+    // The empty alternative exposes capture slots without requiring a sample cookie.
+    return (new RegExp(`(?:${value})|`).exec("")?.length ?? 0) > 1;
+  } catch { return false; }
+}
+
+function eagerHistoryOwner(messages: Record<string, unknown>): boolean {
+  const cookie = messages.selfIdCookie as Record<string, unknown> | undefined;
+  const source = messages.selfIdSource as Record<string, unknown> | undefined;
+  const validCookie = cookie != null && typeof cookie === "object" && !Array.isArray(cookie)
+    && typeof cookie.name === "string" && !!cookie.name.trim() && capturePattern(cookie.pattern);
+  const validSource = source != null && typeof source === "object" && !Array.isArray(source)
+    && typeof source.listPathTemplate === "string" && source.listPathTemplate.startsWith("/")
+    && !source.listPathTemplate.startsWith("//")
+    && typeof source.idPath === "string" && !!source.idPath.trim()
+    && (source.extract === undefined || capturePattern(source.extract));
+  // Validate both configured alternatives so fallback cannot call malformed state.
+  if (messages.selfIdCookie !== undefined && !validCookie) return false;
+  if (messages.selfIdSource !== undefined && !validSource) return false;
+  return validCookie || validSource;
 }
 
 /**
@@ -49,6 +85,7 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
   const r = value as Record<string, unknown>;
 
   if (!isNonEmptyString(r.targetOrigin) || !r.targetOrigin.startsWith("https://")) return false;
+  try { if (new URL(r.targetOrigin).protocol !== "https:") return false; } catch { return false; }
   if (!isNonEmptyString(r.listPathTemplate)) return false;
 
   const pagination = r.paginationParams as Record<string, unknown> | undefined;
@@ -67,6 +104,26 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
     return false;
   }
 
+  const messages = r.messages as Record<string, unknown> | undefined;
+  if (messages?.xHistory !== undefined) {
+    if (!eagerHistoryOwner(messages)) return false;
+    const history = messages.xHistory;
+    if (!history || typeof history !== "object" || Array.isArray(history)) return false;
+    for (const key of HISTORY_PATHS) {
+      const path = (history as Record<string, unknown>)[key];
+      if (typeof path !== "string" || !path.trim()) return false;
+      const placeholder = key === "legacyInboxPath" ? "{timeline}"
+        : key === "legacyConversationPath" ? "{conversation}" : null;
+      if (placeholder && !path.split("#")[0]!.includes(placeholder)) return false;
+      try {
+        const url = new URL(path, r.targetOrigin);
+        if (url.protocol !== "https:") return false;
+        // Substitutions must affect the request path/query, not its host or fragment.
+        const request = url.pathname + url.search;
+        if (placeholder && !request.includes(placeholder) && !request.includes(encodeURIComponent(placeholder))) return false;
+      } catch { return false; }
+    }
+  }
   return true;
 }
 

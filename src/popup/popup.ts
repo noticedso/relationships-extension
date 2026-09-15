@@ -124,6 +124,8 @@ type SourceStatus = {
   source: string;
   networkLabel?: string;
   targetOrigin?: string;
+  requiredOrigins?: string[];
+  failure?: string | null;
   granted?: boolean;
   // Live cookie probe (getStatus): true/false for granted sources, null for
   // sources whose host permission isn't granted yet (unknown — grant flow owns
@@ -151,7 +153,7 @@ type Status = {
 /** Origins of every paired source, or just the recipe's (legacy single-source). */
 function sourceOrigins(status: Status): string[] {
   if (status.sources && status.sources.length > 0) {
-    return status.sources.map((s) => s.targetOrigin).filter((o): o is string => Boolean(o));
+    return [...new Set(status.sources.flatMap((s) => s.requiredOrigins ?? (s.targetOrigin ? [s.targetOrigin] : [])))];
   }
   return status.recipe?.targetOrigin ? [status.recipe.targetOrigin] : [];
 }
@@ -180,7 +182,7 @@ function networkList(status: Status): string {
 // actually does, naming the paired networks.
 function grantExplainerText(status: Status): string {
   const list = networkList(status);
-  return `“grant access” lets this extension read your ${list} connections and profiles: names, headlines, and profile links.`;
+  return `“grant access” lets this extension read your ${list} connections, profiles, and message metadata: participants, dates, direction, and replies. Message text stays out of the import.`;
 }
 
 function setText(root: Document | HTMLElement, id: string, text: string): void {
@@ -240,7 +242,10 @@ function buildNetworkRow(s: SourceStatus): HTMLLIElement {
 
   const text = document.createElement("span");
   text.className = "net-text";
-  if (s.lastScanAt != null) {
+  if (s.failure) {
+    li.classList.add("net-row--warn");
+    text.textContent = `${label} · ${s.failure}`;
+  } else if (s.lastScanAt != null) {
     text.textContent = `${label} · ${s.lastScanCount ?? 0} synced · ${formatShortDate(s.lastScanAt)}`;
   } else {
     text.textContent = `${label} · not synced yet`;
@@ -406,7 +411,8 @@ function render(root: Document | HTMLElement, status: Status): void {
     "what-we-fetch",
     `we read your ${list} connection ${listWord} — name, headline, profile link, ` +
       `connection date — as you, paced like a human, every three days. ` +
-      `we never read messages or anything else.`,
+      `we also import message metadata: participants, dates, direction, and replies. ` +
+      `message text stays out of the import.`,
   );
 
   setText(
@@ -550,6 +556,8 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
     if (lastScan) lastScan.hidden = hasNetworkRows;
     if (networkStatus) networkStatus.hidden = !hasNetworkRows;
     if (!granted && grantPatterns.length > 0) {
+      next.disabled = false;
+      if (spinner) spinner.hidden = true;
       next.textContent = "grant access";
       if (nextScan) nextScan.hidden = true;
       if (lastScan) lastScan.hidden = true;
@@ -584,7 +592,7 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
       // the idle "scan now" state is always clickable, and hide any leftover
       // spinner from a finished poll.
       next.disabled = false;
-      next.textContent = "scan now";
+      next.textContent = status.sources?.some((s) => s.failure) ? "retry scan" : "scan now";
       if (spinner) spinner.hidden = true;
       next.addEventListener("click", () => {
         // A real scan paces pagination over a minute+ and can outlive this popup:
