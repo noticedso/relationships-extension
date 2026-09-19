@@ -1485,19 +1485,24 @@ async function buildStatus(): Promise<Record<string, unknown>> {
   const sources = await Promise.all(
     Object.values(recipes).map(async (recipe) => {
       const source = sourceOf(recipe);
+      const aliases = source === "x" || source === "x_extension" ? ["x", "x_extension"] : [source];
+      const pendingSource = aliases.find((candidate) => state.pendingScans?.[candidate]);
+      const recoverySource = aliases.find((candidate) => state.syncRecovery?.[candidate]);
+      const failureSource = aliases.find((candidate) => state.scanFailures?.[candidate]);
+      const lastSource = aliases.find((candidate) => lastBy[candidate]);
       const isGranted = granted.includes(source);
       return {
         source,
         networkLabel: recipe.networkLabel ?? source,
         targetOrigin: recipe.targetOrigin,
         requiredOrigins: requiredOrigins(recipe),
-        failure: state.scanFailures?.[source]?.message ?? null,
-        recovery: state.syncRecovery?.[source]?.status ?? null,
+        failure: failureSource ? state.scanFailures?.[failureSource]?.message ?? null : null,
+        recovery: recoverySource ? state.syncRecovery?.[recoverySource]?.status ?? null : null,
         granted: isGranted,
         signedIn: isGranted ? await isSignedIn(recipe) : null,
-        pending: state.pendingScans?.[source] != null,
-        lastScanAt: lastBy[source]?.at ?? null,
-        lastScanCount: lastBy[source]?.count ?? null,
+        pending: pendingSource != null,
+        lastScanAt: lastSource ? lastBy[lastSource]?.at ?? null : null,
+        lastScanCount: lastSource ? lastBy[lastSource]?.count ?? null : null,
       };
     }),
   );
@@ -1691,21 +1696,24 @@ async function handleExternal(
         }
         if ((message.scanId !== undefined && pending.id !== message.scanId)
           || (message.accountId !== undefined && stableAccountId(state.account) !== message.accountId)) return null;
+        const aliases = src === "x" || src === "x_extension" ? ["x", "x_extension"] : [src];
         const syncRecovery = { ...state.syncRecovery };
-        delete syncRecovery[src];
         const scanFailures = { ...state.scanFailures };
-        delete scanFailures[src];
-        const count = pending.count;
         const pendingScans = { ...(state.pendingScans ?? {}) };
-        delete pendingScans[src];
+        const syncTabIds = { ...(state.syncTabIds ?? {}) };
+        for (const alias of aliases) {
+          delete syncRecovery[alias];
+          delete scanFailures[alias];
+          delete pendingScans[alias];
+          delete syncTabIds[alias];
+        }
+        const count = pending.count;
         const confirmedAt = Date.now();
         const lastScanBySource = {
           ...(state.lastScanBySource ?? {}),
           [src]: { at: confirmedAt, count },
         };
-        const syncTabIds = { ...(state.syncTabIds ?? {}) };
-        const tabId = syncTabIds[src] ?? state.syncTabId;
-        delete syncTabIds[src];
+        const tabId = aliases.map((alias) => state.syncTabIds?.[alias]).find((id) => id != null) ?? state.syncTabId;
         await setState({
           pendingScans,
           syncRecovery,

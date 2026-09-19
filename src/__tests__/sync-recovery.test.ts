@@ -191,3 +191,35 @@ it.each(["x_extension", "x"])("manual retry requested as %s clears the legacy im
     release?.(null); await settle();
   }
 });
+
+it.each([["x_extension", "x"], ["x", "x_extension"]])("shows %s upload recovery under the paired %s source until successful confirmation", async (legacy, current) => {
+  const paired = { ...recipe, source: current };
+  await seed(complete, {
+    recipe: paired, recipes: { [current]: paired },
+    pendingScans: { [legacy]: { source: legacy, ingestPath: recipe.ingestPath, payload: complete, count: 3, accountKey: "id:a1", id: "scan-1" } },
+    syncTabIds: { [legacy]: 42 },
+  });
+  let now = Date.now();
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const state = await browser().storage.local.get(null) as any;
+    await send({ type: "syncFailed", source: legacy, accountId: "a1", scanId: state.pendingScans[legacy].id, reason: "temporary" });
+    const status = await send({ type: "getOnboardingStatus" });
+    expect(status.sources).toEqual(expect.arrayContaining([expect.objectContaining({
+      source: current, pending: true, recovery: attempt < 3 ? "retrying" : "needs_attention",
+      failure: attempt < 3 ? null : expect.stringContaining("Try again"),
+    })]));
+    if (attempt < 3) {
+      now += 61_000;
+      browser().alarms.onAlarm.dispatch({ name: "handoff-retry" });
+      await settle();
+    }
+  }
+  registerListenersForTest(); await settle();
+  expect((await send({ type: "getOnboardingStatus" })).sources[0].recovery).toBe("needs_attention");
+  const state = await browser().storage.local.get(null) as any;
+  await send({ type: "syncConfirmed", source: legacy, accountId: "a1", scanId: state.pendingScans[legacy].id });
+  expect((await send({ type: "getOnboardingStatus" })).sources).toEqual(expect.arrayContaining([expect.objectContaining({
+    source: current, pending: false, recovery: null, failure: null, lastScanAt: now, lastScanCount: 3,
+  })]));
+});
