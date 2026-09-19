@@ -88,7 +88,7 @@ export function assembleScanPayload(
   const source = recipe.source ?? "linkedin_extension";
   const ingestPath = recipe.ingestPath ?? "/api/linkedin/import/extension";
 
-  if (source === "x") {
+  if (source === "x" || source === "x_extension") {
     const mutuals = connections.map((c) => ({
       accountId: (c.externalId ?? c.profileUrl) ?? "",
       handle: c.profileUrl,
