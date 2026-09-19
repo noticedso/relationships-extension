@@ -433,7 +433,7 @@ async function clearCurrentScan(
   extra?: { needs?: "network-signin" },
 ): Promise<void> {
   const state = await getState();
-  const failure = recipesOf(state)[source]?.messages?.xHistory
+  const failure = recipesOf(state)[source]?.messages?.xHistory || state.syncRecovery?.[source]
     ? historyFailureState(state, source, extra?.needs === "network-signin"
       ? "Sign in to the network, then retry the scan."
       : "History collection timed out. Retry the scan.")
@@ -449,7 +449,9 @@ class HistoryFetchError extends Error {
 function historyFailureState(state: Partial<State>, source: string, message: string, recipe = recipesOf(state)[source]): Partial<State> {
   const checkpoint = state.scanItems?.[0] as XHistoryCheckpoint | undefined;
   const accountId = accountKey(state.account);
-  return { scanFailures: { ...state.scanFailures, [source]: {
+  return {
+    ...(state.syncRecovery?.[source] ? { syncRecovery: { ...state.syncRecovery, [source]: { ...state.syncRecovery[source], status: "needs_attention", retryAt: undefined } } } : {}),
+    scanFailures: { ...state.scanFailures, [source]: {
     message, ...(checkpoint?.version === 1 ? { checkpoint } : {}),
     ...(checkpoint?.version === 1 && accountId && recipe && state.scanPhaseIndex != null && state.scanPhaseResults
       ? { resume: { accountId, recipe, phaseIndex: state.scanPhaseIndex, phaseResults: state.scanPhaseResults } } : {}),
@@ -490,7 +492,7 @@ function historyFailureMessage(error: unknown): string {
   if (code === "x_history_permission_required") return "Grant access in the extension, then retry the scan.";
   if (code === "x_history_account_changed") return "The signed-in network account changed. Sign in to the original account and retry.";
   if (code === "x_history_message_limit" || code === "x_history_page_limit") return "This history exceeds the browser scan limit. Contact contact@noticed.so for help.";
-  return "History collection stopped before it was complete. Retry the scan; update the extension if it keeps failing.";
+  return "We couldn't finish this import. Try again.";
 }
 
 function armScanTick(): void {

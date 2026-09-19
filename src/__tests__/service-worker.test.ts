@@ -2567,6 +2567,18 @@ describe("X history handoff", () => {
     expect((await chrome.storage.local.get(null)).lastScanAt).toBeTypeOf("number");
   });
 
+  it("a malformed fresh history response persists retry guidance without an update diagnosis", async () => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const fetchImpl = vi.fn(async () => ({ ok:true, json:async () => ({ malformed:true }) }) as Response);
+    expect(await sw.continueScan({fetchImpl})).toMatchObject({note:"history-failed"});
+    const state = await chrome.storage.local.get(null) as any;
+    expect(state.scanFailures.x.message).toMatch(/retry|try again/i);
+    expect(state.scanFailures.x.message).not.toMatch(/update/i);
+    expect(state.pendingScans?.x).toBeUndefined();
+    expect(state.lastScanAt).toBeUndefined();
+  });
+
   it("requires the Chat subdomain grant on existing installations before any history fetch", async () => {
     const chrome = await prepareHistory();
     vi.spyOn(chrome.permissions, "contains").mockImplementation(async (permission) =>

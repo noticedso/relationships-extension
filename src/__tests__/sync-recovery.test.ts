@@ -124,3 +124,19 @@ it("obsolete data without a source recipe stops with a useful failure", async ()
   await settle();
   expect((await browser().storage.local.get(null)).syncRecovery).toMatchObject({x:{status:"needs_attention"}});
 });
+
+it("an obsolete import with an old recipe and expired session stays actionable across restart and pair", async () => {
+  await seed(incomplete as typeof complete, { lastScanStartedAt: Date.now() });
+  vi.spyOn(browser().cookies, "get").mockResolvedValue(null);
+  browser().runtime.onInstalled.dispatch({ reason:"update",previousVersion:"1.2.15" });
+  await settle();
+  let state = await browser().storage.local.get(null);
+  expect(state.scanInProgress).toBe(false);
+  expect(state.syncRecovery).toMatchObject({x:{status:"needs_attention"}});
+  expect(state.scanFailures).toMatchObject({x:{message:expect.stringContaining("Sign in")}});
+  registerListenersForTest(); await settle();
+  await send({type:"pair",recipe,account}); await settle();
+  state = await browser().storage.local.get(null);
+  expect(state.syncRecovery).toMatchObject({x:{status:"needs_attention"}});
+  expect(state.scanInProgress).toBe(false);
+});
