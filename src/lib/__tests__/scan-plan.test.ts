@@ -124,6 +124,25 @@ describe("assembleScanPayload", () => {
     expect(out.count).toBe(2); // 1 mutual + 1 message
   });
 
+  it("X: preserves the complete-history payload for the legacy x_extension recipe alias", () => {
+    const out = assembleScanPayload(
+      { ...xRecipe, source: "x_extension" },
+      [[conn("bob", "2")], [conn("bob", "2")]],
+      [{ counterpartProfileUrl: "2", messageId: "m1", conversationId: "1-2", lastMessageAt: "2026-06-20T10:30:00.000Z", direction: "received" }],
+      "owner-99",
+      { messageHistory: { version: 1, complete: true } },
+    );
+
+    expect(out.payload).toMatchObject({
+      source: "x_extension",
+      ownerAccountId: "owner-99",
+      mutuals: [{ accountId: "2", handle: "bob" }],
+      messages: [{ counterpartAccountId: "2", messageId: "m1", conversationId: "1-2" }],
+      messageHistory: { version: 1, complete: true },
+    });
+    expect(out.payload).not.toHaveProperty("connections");
+  });
+
   it("X: carries had_reply through onto the re-mapped messages (NT-107), omitting it when absent", () => {
     const following = [conn("alice", "1"), conn("bob", "2")];
     const followers = [conn("bob", "2"), conn("dave", "4")];

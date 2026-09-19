@@ -6,54 +6,21 @@
 // `status.recipe.networkLabel`, so this extension stays platform-agnostic.
 
 const REPO_URL = "https://github.com/noticedso/relationships-extension";
-const LATEST_RELEASE_API = "https://api.github.com/repos/noticedso/relationships-extension/releases/latest";
-// The "update available" notice sends users to the Chrome Web Store listing (the
-// canonical install/update surface), not the raw GitHub .zip — store installs
-// auto-update, and anyone behind gets the one-click store update from here.
-const WEB_STORE_URL =
-  "https://chromewebstore.google.com/detail/noticed%20Relationships/hjckpjgbhjichgkbmgjfbbdibchghdaf";
-
-// Numeric semver compare. Strips a leading "v", splits on ".", compares parts.
-// Returns >0 if a is newer than b, <0 if older, 0 if equal.
-function compareSemver(a: string, b: string): number {
-  const parse = (v: string) =>
-    v
-      .replace(/^v/, "")
-      .split(".")
-      .map((p) => Number.parseInt(p, 10) || 0);
-  const pa = parse(a);
-  const pb = parse(b);
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
-// Best-effort: ask GitHub for the latest release and reveal an "update available"
-// notice when the installed version is behind. For GitHub / load-unpacked users
-// who don't auto-update. The releases API returns `Access-Control-Allow-Origin: *`,
-// so this works from a popup with no host permission. Never throws.
+// Chrome knows whether an update is available for this installation. A GitHub
+// release may still be awaiting Web Store review, so it is not update evidence.
 async function checkForUpdate(root: Document | HTMLElement): Promise<void> {
-  if (typeof chrome === "undefined" || !chrome.runtime?.getManifest) return;
-  const notice = root.querySelector<HTMLAnchorElement>("#update-notice");
+  if (typeof chrome === "undefined" || !chrome.runtime?.requestUpdateCheck) return;
+  const notice = root.querySelector<HTMLElement>("#update-notice");
   if (!notice) return;
   try {
-    const installed = chrome.runtime.getManifest().version;
-    const res = await fetch(LATEST_RELEASE_API, {
-      headers: { Accept: "application/vnd.github+json" },
-    });
-    if (!res.ok) return;
-    const data = (await res.json()) as { tag_name?: string };
-    const latest = data?.tag_name;
-    if (!latest || typeof latest !== "string") return;
-    if (compareSemver(latest, installed) > 0) {
-      notice.href = WEB_STORE_URL;
+    const result = await chrome.runtime.requestUpdateCheck();
+    if (result.status === "update_available") {
+      notice.textContent = "An update is ready. Restart Chrome to finish updating.";
+      notice.removeAttribute("href");
       notice.hidden = false;
     }
   } catch {
-    // best-effort — leave the notice hidden on any fetch/parse error
+    // Offline and throttled checks leave the notice hidden.
   }
 }
 
@@ -126,6 +93,7 @@ type SourceStatus = {
   targetOrigin?: string;
   requiredOrigins?: string[];
   failure?: string | null;
+  recovery?: "retrying" | "needs_attention" | null;
   granted?: boolean;
   // Live cookie probe (getStatus): true/false for granted sources, null for
   // sources whose host permission isn't granted yet (unknown — grant flow owns
@@ -245,6 +213,8 @@ function buildNetworkRow(s: SourceStatus): HTMLLIElement {
   if (s.failure) {
     li.classList.add("net-row--warn");
     text.textContent = `${label} · ${s.failure}`;
+  } else if (s.recovery === "retrying") {
+    text.textContent = `${label} · retrying automatically`;
   } else if (s.lastScanAt != null) {
     text.textContent = `${label} · ${s.lastScanCount ?? 0} synced · ${formatShortDate(s.lastScanAt)}`;
   } else {

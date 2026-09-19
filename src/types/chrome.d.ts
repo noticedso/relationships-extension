@@ -13,6 +13,7 @@ declare const chrome: {
     id: string;
     sendMessage(message: unknown): Promise<unknown>;
     getManifest(): { version: string };
+    requestUpdateCheck(): Promise<{ status: "throttled" | "no_update" | "update_available"; version?: string }>;
     onMessage: ChromeEvent<[unknown, { id?: string; origin?: string; url?: string }, SendResponse]>;
     onMessageExternal: ChromeEvent<
       [unknown, { id?: string; origin?: string; url?: string }, SendResponse]

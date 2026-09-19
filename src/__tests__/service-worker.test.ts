@@ -2533,6 +2533,52 @@ describe("X history handoff", () => {
     return chrome;
   }
 
+  it.each(["upgrade", "pair"])("%s recovers cached history through fresh collection and confirmation", async (entry) => {
+    const chrome = await prepareHistory();
+    const r = completeHistoryRecipe();
+    await chrome.storage.local.set({ scanInProgress: false, scanQueue: [], pendingScans: { x: {
+      source: "x", ingestPath: r.ingestPath, payload: { mutuals: [], messages: [] }, count: 0, accountKey: "id:acct-1",
+    } }, lastScanStartedAt: Date.now() });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const pages: Record<string, unknown> = {
+      [RECIPE_PATH]: { recipe: r, recipes: [r], account },
+      "/api/connections": { elements: [] },
+      "/initial": { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } },
+      "/requests": { data: { get_message_requests_page: { message_request_items: [], cursor: { __typename: "XChatGetMessageRequestsPageEndCursor", pull_finished: true } } } },
+      "/legacy": { inbox_initial_state: { entries: [], conversations: {}, inbox_timelines: { trusted: { status: "AT_END" }, untrusted: { status: "AT_END" } } } },
+    };
+    globalThis.fetch = vi.fn(async input => {
+      const path = new URL(String(input)).pathname;
+      if (!pages[path]) throw new Error(`Unexpected ${path}`);
+      return { ok:true, json:async () => pages[path] } as Response;
+    });
+    if (entry === "upgrade") chrome.runtime.onInstalled.dispatch({ reason:"update", previousVersion:"1.2.15" });
+    else await dispatchExternal({type:"pair",recipe:r,recipes:[r],account},noticedSender);
+    await vi.waitFor(async () => {
+      chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
+      const state = await chrome.storage.local.get(null);
+      expect(state.pendingScans).toMatchObject({x:{payload:{messageHistory:{version:1,complete:true}}}});
+    });
+    const state = await chrome.storage.local.get(null) as any;
+    expect(state.lastScanAt).toBeUndefined();
+    await dispatchExternal({type:"syncConfirmed",source:"x",accountId:account.id,scanId:state.pendingScans.x.id},noticedSender);
+    expect((await chrome.storage.local.get(null)).pendingScans).toEqual({});
+    expect((await chrome.storage.local.get(null)).syncRecovery).toEqual({});
+    expect((await chrome.storage.local.get(null)).lastScanAt).toBeTypeOf("number");
+  });
+
+  it("a malformed fresh history response persists retry guidance without an update diagnosis", async () => {
+    const chrome = await prepareHistory();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const fetchImpl = vi.fn(async () => ({ ok:true, json:async () => ({ malformed:true }) }) as Response);
+    expect(await sw.continueScan({fetchImpl})).toMatchObject({note:"history-failed"});
+    const state = await chrome.storage.local.get(null) as any;
+    expect(state.scanFailures.x.message).toMatch(/retry|try again/i);
+    expect(state.scanFailures.x.message).not.toMatch(/update/i);
+    expect(state.pendingScans?.x).toBeUndefined();
+    expect(state.lastScanAt).toBeUndefined();
+  });
+
   it("requires the Chat subdomain grant on existing installations before any history fetch", async () => {
     const chrome = await prepareHistory();
     vi.spyOn(chrome.permissions, "contains").mockImplementation(async (permission) =>

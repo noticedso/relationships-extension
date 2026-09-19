@@ -44,6 +44,7 @@ const SCAN_PERIOD_MINUTES = 3 * 24 * 60;
 const SCAN_PERIOD_MS = SCAN_PERIOD_MINUTES * 60 * 1000;
 const SCAN_THROTTLE_MS = SCAN_PERIOD_MS;
 const SYNC_PATH = "/x/sync";
+const HANDOFF_RETRY_ALARM = "handoff-retry";
 
 const SCAN_TICK_ALARM = "scan-tick";
 const SCAN_TICK_PERIOD_MINUTES = 0.5;
@@ -67,7 +68,9 @@ type ExternalMessage =
   | { type: "pair"; recipe: ScanRecipe; recipes?: ScanRecipe[]; account: Account }
   | { type: "getOnboardingStatus" }
   | { type: "getCachedScan"; source?: string; accountId?: string }
-  | { type: "syncConfirmed"; source?: string };
+  | { type: "syncConfirmed"; source?: string; accountId?: string; scanId?: string }
+  | { type: "syncFailed"; source: string; accountId: string; scanId: string; reason: "temporary" | "history-incomplete" | "reconnect" | "failed" }
+  | { type: "retrySync"; source: string; accountId: string };
 
 type InternalMessage =
   | { type: "getStatus" }
@@ -116,6 +119,12 @@ function recipeForSource(
   return recipes[source]
     ?? (source === "x" ? recipes.x_extension : undefined)
     ?? (source === "x_extension" ? recipes.x : undefined);
+}
+
+function sourceAliases(source: string): string[] {
+  return source === "x" || source === "x_extension"
+    ? ["x", "x_extension"]
+    : [source];
 }
 
 /** Preserve cached payloads while rebinding their upload destination to the
@@ -430,7 +439,7 @@ async function clearCurrentScan(
   extra?: { needs?: "network-signin" },
 ): Promise<void> {
   const state = await getState();
-  const failure = recipesOf(state)[source]?.messages?.xHistory
+  const failure = recipesOf(state)[source]?.messages?.xHistory || state.syncRecovery?.[source]
     ? historyFailureState(state, source, extra?.needs === "network-signin"
       ? "Sign in to the network, then retry the scan."
       : "History collection timed out. Retry the scan.")
@@ -446,7 +455,9 @@ class HistoryFetchError extends Error {
 function historyFailureState(state: Partial<State>, source: string, message: string, recipe = recipesOf(state)[source]): Partial<State> {
   const checkpoint = state.scanItems?.[0] as XHistoryCheckpoint | undefined;
   const accountId = accountKey(state.account);
-  return { scanFailures: { ...state.scanFailures, [source]: {
+  return {
+    ...(state.syncRecovery?.[source] ? { syncRecovery: { ...state.syncRecovery, [source]: { ...state.syncRecovery[source], status: "needs_attention", retryAt: undefined } } } : {}),
+    scanFailures: { ...state.scanFailures, [source]: {
     message, ...(checkpoint?.version === 1 ? { checkpoint } : {}),
     ...(checkpoint?.version === 1 && accountId && recipe && state.scanPhaseIndex != null && state.scanPhaseResults
       ? { resume: { accountId, recipe, phaseIndex: state.scanPhaseIndex, phaseResults: state.scanPhaseResults } } : {}),
@@ -487,7 +498,7 @@ function historyFailureMessage(error: unknown): string {
   if (code === "x_history_permission_required") return "Grant access in the extension, then retry the scan.";
   if (code === "x_history_account_changed") return "The signed-in network account changed. Sign in to the original account and retry.";
   if (code === "x_history_message_limit" || code === "x_history_page_limit") return "This history exceeds the browser scan limit. Contact contact@noticed.so for help.";
-  return "History collection stopped before it was complete. Retry the scan; update the extension if it keeps failing.";
+  return "We couldn't finish this import. Try again.";
 }
 
 function armScanTick(): void {
@@ -1111,6 +1122,7 @@ async function finalizeScan(
 
     clearScanTick();
     const pending: PendingScan = {
+      id: crypto.randomUUID(),
       source,
       ingestPath,
       payload,
@@ -1257,7 +1269,7 @@ async function drainScanQueue(): Promise<void> {
         scanPhaseResults: { connLists: [], messages: [] },
         scanSelfId: null,
         scanStartedAt: Date.now(),
-        scanNeedsRecipeRefresh: false,
+        scanNeedsRecipeRefresh: state.syncRecovery?.[candidate]?.status === "retrying",
         needs: null,
         ...retrySourceState(state, candidate),
       });
@@ -1297,22 +1309,133 @@ async function continueScanPlan(): Promise<void> {
  */
 async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promise<void> {
   const state = await getState();
+  if (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0) return;
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   const targets: string[] = [];
   for (const src of await grantedSources(recipesOf(state))) {
+    const aliases = sourceAliases(src);
     // A terminal failure requires a user retry (or a fresh permission grant).
     // Re-pairing and scheduled scans must not restart the failed checkpoint.
-    if (state.scanFailures?.[src]) continue;
+    if (aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias])) continue;
     // A pending payload means this source already scanned and its first-party
     // handoff has not confirmed yet. Re-scanning it cannot help: it only replaces
     // the pending payload and opens another handoff tab. This state guard is
     // stronger than the timestamp throttle and also covers legacy installs where
     // lastScanStartedAt was never persisted.
-    if (state.pendingScans?.[src]) continue;
+    if (aliases.some((alias) => state.pendingScans?.[alias])) continue;
     targets.push(src);
   }
   if (targets.length === 0) return;
   if (await initializeScanPlan(targets, opts.refreshRecipes)) await continueScanPlan();
+}
+
+function isIncompleteX(pending: PendingScan): boolean {
+  if (pending.source !== "x" && pending.source !== "x_extension") return false;
+  const history = pending.payload.messageHistory as { version?: number; complete?: boolean } | undefined;
+  const messages = pending.payload.messages;
+  return history?.version !== 1 || history.complete !== true || !Array.isArray(messages)
+    || !messages.every(m => m && typeof m.messageId === "string" && m.messageId.trim()
+      && typeof m.conversationId === "string" && /^\d+[-:]\d+$/.test(m.conversationId));
+}
+
+async function queueUserRetry(source: string, accountId: string): Promise<boolean> {
+  return withAccountStateMutation(async () => {
+    const state = await getState();
+    const recipes = recipesOf(state);
+    const recipe = recipeForSource(recipes, source);
+    if (stableAccountId(state.account) !== accountId || !recipe || state.scanInProgress) return false;
+    const scanSource = sourceOf(recipe);
+    const aliases = (source === "x" || source === "x_extension" ? ["x", "x_extension"] : [source])
+      .filter(candidate => recipeForSource(recipes, candidate) === recipe);
+    const recovery = { ...state.syncRecovery };
+    const pending = { ...state.pendingScans };
+    const tabIds = { ...state.syncTabIds };
+    const retryState = retrySourceState(state, scanSource);
+    const scanFailures = { ...retryState.scanFailures };
+    const closingTabs = new Set<number>();
+    for (const alias of aliases) {
+      delete recovery[alias];
+      delete pending[alias];
+      delete scanFailures[alias];
+      if (tabIds[alias] != null) closingTabs.add(tabIds[alias]);
+      delete tabIds[alias];
+    }
+    recovery[scanSource] = { rescans: 0, uploads: 0, status: "retrying" };
+    await setState({ ...retryState, scanFailures, syncRecovery: recovery, pendingScans: pending, syncTabIds: tabIds,
+      ...(state.syncTabId != null && closingTabs.has(state.syncTabId) ? { syncTabId: null } : {}),
+      scanQueue: [...new Set([...(state.scanQueue ?? []).filter(candidate => !aliases.includes(candidate)), scanSource])] });
+    for (const tabId of closingTabs) await chrome.tabs.remove(tabId).catch(() => {});
+    return true;
+  });
+}
+
+async function recoverFailedUpload(message: {
+  source: string; accountId: string; scanId: string;
+  reason: "temporary" | "history-incomplete" | "reconnect" | "failed";
+}): Promise<{ ok: boolean; recovery?: "retrying" | "needs_attention" }> {
+  const result = await withAccountStateMutation(async () => {
+    const state = await getState();
+    const source = message.source;
+    const pending = state.pendingScans?.[source];
+    if (!pending || stableAccountId(state.account) !== message.accountId
+      || !accountOwnsKey(state.account, pending.accountKey ?? null) || pending.id !== message.scanId) return { ok: false };
+    const recipe = recipeForSource(recipesOf(state), source);
+    const recipeSource = recipe ? sourceOf(recipe) : source;
+    const previous = state.syncRecovery?.[source] ?? state.syncRecovery?.[recipeSource] ?? { rescans: 0, uploads: 0, status: "retrying" as const };
+    if (previous.status === "needs_attention" || (previous.retryAt ?? 0) > Date.now()) {
+      return { ok: true, recovery: previous.status };
+    }
+    const rescan = message.reason === "history-incomplete" && previous.rescans < 1 && Boolean(recipe);
+    const retry = message.reason === "temporary" && previous.uploads < 2;
+    const status = rescan || retry ? "retrying" as const : "needs_attention" as const;
+    const retryAt = retry ? Date.now() + 30_000 * (previous.uploads + 1) : undefined;
+    const recovery = { rescans: previous.rescans + Number(rescan), uploads: previous.uploads + Number(retry), status, retryAt };
+    const pendingScans = { ...state.pendingScans };
+    if (rescan) delete pendingScans[source];
+    const tabIds = { ...state.syncTabIds };
+    const tabId = tabIds[source] ?? (Object.keys(tabIds).length === 0 && Object.keys(state.pendingScans ?? {}).length === 1 ? state.syncTabId : null);
+    delete tabIds[source];
+    const scanFailures = { ...state.scanFailures };
+    if (status === "needs_attention") scanFailures[source] = { message: message.reason === "reconnect"
+      ? "Sign in to the network, then try again."
+      : "We couldn't finish this import. Try again." };
+    const syncRecovery = { ...state.syncRecovery };
+    // The replacement scan and its status must use the paired recipe's key.
+    // Move the budget too, so switching aliases cannot grant another rescan.
+    if (rescan) {
+      delete syncRecovery[source];
+      delete scanFailures[source];
+    }
+    syncRecovery[rescan ? recipeSource : source] = recovery;
+    await setState({ pendingScans, syncRecovery,
+      scanFailures, syncTabIds: tabIds, ...(tabId === state.syncTabId ? { syncTabId: null } : {}),
+      needs: null,
+      ...(rescan ? { scanQueue: [...new Set([...(state.scanQueue ?? []).filter(candidate => candidate !== source), recipeSource])] } : {}) });
+    if (retryAt) chrome.alarms.create(HANDOFF_RETRY_ALARM, { when: retryAt });
+    if (tabId != null) await chrome.tabs.remove(tabId).catch(() => {});
+    return { ok: true, recovery: status };
+  });
+  if (result.ok) void drainScanQueue();
+  return result;
+}
+
+async function recoverObsoleteHistory(): Promise<void> {
+  const state = await getState();
+  for (const pending of Object.values(state.pendingScans ?? {})) {
+    if (!isIncompleteX(pending) || !accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
+    const accountId = stableAccountId(state.account);
+    if (!accountId) continue;
+    // Bind legacy data before recovery; the failure transition verifies it again.
+    const id = await withAccountStateMutation(async () => {
+      const current = await getState();
+      const item = current.pendingScans?.[pending.source];
+      if (stableAccountId(current.account) !== accountId || !item || !isIncompleteX(item)) return null;
+      item.id ??= crypto.randomUUID();
+      await setState({ pendingScans: { ...current.pendingScans, [pending.source]: item } });
+      return item.id;
+    });
+    if (id) await recoverFailedUpload({ source: pending.source, accountId, scanId: id, reason: "history-incomplete" });
+  }
 }
 
 async function reconcilePendingHandoffs(origin: string): Promise<void> {
@@ -1320,6 +1443,12 @@ async function reconcilePendingHandoffs(origin: string): Promise<void> {
     const state = await getState();
     const tabIds = { ...(state.syncTabIds ?? {}) };
     for (const pending of Object.values(state.pendingScans ?? {})) {
+      const recovery = state.syncRecovery?.[pending.source];
+      if (recovery?.status === "needs_attention") continue;
+      if (recovery?.retryAt && recovery.retryAt > Date.now()) {
+        chrome.alarms.create(HANDOFF_RETRY_ALARM, { when: recovery.retryAt });
+        continue;
+      }
       if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
       const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
       const existingTabId = tabIds[pending.source];
@@ -1332,6 +1461,8 @@ async function reconcilePendingHandoffs(origin: string): Promise<void> {
           delete tabIds[pending.source];
         }
       }
+      pending.id = crypto.randomUUID();
+      await setState({ pendingScans: { ...state.pendingScans, [pending.source]: pending } });
       const tab = await chrome.tabs.create({
         url: handoffUrl,
         active: false,
@@ -1344,7 +1475,7 @@ async function reconcilePendingHandoffs(origin: string): Promise<void> {
 
 async function openPendingHandoffs(origin: string): Promise<void> {
   if (handoffReconcile) return handoffReconcile;
-  const reconcile = reconcilePendingHandoffs(origin);
+  const reconcile = recoverObsoleteHistory().then(() => reconcilePendingHandoffs(origin));
   handoffReconcile = reconcile;
   try {
     await reconcile;
@@ -1361,18 +1492,24 @@ async function buildStatus(): Promise<Record<string, unknown>> {
   const sources = await Promise.all(
     Object.values(recipes).map(async (recipe) => {
       const source = sourceOf(recipe);
+      const aliases = source === "x" || source === "x_extension" ? ["x", "x_extension"] : [source];
+      const pendingSource = aliases.find((candidate) => state.pendingScans?.[candidate]);
+      const recoverySource = aliases.find((candidate) => state.syncRecovery?.[candidate]);
+      const failureSource = aliases.find((candidate) => state.scanFailures?.[candidate]);
+      const lastSource = aliases.find((candidate) => lastBy[candidate]);
       const isGranted = granted.includes(source);
       return {
         source,
         networkLabel: recipe.networkLabel ?? source,
         targetOrigin: recipe.targetOrigin,
         requiredOrigins: requiredOrigins(recipe),
-        failure: state.scanFailures?.[source]?.message ?? null,
+        failure: failureSource ? state.scanFailures?.[failureSource]?.message ?? null : null,
+        recovery: recoverySource ? state.syncRecovery?.[recoverySource]?.status ?? null : null,
         granted: isGranted,
         signedIn: isGranted ? await isSignedIn(recipe) : null,
-        pending: state.pendingScans?.[source] != null,
-        lastScanAt: lastBy[source]?.at ?? null,
-        lastScanCount: lastBy[source]?.count ?? null,
+        pending: pendingSource != null,
+        lastScanAt: lastSource ? lastBy[lastSource]?.at ?? null : null,
+        lastScanCount: lastSource ? lastBy[lastSource]?.count ?? null : null,
       };
     }),
   );
@@ -1401,7 +1538,7 @@ async function handleExternal(
 ): Promise<void> {
   switch (message.type) {
     case "ping":
-      sendResponse({ ok: true });
+      sendResponse({ ok: true, syncRecovery: 1, xHistory: 1 });
       return;
     case "pair": {
       // Store the per-source recipes + account and arm the three-day alarm. The
@@ -1448,6 +1585,7 @@ async function handleExternal(
                 lastScanStartedAt: null,
                 hadReplyByConversation: {},
                 scanFailures: {},
+                syncRecovery: {},
                 scanRetryCount: 0,
                 scanRetryAt: null,
                 needs: null,
@@ -1499,6 +1637,7 @@ async function handleExternal(
       return;
     }
     case "getCachedScan": {
+      await recoverObsoleteHistory();
       const cached = await withAccountStateMutation(async () => {
         const state = await getState();
         const requestedAccountId =
@@ -1511,6 +1650,11 @@ async function handleExternal(
         const pending = src
           ? state.pendingScans?.[src]
           : Object.values(state.pendingScans ?? {})[0];
+        const recoveryRecipe = src ? recipeForSource(recipesOf(state), src) : undefined;
+        const recoverySource = src && state.syncRecovery?.[src] ? src : recoveryRecipe ? sourceOf(recoveryRecipe) : src;
+        if (!pending && requestedAccountId === currentAccountId && recoverySource && state.syncRecovery?.[recoverySource]) {
+          return { accountId: currentAccountId, source: recoverySource, recovery: state.scanFailures?.[recoverySource] ? "needs_attention" : state.syncRecovery[recoverySource].status };
+        }
         if (
           !pending
           || !currentAccountId
@@ -1519,7 +1663,12 @@ async function handleExternal(
         ) {
           return null;
         }
+        if (!pending.id) {
+          pending.id = crypto.randomUUID();
+          await setState({ pendingScans: { ...state.pendingScans, [pending.source]: pending } });
+        }
         return {
+          scanId: pending.id,
           source: pending.source,
           accountId: currentAccountId,
           ingestPath: pending.ingestPath,
@@ -1533,6 +1682,17 @@ async function handleExternal(
       sendResponse(cached);
       return;
     }
+    case "syncFailed": {
+      const result = await recoverFailedUpload(message);
+      sendResponse(result);
+      return;
+    }
+    case "retrySync": {
+      const accepted = await queueUserRetry(message.source, message.accountId);
+      sendResponse({ ok: accepted });
+      if (accepted) void drainScanQueue();
+      return;
+    }
     case "syncConfirmed": {
       const confirmed = await withAccountStateMutation(async () => {
         const state = await getState();
@@ -1541,19 +1701,30 @@ async function handleExternal(
         if (!src || !pending || !accountOwnsKey(state.account, pending.accountKey ?? null)) {
           return null;
         }
-        const count = pending.count;
+        if ((message.scanId !== undefined && pending.id !== message.scanId)
+          || (message.accountId !== undefined && stableAccountId(state.account) !== message.accountId)) return null;
+        const aliases = src === "x" || src === "x_extension" ? ["x", "x_extension"] : [src];
+        const syncRecovery = { ...state.syncRecovery };
+        const scanFailures = { ...state.scanFailures };
         const pendingScans = { ...(state.pendingScans ?? {}) };
-        delete pendingScans[src];
+        const syncTabIds = { ...(state.syncTabIds ?? {}) };
+        for (const alias of aliases) {
+          delete syncRecovery[alias];
+          delete scanFailures[alias];
+          delete pendingScans[alias];
+          delete syncTabIds[alias];
+        }
+        const count = pending.count;
         const confirmedAt = Date.now();
         const lastScanBySource = {
           ...(state.lastScanBySource ?? {}),
           [src]: { at: confirmedAt, count },
         };
-        const syncTabIds = { ...(state.syncTabIds ?? {}) };
-        const tabId = syncTabIds[src] ?? state.syncTabId;
-        delete syncTabIds[src];
+        const tabId = aliases.map((alias) => state.syncTabIds?.[alias]).find((id) => id != null) ?? state.syncTabId;
         await setState({
           pendingScans,
+          syncRecovery,
+          scanFailures,
           lastScanBySource,
           needs: null,
           lastScanAt: confirmedAt,
@@ -1564,7 +1735,7 @@ async function handleExternal(
         return { tabId };
       });
       if (confirmed?.tabId != null) await chrome.tabs.remove(confirmed.tabId).catch(() => {});
-      sendResponse({ ok: true });
+      sendResponse({ ok: confirmed !== null });
       return;
     }
   }
@@ -1589,6 +1760,12 @@ async function handleInternal(
       // SYNCHRONOUSLY — before the CSRF cookie round-trip in runScan — and ack
       // immediately, so the popup's first getStatus after this ack already reads
       // scanning:true and its poller doesn't bail to idle while the scan runs.
+      await withAccountStateMutation(async () => {
+        const current = await getState();
+        const syncRecovery = { ...current.syncRecovery };
+        for (const source of list) delete syncRecovery[source];
+        await setState({ syncRecovery });
+      });
       const started = await initializeScanPlan(list, true);
       sendResponse({ ok: true });
 
@@ -1689,6 +1866,7 @@ export function registerListeners(): void {
   // pushing the next scan further out on every reconcile.
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
+      await recoverObsoleteHistory();
       const existing = await chrome.alarms.get(SCAN_ALARM);
       if (existing && existing.periodInMinutes === SCAN_PERIOD_MINUTES) return;
       const { lastScanAt } = await getState();
@@ -1735,6 +1913,10 @@ export function registerListeners(): void {
         }
         await continueScanPlan();
       })();
+      return;
+    }
+    if (alarm.name === HANDOFF_RETRY_ALARM) {
+      void getState().then(async state => { if (state.noticedOrigin) await openPendingHandoffs(state.noticedOrigin); });
       return;
     }
     if (alarm.name !== SCAN_ALARM) return;
