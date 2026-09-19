@@ -105,6 +105,8 @@ export type Needs = "network-signin" | "noticed-signin" | null;
 /** A finished, source-shaped scan awaiting the first-party POST. The payload is
  *  the EXACT body for `ingestPath`; the broker just posts it (no per-source logic). */
 export type PendingScan = {
+  /** Correlates acknowledgements to this exact upload. */
+  id?: string;
   source: string;
   ingestPath: string;
   payload: Record<string, unknown>;
@@ -113,7 +115,15 @@ export type PendingScan = {
   accountKey?: string | null;
 };
 
+export type SyncRecovery = {
+  rescans: number;
+  uploads: number;
+  status: "retrying" | "needs_attention";
+  retryAt?: number;
+};
+
 export type State = {
+  syncRecovery?: Record<string, SyncRecovery> | null;
   /** Back-compat single recipe (the LinkedIn one). New code reads `recipes`. */
   recipe: ScanRecipe | null;
   /** Per-source recipes, keyed by `recipe.source` (NT-45 multi-network). */
@@ -200,6 +210,7 @@ export type State = {
 };
 
 const KEYS: (keyof State)[] = [
+  "syncRecovery",
   "recipe",
   "recipes",
   "account",

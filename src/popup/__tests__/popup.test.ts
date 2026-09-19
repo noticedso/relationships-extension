@@ -44,6 +44,24 @@ describe("popup", () => {
     buildDom();
   });
 
+  it("shows automatic recovery instead of an old successful sync", async () => {
+    (globalThis as unknown as {chrome: unknown}).chrome = {
+      runtime: { sendMessage: vi.fn(async (m: {type:string}) => m.type === "getSyncHistory" ? {runs:[]} : {...status, needs:null,
+        sources:[{source:"x",networkLabel:"X",granted:true,signedIn:true,recovery:"retrying",lastScanAt:1707091200000}]}) },
+    };
+    await init(document);
+    expect(document.getElementById("network-status")!.textContent).toContain("retrying automatically");
+  });
+
+  it("does not call an unpublished GitHub release an available Chrome update", async () => {
+    (globalThis as unknown as {chrome: unknown}).chrome = {...chromeWithManifest("1.0.2"), runtime: {
+      ...chromeWithManifest("1.0.2").runtime, requestUpdateCheck: vi.fn(async () => ({status:"no_update"})),
+    }};
+    globalThis.fetch = vi.fn(async () => ({ok:true,json:async () => ({tag_name:"v9.0.0"})})) as unknown as typeof fetch;
+    await init(document); await new Promise(r => setTimeout(r,0));
+    expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
+  });
+
   it("renders account, scans, fetch copy, and needs from runtime status", async () => {
     const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : status));
     (globalThis as unknown as { chrome: unknown }).chrome = {
@@ -267,8 +285,7 @@ describe("popup", () => {
     expect(document.getElementById("what-we-fetch")!.textContent).toContain("professional network");
   });
 
-  const WEB_STORE_URL =
-    "https://chromewebstore.google.com/detail/noticed%20Relationships/hjckpjgbhjichgkbmgjfbbdibchghdaf";
+
 
   function chromeWithManifest(version: string) {
     const sendMessage = vi.fn(async (m: { type: string }) => (m.type === "getSyncHistory" ? { runs: [] } : status));
@@ -282,16 +299,17 @@ describe("popup", () => {
     };
   }
 
-  it("#1: reveals the update notice (linking to the Chrome Web Store) when a newer release exists", async () => {
+  it("#1: reveals guidance when Chrome confirms an available update", async () => {
     (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
-    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
+    (chrome.runtime as any).requestUpdateCheck = vi.fn(async () => ({ status: "update_available" }));
 
     await init(document);
     await new Promise((r) => setTimeout(r, 0));
 
     const notice = document.getElementById("update-notice") as HTMLAnchorElement;
     expect(notice.hidden).toBe(false);
-    expect(notice.getAttribute("href")).toBe(WEB_STORE_URL);
+    expect(notice.textContent).toContain("Restart Chrome");
+    expect(notice.hasAttribute("href")).toBe(false);
   });
 
   it("#1: keeps the update notice hidden when the installed version is current", async () => {
@@ -304,11 +322,9 @@ describe("popup", () => {
     expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
   });
 
-  it("#1: leaves the update notice hidden (no throw) when the release fetch fails", async () => {
+  it("#1: leaves the update notice hidden when Chrome cannot check for updates", async () => {
     (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
-    globalThis.fetch = vi.fn(async () => {
-      throw new Error("network down");
-    }) as unknown as typeof fetch;
+    (chrome.runtime as any).requestUpdateCheck = vi.fn(async () => { throw new Error("network down"); });
 
     await expect(init(document)).resolves.toBeUndefined();
     await new Promise((r) => setTimeout(r, 0));
@@ -718,7 +734,7 @@ describe("popup", () => {
 
   it("E6: the version footer is shown even when the version is current and there's no update", async () => {
     (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.3");
-    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
+    (chrome.runtime as any).requestUpdateCheck = vi.fn(async () => ({ status: "no_update" }));
 
     await init(document);
     await new Promise((r) => setTimeout(r, 0));
@@ -727,9 +743,9 @@ describe("popup", () => {
     expect((document.getElementById("update-notice") as HTMLAnchorElement).hidden).toBe(true);
   });
 
-  it("E6: the update notice lives in the footer alongside the version, and reveals (linking to the Chrome Web Store) when behind", async () => {
+  it("E6: the confirmed update notice lives in the footer alongside the version", async () => {
     (globalThis as unknown as { chrome: unknown }).chrome = chromeWithManifest("1.0.2");
-    globalThis.fetch = vi.fn(async () => ({ ok: true, json: async () => ({ tag_name: "v1.0.3" }) })) as unknown as typeof fetch;
+    (chrome.runtime as any).requestUpdateCheck = vi.fn(async () => ({ status: "update_available" }));
 
     await init(document);
     await new Promise((r) => setTimeout(r, 0));
@@ -738,7 +754,8 @@ describe("popup", () => {
     const notice = document.getElementById("update-notice") as HTMLAnchorElement;
     expect(version.textContent).toBe("v1.0.2");
     expect(notice.hidden).toBe(false);
-    expect(notice.getAttribute("href")).toBe(WEB_STORE_URL);
+    expect(notice.textContent).toContain("Restart Chrome");
+    expect(notice.hasAttribute("href")).toBe(false);
     // the update notice and the version share a footer container (bottom of panel)
     expect(notice.parentElement).toBe(version.parentElement);
   });
