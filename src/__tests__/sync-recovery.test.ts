@@ -140,3 +140,54 @@ it("an obsolete import with an old recipe and expired session stays actionable a
   expect(state.syncRecovery).toMatchObject({x:{status:"needs_attention"}});
   expect(state.scanInProgress).toBe(false);
 });
+
+
+it.each([["x_extension", "x"], ["x", "x_extension"]])("upgrade rescans %s imports with the paired %s recipe and keeps the attempt bound", async (legacy, current) => {
+  const paired = { ...recipe, source: current };
+  await seed(incomplete as typeof complete, {
+    recipe: paired, recipes: { [current]: paired },
+    pendingScans: { [legacy]: { source: legacy, ingestPath: recipe.ingestPath, payload: incomplete, count: 0, accountKey: "id:a1", id: "scan-1" } },
+    syncTabIds: { [legacy]: 42 },
+    scanInProgress: true, scanSource: "linkedin_extension", scanAccountId: "id:a1", scanStartedAt: Date.now(),
+  });
+  const remove = vi.spyOn(browser().tabs, "remove");
+  browser().runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.2.15" });
+  await settle();
+  let state = await browser().storage.local.get(null) as any;
+  expect(state.pendingScans).toEqual({});
+  expect(state.scanQueue).toEqual([current]);
+  expect(state.syncRecovery).toEqual({ [current]: { rescans: 1, uploads: 0, status: "retrying" } });
+  expect(remove).toHaveBeenCalledWith(42);
+  expect(await send({ type: "getCachedScan", source: legacy, accountId: "a1" })).toMatchObject({ recovery: "retrying" });
+  expect((await send({ type: "getOnboardingStatus" })).sources).toEqual(expect.arrayContaining([expect.objectContaining({ source: current, recovery: "retrying" })]));
+  registerListenersForTest(); await settle();
+  state = await browser().storage.local.get(null) as any;
+  expect(state.scanQueue).toEqual([current]);
+  await browser().storage.local.set({ pendingScans: { [current]: { source: current, ingestPath: recipe.ingestPath, payload: incomplete, count: 0, accountKey: "id:a1", id: "scan-2" } } });
+  expect(await send({ type: "syncFailed", source: current, accountId: "a1", scanId: "scan-2", reason: "history-incomplete" })).toMatchObject({ recovery: "needs_attention" });
+});
+
+it.each(["x_extension", "x"])("manual retry requested as %s clears the legacy import and scans the paired recipe", async requested => {
+  await seed(complete, {
+    pendingScans: { x_extension: { source: "x_extension", ingestPath: recipe.ingestPath, payload: complete, count: 0, accountKey: "id:a1", id: "scan-1" } },
+    syncTabIds: { x_extension: 42 },
+    syncRecovery: { x_extension: { rescans: 1, uploads: 2, status: "needs_attention" } },
+    scanFailures: { x_extension: { message: "Try again." } },
+  });
+  const remove = vi.spyOn(browser().tabs, "remove");
+  let release!: (value: null) => void;
+  vi.spyOn(browser().cookies, "get").mockImplementation(() => new Promise(resolve => { release = resolve; }));
+  try {
+    expect(await send({ type: "retrySync", source: requested, accountId: "a1" })).toMatchObject({ ok: true });
+    await settle();
+    const state = await browser().storage.local.get(null) as any;
+    expect(state.scanSource).toBe("x");
+    expect(state.pendingScans).toEqual({});
+    expect(state.syncRecovery).toEqual({ x: { rescans: 0, uploads: 0, status: "retrying" } });
+    expect(state.scanFailures).toEqual({});
+    expect(state.scanNeedsRecipeRefresh).toBe(true);
+    expect(remove).toHaveBeenCalledWith(42);
+  } finally {
+    release?.(null); await settle();
+  }
+});

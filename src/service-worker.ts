@@ -1334,18 +1334,30 @@ function isIncompleteX(pending: PendingScan): boolean {
 async function queueUserRetry(source: string, accountId: string): Promise<boolean> {
   return withAccountStateMutation(async () => {
     const state = await getState();
-    if (stableAccountId(state.account) !== accountId || !recipesOf(state)[source] || state.scanInProgress) return false;
+    const recipes = recipesOf(state);
+    const recipe = recipeForSource(recipes, source);
+    if (stableAccountId(state.account) !== accountId || !recipe || state.scanInProgress) return false;
+    const scanSource = sourceOf(recipe);
+    const aliases = (source === "x" || source === "x_extension" ? ["x", "x_extension"] : [source])
+      .filter(candidate => recipeForSource(recipes, candidate) === recipe);
     const recovery = { ...state.syncRecovery };
-    recovery[source] = { rescans: 0, uploads: 0, status: "retrying" };
     const pending = { ...state.pendingScans };
-    delete pending[source];
     const tabIds = { ...state.syncTabIds };
-    const tabId = tabIds[source];
-    delete tabIds[source];
-    await setState({ syncRecovery: recovery, pendingScans: pending, syncTabIds: tabIds,
-      ...retrySourceState(state, source),
-      scanQueue: [...new Set([...(state.scanQueue ?? []), source])] });
-    if (tabId != null) await chrome.tabs.remove(tabId).catch(() => {});
+    const retryState = retrySourceState(state, scanSource);
+    const scanFailures = { ...retryState.scanFailures };
+    const closingTabs = new Set<number>();
+    for (const alias of aliases) {
+      delete recovery[alias];
+      delete pending[alias];
+      delete scanFailures[alias];
+      if (tabIds[alias] != null) closingTabs.add(tabIds[alias]);
+      delete tabIds[alias];
+    }
+    recovery[scanSource] = { rescans: 0, uploads: 0, status: "retrying" };
+    await setState({ ...retryState, scanFailures, syncRecovery: recovery, pendingScans: pending, syncTabIds: tabIds,
+      ...(state.syncTabId != null && closingTabs.has(state.syncTabId) ? { syncTabId: null } : {}),
+      scanQueue: [...new Set([...(state.scanQueue ?? []).filter(candidate => !aliases.includes(candidate)), scanSource])] });
+    for (const tabId of closingTabs) await chrome.tabs.remove(tabId).catch(() => {});
     return true;
   });
 }
@@ -1360,11 +1372,13 @@ async function recoverFailedUpload(message: {
     const pending = state.pendingScans?.[source];
     if (!pending || stableAccountId(state.account) !== message.accountId
       || !accountOwnsKey(state.account, pending.accountKey ?? null) || pending.id !== message.scanId) return { ok: false };
-    const previous = state.syncRecovery?.[source] ?? { rescans: 0, uploads: 0, status: "retrying" as const };
+    const recipe = recipeForSource(recipesOf(state), source);
+    const recipeSource = recipe ? sourceOf(recipe) : source;
+    const previous = state.syncRecovery?.[source] ?? state.syncRecovery?.[recipeSource] ?? { rescans: 0, uploads: 0, status: "retrying" as const };
     if (previous.status === "needs_attention" || (previous.retryAt ?? 0) > Date.now()) {
       return { ok: true, recovery: previous.status };
     }
-    const rescan = message.reason === "history-incomplete" && previous.rescans < 1 && Boolean(recipesOf(state)[source]);
+    const rescan = message.reason === "history-incomplete" && previous.rescans < 1 && Boolean(recipe);
     const retry = message.reason === "temporary" && previous.uploads < 2;
     const status = rescan || retry ? "retrying" as const : "needs_attention" as const;
     const retryAt = retry ? Date.now() + 30_000 * (previous.uploads + 1) : undefined;
@@ -1378,10 +1392,18 @@ async function recoverFailedUpload(message: {
     if (status === "needs_attention") scanFailures[source] = { message: message.reason === "reconnect"
       ? "Sign in to the network, then try again."
       : "We couldn't finish this import. Try again." };
-    await setState({ pendingScans, syncRecovery: { ...state.syncRecovery, [source]: recovery },
+    const syncRecovery = { ...state.syncRecovery };
+    // The replacement scan and its status must use the paired recipe's key.
+    // Move the budget too, so switching aliases cannot grant another rescan.
+    if (rescan) {
+      delete syncRecovery[source];
+      delete scanFailures[source];
+    }
+    syncRecovery[rescan ? recipeSource : source] = recovery;
+    await setState({ pendingScans, syncRecovery,
       scanFailures, syncTabIds: tabIds, ...(tabId === state.syncTabId ? { syncTabId: null } : {}),
       needs: null,
-      ...(rescan ? { scanQueue: [...new Set([...(state.scanQueue ?? []), source])] } : {}) });
+      ...(rescan ? { scanQueue: [...new Set([...(state.scanQueue ?? []).filter(candidate => candidate !== source), recipeSource])] } : {}) });
     if (retryAt) chrome.alarms.create(HANDOFF_RETRY_ALARM, { when: retryAt });
     if (tabId != null) await chrome.tabs.remove(tabId).catch(() => {});
     return { ok: true, recovery: status };
@@ -1616,8 +1638,10 @@ async function handleExternal(
         const pending = src
           ? state.pendingScans?.[src]
           : Object.values(state.pendingScans ?? {})[0];
-        if (!pending && requestedAccountId === currentAccountId && src && state.syncRecovery?.[src]) {
-          return { accountId: currentAccountId, source: src, recovery: state.scanFailures?.[src] ? "needs_attention" : state.syncRecovery[src].status };
+        const recoveryRecipe = src ? recipeForSource(recipesOf(state), src) : undefined;
+        const recoverySource = src && state.syncRecovery?.[src] ? src : recoveryRecipe ? sourceOf(recoveryRecipe) : src;
+        if (!pending && requestedAccountId === currentAccountId && recoverySource && state.syncRecovery?.[recoverySource]) {
+          return { accountId: currentAccountId, source: recoverySource, recovery: state.scanFailures?.[recoverySource] ? "needs_attention" : state.syncRecovery[recoverySource].status };
         }
         if (
           !pending
