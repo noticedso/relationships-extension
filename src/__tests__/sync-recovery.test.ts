@@ -79,13 +79,37 @@ it("does not rescan fresh incomplete history forever", async () => {
 
 it("only the matching successful upload clears recovery", async () => {
   await seed(complete, { syncRecovery: { x: { rescans: 1, uploads: 1, status: "retrying" } } });
-  await send({ type: "syncConfirmed", source: "x", accountId: "a1", scanId: "old" });
+  expect(await send({ type: "syncConfirmed", source: "x", accountId: "a1", scanId: "old" })).toMatchObject({ ok: false });
+  expect(await send({ type: "syncConfirmed", source: "x", accountId: "other", scanId: "scan-1" })).toMatchObject({ ok: false });
   expect((await browser().storage.local.get(null)).pendingScans).toHaveProperty("x");
-  await send({ type: "syncConfirmed", source: "x", accountId: "a1", scanId: "scan-1" });
+  expect(await send({ type: "syncConfirmed", source: "x", accountId: "a1", scanId: "scan-1" })).toMatchObject({ ok: true });
   const state = await browser().storage.local.get(null);
   expect(state.pendingScans).toEqual({});
   expect(state.syncRecovery).toEqual({});
   expect(state.lastScanAt).toBeTypeOf("number");
+});
+
+it.each([["x_extension", "x"], ["x", "x_extension"]])("re-pairing %s pending data as %s does not start a duplicate scan", async (pendingSource, recipeSource) => {
+  const paired = { ...recipe, source: recipeSource };
+  await seed(complete, {
+    recipe: paired,
+    recipes: { [recipeSource]: paired },
+    pendingScans: { [pendingSource]: { source: pendingSource, ingestPath: recipe.ingestPath, payload: complete, count: 0, accountKey: "id:a1", id: "scan-1" } },
+    syncTabIds: {},
+    lastScanStartedAt: null,
+  });
+  vi.spyOn(browser().permissions, "contains").mockResolvedValue(true);
+  vi.spyOn(browser().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+  const fetcher = vi.fn(async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response);
+  globalThis.fetch = fetcher;
+
+  await send({ type: "pair", recipe: paired, account });
+  await settle();
+
+  const state = await browser().storage.local.get(null) as any;
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(state.scanInProgress).not.toBe(true);
+  expect(state.pendingScans).toHaveProperty(pendingSource);
 });
 
 it("account switches discard recovery state", async () => {

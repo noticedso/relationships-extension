@@ -121,6 +121,12 @@ function recipeForSource(
     ?? (source === "x_extension" ? recipes.x : undefined);
 }
 
+function sourceAliases(source: string): string[] {
+  return source === "x" || source === "x_extension"
+    ? ["x", "x_extension"]
+    : [source];
+}
+
 /** Preserve cached payloads while rebinding their upload destination to the
  * newly paired run/session. The correlation lives in the served ingestPath. */
 function rebindPendingIngestPaths(
@@ -1307,15 +1313,16 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   const targets: string[] = [];
   for (const src of await grantedSources(recipesOf(state))) {
+    const aliases = sourceAliases(src);
     // A terminal failure requires a user retry (or a fresh permission grant).
     // Re-pairing and scheduled scans must not restart the failed checkpoint.
-    if (state.scanFailures?.[src] || state.syncRecovery?.[src]) continue;
+    if (aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias])) continue;
     // A pending payload means this source already scanned and its first-party
     // handoff has not confirmed yet. Re-scanning it cannot help: it only replaces
     // the pending payload and opens another handoff tab. This state guard is
     // stronger than the timestamp throttle and also covers legacy installs where
     // lastScanStartedAt was never persisted.
-    if (state.pendingScans?.[src]) continue;
+    if (aliases.some((alias) => state.pendingScans?.[alias])) continue;
     targets.push(src);
   }
   if (targets.length === 0) return;
@@ -1728,7 +1735,7 @@ async function handleExternal(
         return { tabId };
       });
       if (confirmed?.tabId != null) await chrome.tabs.remove(confirmed.tabId).catch(() => {});
-      sendResponse({ ok: true });
+      sendResponse({ ok: confirmed !== null });
       return;
     }
   }
