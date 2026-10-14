@@ -1220,8 +1220,8 @@ async function initializeScanPlan(
   return withAccountStateMutation(async () => {
     const state = await getState();
     if (expectedAccountId && state.account?.id !== expectedAccountId) throw new ScanSupersededError();
-    if (expectedAccountId && state.scanInProgress) {
-      if (sources.includes(state.scanSource ?? "") || sources.some(source=>(state.scanQueue ?? []).includes(source))) return false;
+    if (expectedAccountId && (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0)) {
+      if ((state.scanInProgress && sources.includes(state.scanSource ?? "")) || sources.some(source=>(state.scanQueue ?? []).includes(source))) return false;
       throw new ScanSourceBusyError();
     }
     const recipes = recipesOf(state);
@@ -1559,8 +1559,8 @@ async function handleExternal(
         }
         const recipe = recipesOf(state)[message.source];
         if (!recipe) { sendResponse({ok:false,error:"not_connected"}); return; }
-        if (state.scanInProgress) {
-          sendResponse(state.scanSource === message.source || (state.scanQueue ?? []).includes(message.source) ? {ok:true,status:"already_running"} : {ok:false,error:"source_busy"}); return;
+        if (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0) {
+          sendResponse((state.scanInProgress && state.scanSource === message.source) || (state.scanQueue ?? []).includes(message.source) ? {ok:true,status:"already_running"} : {ok:false,error:"source_busy"}); return;
         }
         if (!(await grantedSources({[message.source]:recipe})).includes(message.source)) {
           sendResponse({ok:false,error:"permission_required"}); return;

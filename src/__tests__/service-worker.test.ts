@@ -158,6 +158,25 @@ describe("service worker", () => {
     vi.spyOn(getChrome().cookies,"get").mockRejectedValue(new Error("transient cookie failure"));
     expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"request_failed"});
   });
+  it.each([false, true])("preserves an idle X queue when a website scan arrives (queue during probe: %s)", async (duringProbe) => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",scanInProgress:false,scanSource:"linkedin_extension",scanQueue:duringProbe ? [] : ["x"]});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockImplementationOnce(async()=>{
+      if (duringProbe) await getChrome().storage.local.set({scanInProgress:false,scanQueue:["x"]});
+      return {name:"tok",value:"abc"};
+    }).mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async (url: string)=>({ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}})));
+    const result=await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(result).toMatchObject({ok:false,error:"source_busy"});
+    expect((await getChrome().storage.local.get(null)).scanQueue).toEqual(["x"]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("reuses LinkedIn queued between sources without changing the queue", async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",scanInProgress:false,scanQueue:["x","linkedin_extension"]});
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:true,status:"already_running"});
+    expect((await getChrome().storage.local.get(null)).scanQueue).toEqual(["x","linkedin_extension"]);
+  });
   it("checks source admission atomically when X starts during the sign-in probe",async()=>{
     await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
     vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
