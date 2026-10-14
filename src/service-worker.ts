@@ -65,6 +65,7 @@ const MAX_CONSECUTIVE_PROBE_FAILURES = 5;
 
 type ExternalMessage =
   | { type: "ping" }
+  | { type: "scanNow"; source: "linkedin_extension"; accountId: string }
   | { type: "pair"; recipe: ScanRecipe; recipes?: ScanRecipe[]; account: Account }
   | { type: "getOnboardingStatus" }
   | { type: "getCachedScan"; source?: string; accountId?: string }
@@ -1213,9 +1214,12 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
 async function initializeScanPlan(
   sources: string[],
   refreshRecipes: boolean,
+  expectedAccountId?: string,
 ): Promise<boolean> {
   return withAccountStateMutation(async () => {
     const state = await getState();
+    if (expectedAccountId && state.account?.id !== expectedAccountId) throw new ScanSupersededError();
+    if (expectedAccountId && state.scanInProgress) return false;
     const recipes = recipesOf(state);
     const list = sources.filter((source) => recipes[source] != null);
     const first = list[0];
@@ -1538,8 +1542,34 @@ async function handleExternal(
 ): Promise<void> {
   switch (message.type) {
     case "ping":
-      sendResponse({ ok: true, syncRecovery: 1, xHistory: 1 });
+      sendResponse({ ok: true, syncRecovery: 1, xHistory: 1, websiteScan: 1 });
       return;
+    case "scanNow": {
+      try {
+        const state = await getState();
+        if (!message.accountId || state.account?.id !== message.accountId) {
+          sendResponse({ok:false,error:"account_mismatch"}); return;
+        }
+        if (message.source !== "linkedin_extension") {
+          sendResponse({ok:false,error:"unsupported_source"}); return;
+        }
+        const recipe = recipesOf(state)[message.source];
+        if (!recipe) { sendResponse({ok:false,error:"not_connected"}); return; }
+        if (state.scanInProgress) { sendResponse({ok:true,status:"already_running"}); return; }
+        if (!(await grantedSources({[message.source]:recipe})).includes(message.source)) {
+          sendResponse({ok:false,error:"permission_required"}); return;
+        }
+        if (!(await isSignedIn(recipe))) {
+          sendResponse({ok:false,error:"network_signin_required"}); return;
+        }
+        const started = await initializeScanPlan([message.source], true, message.accountId);
+        sendResponse({ok:true,status:started ? "started" : "already_running"});
+        if (started) void continueScanPlan();
+      } catch (error) {
+        sendResponse({ok:false,error:error instanceof ScanSupersededError ? "account_mismatch" : "request_failed"});
+      }
+      return;
+    }
     case "pair": {
       // Store the per-source recipes + account and arm the three-day alarm. The
       // host permission is requested from a user gesture in the popup, not here.

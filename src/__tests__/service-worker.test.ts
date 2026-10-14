@@ -109,6 +109,42 @@ describe("service worker", () => {
     sw.registerListeners();
   });
 
+  it("accepts a first-party scan request only for the paired account and acknowledges without a popup", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"request");
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async (url: string)=>({ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe],account}:{elements:[]}})));
+    const result=await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender);
+    expect(result).toMatchObject({ok:true,status:"started"});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect((await getChrome().storage.local.get(null)).account).toMatchObject(account);
+    expect(getChrome().permissions.request).not.toHaveBeenCalled();
+  });
+  it("rejects another account's external scan without changing pairing or making requests", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:"other"},noticedSender)).toMatchObject({ok:false,error:"account_mismatch"});
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await getChrome().storage.local.get(null)).account).toMatchObject(account);
+  });
+  it("reports permission and sign-in requirements without prompting from a webpage", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"request");
+    const permissions=vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(false);
+    const message={type:"scanNow",source:"linkedin_extension",accountId:account.id};
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:false,error:"permission_required"});
+    permissions.mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue(null);
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:false,error:"network_signin_required"});
+    expect(getChrome().permissions.request).not.toHaveBeenCalled();
+  });
+  it("reuses an active scan and rejects non-first-party senders", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanAccountId:"id:acct-1"})});
+    const message={type:"scanNow",source:"linkedin_extension",accountId:account.id};
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:true,status:"already_running"});
+    expect(await dispatchExternal(message,{origin:"https://evil.example"})).toBeUndefined();
+  });
   it("1. external pair from allowed origin stores state + creates alarm, acks, and does NOT request permissions (no user gesture in the SW)", async () => {
     const chrome = getChrome();
     const createAlarm = vi.spyOn(chrome.alarms, "create");
