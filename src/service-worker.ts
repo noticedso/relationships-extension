@@ -315,6 +315,7 @@ let accountStateMutation = Promise.resolve();
 let handoffReconcile: Promise<void> | null = null;
 
 class ScanSupersededError extends Error {}
+class ScanSourceBusyError extends Error {}
 
 function accountKey(account: Account | null | undefined): string | null {
   const id = typeof account?.id === "string" ? account.id.trim() : "";
@@ -1219,7 +1220,10 @@ async function initializeScanPlan(
   return withAccountStateMutation(async () => {
     const state = await getState();
     if (expectedAccountId && state.account?.id !== expectedAccountId) throw new ScanSupersededError();
-    if (expectedAccountId && state.scanInProgress) return false;
+    if (expectedAccountId && state.scanInProgress) {
+      if (sources.includes(state.scanSource ?? "") || sources.some(source=>(state.scanQueue ?? []).includes(source))) return false;
+      throw new ScanSourceBusyError();
+    }
     const recipes = recipesOf(state);
     const list = sources.filter((source) => recipes[source] != null);
     const first = list[0];
@@ -1555,18 +1559,21 @@ async function handleExternal(
         }
         const recipe = recipesOf(state)[message.source];
         if (!recipe) { sendResponse({ok:false,error:"not_connected"}); return; }
-        if (state.scanInProgress) { sendResponse({ok:true,status:"already_running"}); return; }
+        if (state.scanInProgress) {
+          sendResponse(state.scanSource === message.source || (state.scanQueue ?? []).includes(message.source) ? {ok:true,status:"already_running"} : {ok:false,error:"source_busy"}); return;
+        }
         if (!(await grantedSources({[message.source]:recipe})).includes(message.source)) {
           sendResponse({ok:false,error:"permission_required"}); return;
         }
-        if (!(await isSignedIn(recipe))) {
-          sendResponse({ok:false,error:"network_signin_required"}); return;
+        const signedIn=await isSignedIn(recipe);
+        if (signedIn !== true) {
+          sendResponse({ok:false,error:signedIn === false ? "network_signin_required" : "request_failed"}); return;
         }
         const started = await initializeScanPlan([message.source], true, message.accountId);
         sendResponse({ok:true,status:started ? "started" : "already_running"});
         if (started) void continueScanPlan();
       } catch (error) {
-        sendResponse({ok:false,error:error instanceof ScanSupersededError ? "account_mismatch" : "request_failed"});
+        sendResponse({ok:false,error:error instanceof ScanSupersededError ? "account_mismatch" : error instanceof ScanSourceBusyError ? "source_busy" : "request_failed"});
       }
       return;
     }

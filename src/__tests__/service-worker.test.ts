@@ -145,6 +145,29 @@ describe("service worker", () => {
     expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:true,status:"already_running"});
     expect(await dispatchExternal(message,{origin:"https://evil.example"})).toBeUndefined();
   });
+
+  it("reports retryable busy when only X is active instead of claiming LinkedIn is running", async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanSource:"x",scanQueue:[],scanAccountId:"id:acct-1"})});
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"source_busy"});
+    await getChrome().storage.local.set({scanQueue:["linkedin_extension"]});
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:true,status:"already_running"});
+  });
+  it("does not mistake an unknown cookie probe for signed out",async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockRejectedValue(new Error("transient cookie failure"));
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"request_failed"});
+  });
+  it("checks source admission atomically when X starts during the sign-in probe",async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockImplementation(async()=>{
+      await getChrome().storage.local.set(inProgress({scanSource:"x",scanQueue:[],scanAccountId:"id:acct-1"}));
+      return {name:"tok",value:"abc"};
+    });
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"source_busy"});
+    expect((await getChrome().storage.local.get(null)).scanSource).toBe("x");
+  });
   it("1. external pair from allowed origin stores state + creates alarm, acks, and does NOT request permissions (no user gesture in the SW)", async () => {
     const chrome = getChrome();
     const createAlarm = vi.spyOn(chrome.alarms, "create");
