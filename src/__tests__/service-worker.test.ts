@@ -187,6 +187,37 @@ describe("service worker", () => {
     expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"source_busy"});
     expect((await getChrome().storage.local.get(null)).scanSource).toBe("x");
   });
+  it.each(["alarm", "permission"])("preserves a website-started scan when the %s starter resumes its permission probe", async (starter) => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    let releaseProbe!: (granted: boolean)=>void;
+    let probeSeen!: ()=>void;
+    let releaseFetch!: ()=>void;
+    const firstProbe=new Promise<boolean>(resolve=>{releaseProbe=resolve;});
+    const probing=new Promise<void>(resolve=>{probeSeen=resolve;});
+    const fetchGate=new Promise<void>(resolve=>{releaseFetch=resolve;});
+    vi.spyOn(getChrome().permissions,"contains").mockImplementationOnce(()=>{probeSeen();return firstProbe;}).mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async(url: string)=>{
+      await fetchGate;
+      return {ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}};
+    }));
+    if(starter==="alarm") getChrome().alarms.onAlarm.dispatch({name:"scan"});
+    else getChrome().permissions.onAdded.dispatch({origins:[xRecipe.targetOrigin+"/*"]});
+    try {
+      await probing;
+      expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:true,status:"started"});
+      const before=await getChrome().storage.local.get(null);
+      releaseProbe(true);
+      await new Promise(resolve=>setTimeout(resolve,20));
+      expect(await getChrome().storage.local.get(null)).toMatchObject({scanInProgress:true,scanSource:before.scanSource,scanQueue:before.scanQueue,scanStartedAt:before.scanStartedAt});
+    } finally {
+      // Finish the gated fixture before the next test swaps the Chrome mock.
+      releaseProbe(true);
+      await getChrome().storage.local.set({scanInProgress:false,scanQueue:[]});
+      releaseFetch();
+      await new Promise(resolve=>setTimeout(resolve,30));
+    }
+  });
   it("1. external pair from allowed origin stores state + creates alarm, acks, and does NOT request permissions (no user gesture in the SW)", async () => {
     const chrome = getChrome();
     const createAlarm = vi.spyOn(chrome.alarms, "create");

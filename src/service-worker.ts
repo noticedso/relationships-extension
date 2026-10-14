@@ -1220,9 +1220,12 @@ async function initializeScanPlan(
   return withAccountStateMutation(async () => {
     const state = await getState();
     if (expectedAccountId && state.account?.id !== expectedAccountId) throw new ScanSupersededError();
-    if (expectedAccountId && (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0)) {
-      if ((state.scanInProgress && sources.includes(state.scanSource ?? "")) || sources.some(source=>(state.scanQueue ?? []).includes(source))) return false;
-      throw new ScanSourceBusyError();
+    if (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0) {
+      const requestedIsOwed = (state.scanInProgress && sources.includes(state.scanSource ?? "")) || sources.some(source=>(state.scanQueue ?? []).includes(source));
+      if (expectedAccountId && !requestedIsOwed) throw new ScanSourceBusyError();
+      // Every starter must preserve the plan admitted under this same lock.
+      // Internal alarm/grant callers simply skip; website callers reuse or retry.
+      return false;
     }
     const recipes = recipesOf(state);
     const list = sources.filter((source) => recipes[source] != null);
