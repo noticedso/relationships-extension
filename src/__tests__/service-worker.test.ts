@@ -61,6 +61,65 @@ function inProgress(extra: Record<string, unknown> = {}): Record<string, unknown
 
 const account = { id: "acct-1", displayName: "Test User" };
 
+describe("source owner binding", () => {
+  const ownerAccountSource = { listPathTemplate: "/me", idPath: "me.id", usernamePath: "me.handle" };
+  beforeEach(() => { sw.registerListeners(); });
+  it("allows the exact local test origin only in a development build", () => {
+    (globalThis as any).__DEV__ = false;
+    expect(sw.isNoticedOrigin("http://localhost:3011")).toBe(false);
+    (globalThis as any).__DEV__ = true;
+    expect(sw.isNoticedOrigin("http://localhost:3011")).toBe(true);
+    expect(sw.isNoticedOrigin("http://localhost:3012")).toBe(false);
+    expect(sw.isNoticedOrigin("http://localhost.evil.example:3011")).toBe(false);
+  });
+  it("captures the owner before scanning and attaches it to the completed payload", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource }, account,
+      ...inProgress() });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchImpl = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/me")
+      ? { me: { id: "urn:li:fsd_profile:ACoAA-owner", handle: "owner-handle" } }
+      : { elements: [makeElement("jane")] }), { status: 200 }));
+    await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 });
+    const stored = await chrome.storage.local.get(null);
+    expect((stored.pendingScans as any)?.linkedin_extension?.payload?.ownerAccount)
+      .toEqual({ memberId: "ACoAA-owner", username: "owner-handle" });
+    expect(fetchImpl.mock.calls[0]?.[0]).toContain("/me");
+  });
+  it("detects a session-cookie change during a page request without storing the credential", async () => {
+    const chrome = getChrome();
+    let session = "PRIVATE-CREDENTIAL-ONE";
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource: { ...ownerAccountSource, sessionCookie: "session" } }, account, ...inProgress() });
+    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }) => ({ name, value: name === "session" ? session : "abc" }));
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/me")) return new Response(JSON.stringify({ me: { id: "ACoAA-owner", handle: "owner-handle" } }), { status: 200 });
+      session = "PRIVATE-CREDENTIAL-TWO";
+      return new Response(JSON.stringify({ elements: [makeElement("jane")] }), { status: 200 });
+    });
+    await expect(sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 })).rejects.toThrow("source_account_changed");
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans).toBeUndefined();
+    expect(JSON.stringify(stored)).not.toContain("PRIVATE-CREDENTIAL");
+  });
+  it.each(["resume", "during scan"])("rejects a source-account switch %s without handing off mixed data", async (mode) => {
+    const chrome = getChrome();
+    const owner = { memberId: "ACoAA-owner", username: "owner-handle" };
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource }, account,
+      ...inProgress(mode === "resume" ? { scanOwnerAccount: owner, scanItems: [makeElement("prior")] } : {}) });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    let probes = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      const switched = mode === "resume" || ++probes > 1;
+      return new Response(JSON.stringify(url.endsWith("/me")
+        ? { me: { id: switched ? "ACoAA-other" : owner.memberId, handle: switched ? "other" : owner.username } }
+        : { elements: [makeElement("jane")] }), { status: 200 });
+    });
+    await expect(sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 }))
+      .rejects.toThrow("source_account_changed");
+    expect((await chrome.storage.local.get(null)).pendingScans).toBeUndefined();
+  });
+});
+
 function makeElement(id: string) {
   return {
     m: { publicIdentifier: id, firstName: id.toUpperCase(), lastName: "X", headline: "h" },

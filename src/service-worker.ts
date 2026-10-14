@@ -38,6 +38,7 @@ import {
 } from "./lib/recipe-source";
 import { getState, setState } from "./lib/storage";
 import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
+declare const __DEV__: boolean;
 
 const SCAN_ALARM = "scan";
 const SCAN_PERIOD_MINUTES = 3 * 24 * 60;
@@ -86,6 +87,7 @@ export function isNoticedOrigin(origin: string | null | undefined): boolean {
   if (!origin) return false;
   try {
     const url = new URL(origin);
+    if (__DEV__ && url.origin === "http://localhost:3011") return true;
     return url.protocol === "https:" && /(^|\.)noticed\.so$/.test(url.hostname);
   } catch {
     return false;
@@ -426,7 +428,7 @@ function clearedScanState(extra?: { needs?: "network-signin" }): Partial<State> 
     scanCursor: null,
     scanItems: null,
     scanPhaseResults: null,
-    scanSelfId: null,
+    scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
     scanStartedAt: null,
     scanNeedsRecipeRefresh: false,
     scanRetryCount: 0,
@@ -613,6 +615,25 @@ async function runOwnerProfilePass(
     }
   }
   return out;
+}
+
+async function readSourceOwner(
+  recipe: ScanRecipe, headers: Record<string, string>, fetchImpl: typeof fetch,
+): Promise<{ memberId: string; username: string }> {
+  const spec = recipe.ownerAccountSource!;
+  const res = await fetchImpl(recipe.targetOrigin + spec.listPathTemplate,
+    { credentials: "include", cache: "no-store", headers });
+  if (!res.ok) throw new Error("source_account_unavailable");
+  const json = await res.json();
+  const memberId = String(getByPath(json, spec.idPath) ?? "").split(":").pop()?.trim() ?? "";
+  const username = String(getByPath(json, spec.usernamePath) ?? "").trim().toLowerCase();
+  if (!memberId || !username) throw new Error("source_account_unavailable");
+  return { memberId, username };
+}
+
+function assertSourceOwner(expected: { memberId: string; username: string }, actual: { memberId: string; username: string }): void {
+  if (expected.memberId !== actual.memberId || expected.username !== actual.username)
+    throw new Error("source_account_changed");
 }
 
 /**
@@ -807,7 +828,8 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
   if (scanRunning) return { ok: true, note: "already-running" };
   scanRunning = true;
   try {
-    const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
+    const unguardedFetch = deps.fetchImpl ?? globalThis.fetch;
+    let fetchImpl = unguardedFetch;
     const sleep = deps.sleep ?? realSleep;
     const now = deps.nowMs ?? (() => Date.now());
 
@@ -859,7 +881,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
           : {}),
         ...(fresh && JSON.stringify(fresh) !== JSON.stringify(recipe)
           ? { scanPhaseIndex: 0, scanCursor: null, scanItems: [],
-              scanPhaseResults: { connLists: [], messages: [] }, scanSelfId: null }
+              scanPhaseResults: { connLists: [], messages: [] }, scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null }
           : {}),
         scanNeedsRecipeRefresh: false,
       };
@@ -874,6 +896,30 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       // refreshed == null → keep the cached recipe + headers and scan as before.
     }
 
+    // Bind every provider response and persisted checkpoint to this browser session.
+    // The credential stays in Chrome; only a local fingerprint is persisted.
+    const sessionCookie = recipe.ownerAccountSource?.sessionCookie;
+    if (sessionCookie) {
+      const sessionHash = async () => {
+        const cookie = await chrome.cookies.get({ url: recipe.targetOrigin, name: sessionCookie });
+        if (!cookie?.value) throw new Error("source_account_unavailable");
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(cookie.value));
+        return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      };
+      const expected = await sessionHash();
+      if (state.scanSourceSessionHash && state.scanSourceSessionHash !== expected)
+        throw new Error("source_account_changed");
+      if (!state.scanSourceSessionHash && ((state.scanItems?.length ?? 0) > 0 || (state.scanPhaseIndex ?? 0) > 0))
+        throw new Error("source_account_unproven");
+      await updateCurrentScan(scanSource, scanAccountId, { scanSourceSessionHash: expected });
+      fetchImpl = async (input, init) => {
+        if (await sessionHash() !== expected) throw new Error("source_account_changed");
+        const response = await unguardedFetch(input, init);
+        if (await sessionHash() !== expected) throw new Error("source_account_changed");
+        return response;
+      };
+    }
+
     const jitter = deps.jitter ?? makeJitter(recipe);
     const { scanConnections } = await import("./lib/fetch-engine");
     const phases = planPhases(recipe);
@@ -883,6 +929,17 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
     const results = state.scanPhaseResults ?? { connLists: [], messages: [] };
     let selfId = state.scanSelfId ?? "";
+    let ownerAccount: { memberId: string; username: string } | undefined;
+    if (recipe.ownerAccountSource) {
+      ownerAccount = await readSourceOwner(recipe, headers, fetchImpl);
+      await assertCurrent();
+      if (state.scanOwnerAccount) assertSourceOwner(state.scanOwnerAccount, ownerAccount);
+      else if ((state.scanItems?.length ?? 0) > 0 || (state.scanPhaseIndex ?? 0) > 0)
+        throw new Error("source_account_unproven");
+      if (selfId && selfId !== ownerAccount.memberId) throw new Error("source_account_changed");
+      selfId = ownerAccount.memberId;
+      await updateCurrentScan(scanSource, scanAccountId, { scanOwnerAccount: ownerAccount, scanSelfId: selfId });
+    }
     let phaseIndex = state.scanPhaseIndex ?? 0;
     let resumeThisPhase = true; // only the FIRST phase iteration resumes from the checkpoint
 
@@ -1059,7 +1116,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // NT-63 best-effort owner side-passes, AFTER the connection/message phases so
     // a failure here can never abort a completed connections scan. Each is wrapped
     // so a throw degrades to "no extra" rather than wedging the scan.
-    const extras: ScanExtras = { messageHistory: results.messageHistory };
+    const extras: ScanExtras = { messageHistory: results.messageHistory, ownerAccount };
     await assertCurrent();
     if (recipe.ownerProfile) {
       extras.ownerProfile = await runOwnerProfilePass(recipe, headers, fetchImpl).catch(() => undefined);
@@ -1079,6 +1136,10 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     }
 
     await assertCurrent();
+    if (ownerAccount) {
+      assertSourceOwner(ownerAccount, await readSourceOwner(recipe, headers, fetchImpl));
+      await assertCurrent();
+    }
     return finalizeScan(
       recipe,
       results.connLists,
@@ -1140,7 +1201,7 @@ async function finalizeScan(
       scanCursor: null,
       scanItems: null,
       scanPhaseResults: null,
-      scanSelfId: null,
+      scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
       scanStartedAt: null,
       scanNeedsRecipeRefresh: false,
     } as const;
@@ -1198,7 +1259,7 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
       scanCursor: null,
       scanItems: [],
       scanPhaseResults: { connLists: [], messages: [] },
-      scanSelfId: null,
+      scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
       scanStartedAt: now(),
       // A genuine fresh start → owe a recipe refresh (continueScan performs it).
       scanNeedsRecipeRefresh: deps.refreshRecipes !== false,
@@ -1243,7 +1304,7 @@ async function initializeScanPlan(
       scanCursor: null,
       scanItems: [],
       scanPhaseResults: { connLists: [], messages: [] },
-      scanSelfId: null,
+      scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
       scanStartedAt: Date.now(),
       scanNeedsRecipeRefresh: refreshRecipes,
       needs: null,
@@ -1278,7 +1339,7 @@ async function drainScanQueue(): Promise<void> {
         scanCursor: null,
         scanItems: [],
         scanPhaseResults: { connLists: [], messages: [] },
-        scanSelfId: null,
+        scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
         scanStartedAt: Date.now(),
         scanNeedsRecipeRefresh: state.syncRecovery?.[candidate]?.status === "retrying",
         needs: null,
@@ -1549,7 +1610,7 @@ async function handleExternal(
 ): Promise<void> {
   switch (message.type) {
     case "ping":
-      sendResponse({ ok: true, syncRecovery: 1, xHistory: 1, websiteScan: 1 });
+      sendResponse({ ok: true, syncRecovery: 1, xHistory: 1, websiteScan: 1, linkedinSourceAccount: 1 });
       return;
     case "scanNow": {
       try {
@@ -1637,7 +1698,7 @@ async function handleExternal(
                 scanCursor: null,
                 scanItems: null,
                 scanPhaseResults: null,
-                scanSelfId: null,
+                scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
                 scanStartedAt: null,
                 scanNeedsRecipeRefresh: false,
                 syncTabId: null,
