@@ -104,6 +104,18 @@ export function isValidScanRecipe(value: unknown): value is ScanRecipe {
     return false;
   }
 
+  if (r.ownerAccountSource !== undefined) {
+    const owner = r.ownerAccountSource;
+    if (!owner || typeof owner !== "object" || Array.isArray(owner)) return false;
+    const spec = owner as Record<string, unknown>;
+    if (typeof spec.listPathTemplate !== "string" || !spec.listPathTemplate.startsWith("/")
+      || spec.listPathTemplate.startsWith("//")) return false;
+    if (typeof spec.idPath !== "string" || !spec.idPath.trim()
+      || typeof spec.usernamePath !== "string" || !spec.usernamePath.trim()) return false;
+    if (spec.sessionCookie !== undefined
+      && (typeof spec.sessionCookie !== "string" || !spec.sessionCookie.trim())) return false;
+  }
+
   const messages = r.messages as Record<string, unknown> | undefined;
   if (messages?.xHistory !== undefined) {
     if (!eagerHistoryOwner(messages)) return false;

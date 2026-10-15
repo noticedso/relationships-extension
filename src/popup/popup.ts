@@ -94,6 +94,7 @@ type SourceStatus = {
   requiredOrigins?: string[];
   failure?: string | null;
   recovery?: "retrying" | "needs_attention" | null;
+  refreshAvailableAt?: string | null;
   granted?: boolean;
   // Live cookie probe (getStatus): true/false for granted sources, null for
   // sources whose host permission isn't granted yet (unknown — grant flow owns
@@ -220,8 +221,14 @@ function buildNetworkRow(s: SourceStatus): HTMLLIElement {
   } else {
     text.textContent = `${label} · not synced yet`;
   }
+  if (s.refreshAvailableAt && Number.isFinite(Date.parse(s.refreshAvailableAt)))
+    text.textContent += ` · refresh after ${formatRefreshTime(s.refreshAvailableAt)}`;
   li.append(text);
   return li;
+}
+
+function formatRefreshTime(value: string): string {
+  return new Intl.DateTimeFormat(undefined, {dateStyle:"medium",timeStyle:"short"}).format(new Date(value));
 }
 
 // Render the per-network status list from status.sources. Returns true when it
@@ -454,7 +461,17 @@ async function startScan(
   btn.textContent = "scanning…";
   if (spinner) spinner.hidden = false;
   if (typeof chrome !== "undefined" && chrome.runtime?.sendMessage) {
-    await chrome.runtime.sendMessage({ type: "scanNow" });
+    const reply = await chrome.runtime.sendMessage({ type: "scanNow" }) as {ok?: boolean; error?: string; retryAt?: string} | undefined;
+    if (reply?.ok === false) {
+      btn.disabled = false;
+      btn.textContent = "scan now";
+      if (spinner) spinner.hidden = true;
+      const retry = reply.error === "rate_limited" && reply.retryAt ? Date.parse(reply.retryAt) : NaN;
+      setText(root, "needs", Number.isFinite(retry)
+        ? `Refresh available after ${formatRefreshTime(reply.retryAt!)}`
+        : "Couldn’t start a scan. Try again shortly.");
+      return;
+    }
   }
   await pollScanProgress(root);
 }

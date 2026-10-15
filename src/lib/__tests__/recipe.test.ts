@@ -19,12 +19,12 @@ describe("getByPath", () => {
 });
 
 describe("applyFieldMap", () => {
-  it("normalizes one page into typed connections (epoch-ms → YYYY-MM-DD)", () => {
+  it("preserves the exact connection timestamp from epoch milliseconds", () => {
     const page = { elements: [{ m: { firstName: "Jane", lastName: "Doe", publicIdentifier: "jane-9", headline: "PM" }, createdAt: 1707091200000 }] };
     const out = applyFieldMap(page, fieldMap as any);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({ firstName: "Jane", lastName: "Doe", profileUrl: "jane-9", headline: "PM" });
-    expect(out[0].connectedOn).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(out[0].connectedOn).toBe("2024-02-05T00:00:00.000Z");
   });
 
   it("passes through an ISO connectedOn string unchanged and accepts missing fields as null", () => {
@@ -183,8 +183,7 @@ describe("live connections contract (C1)", () => {
       headline: "Creative media and marketing specialist",
       profileUrl: "sample-person-296389207",
     });
-    // epoch-ms createdAt → YYYY-MM-DD
-    expect(out[0].connectedOn).toBe("2026-06-18");
+    expect(out[0].connectedOn).toBe("2026-06-18T22:00:40.000Z");
     // vector image composed at width 400
     expect(out[0].pictureUrl).toBe("https://media.example/dms/image/x/photo_400seg");
   });

@@ -30,6 +30,8 @@ export type MessagesTarget = {
 
 /** Recipe shape the orchestrator needs. Site specifics live here, never in code. */
 export type ScanRecipe = {
+  /** Required source-owner observation when present, checked throughout the scan. */
+  ownerAccountSource?: { listPathTemplate: string; idPath: string; usernamePath: string; sessionCookie?: string };
   /** Source discriminator + payload routing key (e.g. "linkedin_extension" | "x"). */
   source?: string;
   /** Human label for the popup (e.g. "LinkedIn", "X"). */
@@ -138,6 +140,8 @@ export type State = {
   lastScanCount: number | null;
   /** When the most recent automatic scan hit the network — drives the once-per-period throttle. */
   lastScanStartedAt: number | null;
+  /** Provider scan attempts survive worker restarts and noticed re-pairing. */
+  lastScanAttemptBySource?: Record<string, number> | null;
   /**
    * NT-99 follow-up — per-conversation had_reply verdict cache, keyed by
    * conversation urn: `{ at: lastActivityAt(ms) when probed, had_reply }`. Makes
@@ -172,6 +176,8 @@ export type State = {
   scanPhaseResults?: { connLists: ScanConnection[][]; messages: ScanMessage[]; messageHistory?: { version: 1; complete: true } } | null;
   /** The owner's own id resolved for the messages pass (direction). */
   scanSelfId?: string | null;
+  scanSourceSessionHash?: string | null;
+  scanOwnerAccount?: { memberId: string; username: string } | null;
   /** When the current scan began — drives the stale-zombie guard. */
   scanStartedAt?: number | null;
   /**
@@ -220,6 +226,7 @@ const KEYS: (keyof State)[] = [
   "lastScanAt",
   "lastScanCount",
   "lastScanStartedAt",
+  "lastScanAttemptBySource",
   "hadReplyByConversation",
   "needs",
   "testMode",
@@ -232,6 +239,8 @@ const KEYS: (keyof State)[] = [
   "scanItems",
   "scanPhaseResults",
   "scanSelfId",
+  "scanOwnerAccount",
+  "scanSourceSessionHash",
   "scanStartedAt",
   "scanNeedsRecipeRefresh",
   "scanFailures",

@@ -61,6 +61,136 @@ function inProgress(extra: Record<string, unknown> = {}): Record<string, unknown
 
 const account = { id: "acct-1", displayName: "Test User" };
 
+describe("source owner binding", () => {
+  it.each(["transport", "json", "session", "session-bound"])("terminates owner %s failures and records a recoverable error", async (mode) => {
+    const chrome=getChrome(); sw.registerListeners();
+    await chrome.storage.local.set({recipe:{...recipe,ownerAccountSource:{listPathTemplate:"/me",idPath:"id",usernamePath:"handle",...(mode.startsWith("session")?{sessionCookie:"session"}:{})}},account,...inProgress()});
+    vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    let checks=0;
+    if(mode.startsWith("session"))vi.mocked(chrome.cookies.get).mockImplementation(async({name})=>{if(name==="session" && (++checks>1 || mode==="session"))throw new Error("cookie service unavailable");return {name,value:"abc"};});
+    const fetchImpl=vi.fn(async()=>{if(mode==="transport")throw new TypeError("offline");return new Response("invalid-json");});
+    await expect(sw.continueScan({fetchImpl:fetchImpl as typeof fetch})).resolves.toMatchObject({ok:false,note:"source-account-failed"});
+    expect(await chrome.storage.local.get(null)).toMatchObject({scanInProgress:false,scanFailures:{linkedin_extension:{message:expect.stringContaining("verify")}}});
+  });
+  const ownerAccountSource = { listPathTemplate: "/me", idPath: "me.id", usernamePath: "me.handle" };
+  beforeEach(() => { sw.registerListeners(); });
+  it("allows the exact local test origin only in a development build", () => {
+    (globalThis as any).__DEV__ = false;
+    expect(sw.isNoticedOrigin("http://localhost:3011")).toBe(false);
+    (globalThis as any).__DEV__ = true;
+    expect(sw.isNoticedOrigin("http://localhost:3011")).toBe(true);
+    expect(sw.isNoticedOrigin("http://localhost:3012")).toBe(false);
+    expect(sw.isNoticedOrigin("http://localhost.evil.example:3011")).toBe(false);
+  });
+  it("captures the owner before scanning and attaches it to the completed payload", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource }, account,
+      ...inProgress() });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchImpl = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/me")
+      ? { me: { id: "urn:li:fsd_profile:ACoAA-owner", handle: "owner-handle" } }
+      : { elements: [makeElement("jane")] }), { status: 200 }));
+    await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 });
+    const stored = await chrome.storage.local.get(null);
+    expect((stored.pendingScans as any)?.linkedin_extension?.payload?.ownerAccount)
+      .toEqual({ memberId: "ACoAA-owner", username: "owner-handle" });
+    expect(fetchImpl.mock.calls[0]?.[0]).toContain("/me");
+  });
+  it("detects a session-cookie change during a page request without storing the credential", async () => {
+    const chrome = getChrome();
+    let session = "PRIVATE-CREDENTIAL-ONE";
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource: { ...ownerAccountSource, sessionCookie: "session" } }, account, ...inProgress() });
+    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }) => ({ name, value: name === "session" ? session : "abc" }));
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/me")) return new Response(JSON.stringify({ me: { id: "ACoAA-owner", handle: "owner-handle" } }), { status: 200 });
+      session = "PRIVATE-CREDENTIAL-TWO";
+      return new Response(JSON.stringify({ elements: [makeElement("jane")] }), { status: 200 });
+    });
+    await expect(sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 }))
+      .resolves.toMatchObject({ ok: false, note: "source-account-failed" });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans).toBeUndefined();
+    expect(stored.scanInProgress).toBe(false);
+    expect(stored.scanSourceSessionHash).toBeNull();
+    expect(stored.scanFailures).toMatchObject({ linkedin_extension: { message: expect.stringContaining("account changed") } });
+    expect(JSON.stringify(stored)).not.toContain("PRIVATE-CREDENTIAL");
+  });
+  it.each(["resume", "during scan"])("rejects a source-account switch %s without handing off mixed data", async (mode) => {
+    const chrome = getChrome();
+    const owner = { memberId: "ACoAA-owner", username: "owner-handle" };
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource }, account,
+      ...inProgress(mode === "resume" ? { scanOwnerAccount: owner, scanItems: [makeElement("prior")] } : {}) });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    let probes = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      const switched = mode === "resume" || ++probes > 1;
+      return new Response(JSON.stringify(url.endsWith("/me")
+        ? { me: { id: switched ? "ACoAA-other" : owner.memberId, handle: switched ? "other" : owner.username } }
+        : { elements: [makeElement("jane")] }), { status: 200 });
+    });
+    await expect(sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 }))
+      .resolves.toMatchObject({ ok: false, note: "source-account-failed" });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.pendingScans).toBeUndefined();
+    expect(stored).toMatchObject({ scanInProgress: false, scanSource: null, scanItems: null,
+      scanOwnerAccount: null, scanSourceSessionHash: null,
+      scanFailures: { linkedin_extension: { message: expect.stringContaining("account changed") } } });
+    expect(await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch })).toMatchObject({ note: "not-in-progress" });
+  });
+  it.each(["unavailable", "unproven"])("terminates an %s owner binding without retaining an unsafe checkpoint", async (mode) => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource }, account,
+      ...inProgress(mode === "unproven" ? { scanItems: [makeElement("prior")] } : {}) });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify(mode === "unavailable"
+      ? {} : { me: { id: "ACoAA-owner", handle: "owner-handle" } }), { status: 200 }));
+    expect(await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch }))
+      .toMatchObject({ ok: false, note: "source-account-failed" });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored).toMatchObject({ scanInProgress: false, scanItems: null, scanPhaseResults: null });
+    expect((stored.scanFailures as any).linkedin_extension.message).toMatch(/retry|new scan/i);
+    expect((stored.scanFailures as any).linkedin_extension.resume).toBeUndefined();
+    expect(stored.pendingScans).toBeUndefined();
+  });
+  it("lets the production plan continue queued work after an owner failure", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource },
+      recipes: { linkedin_extension: { ...recipe, ownerAccountSource }, x: xRecipe }, account,
+      noticedOrigin: "https://app.noticed.so", ...inProgress({ scanQueue: ["x"] }) });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/me")
+      ? {} : { elements: [] }), { status: 200 })));
+    chrome.alarms.onAlarm.dispatch({ name: "scan-tick" });
+    await vi.waitFor(async () => {
+      const stored = await chrome.storage.local.get(null);
+      expect(stored.scanInProgress).toBe(false);
+      expect(stored.scanQueue).toEqual([]);
+      expect((stored.pendingScans as any)?.x).toBeDefined();
+      expect((stored.pendingScans as any)?.linkedin_extension).toBeUndefined();
+      expect((stored.scanFailures as any)?.linkedin_extension?.message).toMatch(/retry/i);
+    });
+  });
+  it("does not clear a replacement account's scan when an old owner lookup fails", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource }, account, ...inProgress() });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    let release!: (response: Response) => void;
+    const fetchImpl = vi.fn(() => new Promise<Response>((resolve) => { release = resolve; }));
+    const oldScan = sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    const replacement = { id: "acct-2", displayName: "Replacement" };
+    await chrome.storage.local.set({ account: replacement,
+      ...inProgress({ scanAccountId: "id:acct-2", scanItems: [makeElement("replacement")] }) });
+    release(new Response("{}", { status: 200 }));
+    expect(await oldScan).toMatchObject({ ok: false, note: "superseded" });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored).toMatchObject({ account: replacement, scanInProgress: true,
+      scanAccountId: "id:acct-2", scanItems: [makeElement("replacement")] });
+    expect(stored.scanFailures).toBeUndefined();
+  });
+});
+
 function makeElement(id: string) {
   return {
     m: { publicIdentifier: id, firstName: id.toUpperCase(), lastName: "X", headline: "h" },
@@ -103,12 +233,181 @@ async function pair() {
 }
 
 describe("service worker", () => {
+  it.each(["website", "popup"])("blocks a fresh LinkedIn scan within 24 hours from %s", async (entry) => {
+    sw.registerListeners(); const chrome=getChrome(); const at=Date.now()-60_000;
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",lastScanBySource:{linkedin_extension:{at,count:2}}});
+    vi.spyOn(chrome.permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    const response=entry==="website"?await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender):await dispatchInternal({type:"scanNow"});
+    expect(response).toMatchObject({ok:false,error:"rate_limited",retryAt:new Date(at+86400000).toISOString()});
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await chrome.storage.local.get(null)).scanInProgress).not.toBe(true);
+  });
+  it("scans another network while reporting the LinkedIn cooldown",async()=>{
+    sw.registerListeners();const chrome=getChrome();const at=Date.now();
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{linkedin_extension:at}});
+    vi.spyOn(chrome.permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    const fetch=vi.fn(async(url:string)=>({ok:true,status:200,json:async()=>url.includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}}));vi.stubGlobal("fetch",fetch);
+    expect(await dispatchInternal({type:"scanNow"})).toMatchObject({ok:true,status:"started"});
+    await vi.waitFor(async()=>expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false));
+    const status=await dispatchInternal({type:"getStatus"}) as {sources:Array<{source:string;refreshAvailableAt:string|null}>};
+    expect(status.sources.find(s=>s.source==="linkedin_extension")?.refreshAvailableAt).toBe(new Date(at+86400000).toISOString());
+    expect(fetch.mock.calls.some(([url])=>url.startsWith(recipe.targetOrigin))).toBe(false);
+    expect(fetch.mock.calls.some(([url])=>url.startsWith(xRecipe.targetOrigin))).toBe(true);
+  });
+  it("retains actionable recovery when a user retry is blocked by the daily limit",async()=>{
+    sw.registerListeners();const chrome=getChrome();
+    const original={message:"Previous failure"};
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{linkedin_extension:Date.now()},scanFailures:{linkedin_extension:original},syncRecovery:{linkedin_extension:{status:"needs_attention",rescans:0,uploads:0}}});
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    expect(await dispatchExternal({type:"retrySync",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"rate_limited"});
+    expect(await chrome.storage.local.get(null)).toMatchObject({scanFailures:{linkedin_extension:original},syncRecovery:{linkedin_extension:{status:"needs_attention"}}});
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("persists attempt throttling through worker restart and permits a fresh scan at the 24-hour boundary", async()=>{
+    sw.registerListeners();const chrome=getChrome();const at=Date.now()-86400000+1;
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{linkedin_extension:at}});
+    const clock = vi.spyOn(Date,"now").mockReturnValue(at+86400000-1);
+    try {
+    vi.spyOn(chrome.permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async(url:string)=>({ok:true,status:200,json:async()=>url.includes(RECIPE_PATH)?{recipe,recipes:[recipe],account}:{elements:[]}})));
+    const message={type:"scanNow",source:"linkedin_extension",accountId:account.id};
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:false,error:"rate_limited"});
+    sw.registerListeners();
+    vi.mocked(Date.now).mockReturnValue(at+86400000);
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:true,status:"started"});
+    await vi.waitFor(async()=>expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false));
+    expect((await chrome.storage.local.get(null)).lastScanAttemptBySource).toEqual({linkedin_extension:at+86400000});
+    } finally {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      clock.mockRestore();
+    }
+  });
+  it("queues the missing source of an overlapping popup plan without replacing the active checkpoint",async()=>{
+    sw.registerListeners();const chrome=getChrome();
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanItems:[{id:"keep"}],scanQueue:[]})});
+    vi.spyOn(chrome.permissions,"contains").mockResolvedValue(true);
+    await dispatchInternal({type:"scanNow"});
+    expect(await chrome.storage.local.get(null)).toMatchObject({scanSource:"linkedin_extension",scanItems:[{id:"keep"}],scanQueue:["x"]});
+  });
   beforeEach(() => {
     // re-import side effects already ran at module load; listeners are registered
     // against the fresh per-test chrome mock via lazy registration.
     sw.registerListeners();
   });
 
+  it("accepts a first-party scan request only for the paired account and acknowledges without a popup", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"request");
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async (url: string)=>({ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe],account}:{elements:[]}})));
+    const result=await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender);
+    expect(result).toMatchObject({ok:true,status:"started"});
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect((await getChrome().storage.local.get(null)).account).toMatchObject(account);
+    expect(getChrome().permissions.request).not.toHaveBeenCalled();
+  });
+  it("rejects another account's external scan without changing pairing or making requests", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:"other"},noticedSender)).toMatchObject({ok:false,error:"account_mismatch"});
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await getChrome().storage.local.get(null)).account).toMatchObject(account);
+  });
+  it("reports permission and sign-in requirements without prompting from a webpage", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"request");
+    const permissions=vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(false);
+    const message={type:"scanNow",source:"linkedin_extension",accountId:account.id};
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:false,error:"permission_required"});
+    permissions.mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue(null);
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:false,error:"network_signin_required"});
+    expect(getChrome().permissions.request).not.toHaveBeenCalled();
+  });
+  it("reuses an active scan and rejects non-first-party senders", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanAccountId:"id:acct-1"})});
+    const message={type:"scanNow",source:"linkedin_extension",accountId:account.id};
+    expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:true,status:"already_running"});
+    expect(await dispatchExternal(message,{origin:"https://evil.example"})).toBeUndefined();
+  });
+
+  it("reports retryable busy when only X is active instead of claiming LinkedIn is running", async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanSource:"x",scanQueue:[],scanAccountId:"id:acct-1"})});
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"source_busy"});
+    await getChrome().storage.local.set({scanQueue:["linkedin_extension"]});
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:true,status:"already_running"});
+  });
+  it("does not mistake an unknown cookie probe for signed out",async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockRejectedValue(new Error("transient cookie failure"));
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"request_failed"});
+  });
+  it.each([false, true])("preserves an idle X queue when a website scan arrives (queue during probe: %s)", async (duringProbe) => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",scanInProgress:false,scanSource:"linkedin_extension",scanQueue:duringProbe ? [] : ["x"]});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockImplementationOnce(async()=>{
+      if (duringProbe) await getChrome().storage.local.set({scanInProgress:false,scanQueue:["x"]});
+      return {name:"tok",value:"abc"};
+    }).mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async (url: string)=>({ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}})));
+    const result=await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender);
+    await new Promise(resolve=>setTimeout(resolve,30));
+    expect(result).toMatchObject({ok:false,error:"source_busy"});
+    expect((await getChrome().storage.local.get(null)).scanQueue).toEqual(["x"]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("reuses LinkedIn queued between sources without changing the queue", async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",scanInProgress:false,scanQueue:["x","linkedin_extension"]});
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:true,status:"already_running"});
+    expect((await getChrome().storage.local.get(null)).scanQueue).toEqual(["x","linkedin_extension"]);
+  });
+  it("checks source admission atomically when X starts during the sign-in probe",async()=>{
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockImplementation(async()=>{
+      await getChrome().storage.local.set(inProgress({scanSource:"x",scanQueue:[],scanAccountId:"id:acct-1"}));
+      return {name:"tok",value:"abc"};
+    });
+    expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"source_busy"});
+    expect((await getChrome().storage.local.get(null)).scanSource).toBe("x");
+  });
+  it.each(["alarm", "permission"])("preserves a website-started scan when the %s starter resumes its permission probe", async (starter) => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    let releaseProbe!: (granted: boolean)=>void;
+    let probeSeen!: ()=>void;
+    let releaseFetch!: ()=>void;
+    const firstProbe=new Promise<boolean>(resolve=>{releaseProbe=resolve;});
+    const probing=new Promise<void>(resolve=>{probeSeen=resolve;});
+    const fetchGate=new Promise<void>(resolve=>{releaseFetch=resolve;});
+    vi.spyOn(getChrome().permissions,"contains").mockImplementationOnce(()=>{probeSeen();return firstProbe;}).mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    vi.stubGlobal("fetch",vi.fn(async(url: string)=>{
+      await fetchGate;
+      return {ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}};
+    }));
+    if(starter==="alarm") getChrome().alarms.onAlarm.dispatch({name:"scan"});
+    else getChrome().permissions.onAdded.dispatch({origins:[xRecipe.targetOrigin+"/*"]});
+    try {
+      await probing;
+      expect(await dispatchExternal({type:"scanNow",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:true,status:"started"});
+      const before=await getChrome().storage.local.get(null);
+      releaseProbe(true);
+      await new Promise(resolve=>setTimeout(resolve,20));
+      expect(await getChrome().storage.local.get(null)).toMatchObject({scanInProgress:true,scanSource:before.scanSource,scanQueue:["x"],scanStartedAt:before.scanStartedAt});
+    } finally {
+      // Finish the gated fixture before the next test swaps the Chrome mock.
+      releaseProbe(true);
+      await getChrome().storage.local.set({scanInProgress:false,scanQueue:[]});
+      releaseFetch();
+      await new Promise(resolve=>setTimeout(resolve,30));
+    }
+  });
   it("1. external pair from allowed origin stores state + creates alarm, acks, and does NOT request permissions (no user gesture in the SW)", async () => {
     const chrome = getChrome();
     const createAlarm = vi.spyOn(chrome.alarms, "create");
@@ -2433,15 +2732,17 @@ describe("service worker", () => {
     expect(byCp["https://www.linkedin.com/in/jane"]).toBe(true); // cached recipe drove it
   });
 
-  it("34b. a malformed 200 recipe body is NOT stored over the good cached recipe (and the scan still completes)", async () => {
+  it.each([
+    { error: "unauthorized" },
+    { recipe: { ...recipe, ownerAccountSource: {} }, recipes: [{ ...recipe, ownerAccountSource: {} }] },
+  ])("34b. a malformed 200 recipe body is NOT stored over the good cached recipe (and the scan still completes): %j", async (body) => {
     const chrome = getChrome();
     await dispatchExternal({ type: "pair", recipe: liMessagesRecipe, account }, noticedSender);
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
 
-    // A 200 that is NOT a recipe (an HTML login page, an error body, …).
-    const fetchSpy = makeServerFetch({ error: "unauthorized" });
+    const fetchSpy = makeServerFetch(body);
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
 
     await dispatchInternal({ type: "scanNow" });
