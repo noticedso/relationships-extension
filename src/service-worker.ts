@@ -1328,8 +1328,14 @@ async function drainScanQueue(): Promise<void> {
         return null;
       }
       const recipes = recipesOf(state);
-      if (!recipes[candidate] || scanCooldown(state, candidate)) {
-        await setState({ scanQueue: rest });
+      const cooldown = scanCooldown(state, candidate);
+      if (!recipes[candidate] || cooldown) {
+        await setState({ scanQueue: rest,
+          ...(cooldown && state.syncRecovery?.[candidate] ? {
+            syncRecovery: { ...state.syncRecovery, [candidate]: { ...state.syncRecovery[candidate]!, status: "needs_attention", retryAt: undefined } },
+            scanFailures: { ...state.scanFailures, [candidate]: { message: `Refresh available after ${cooldown.retryAt}` } },
+          } : {}),
+        });
         return "skip" as const;
       }
       await setState({
@@ -1414,13 +1420,15 @@ function isIncompleteX(pending: PendingScan): boolean {
       && typeof m.conversationId === "string" && /^\d+[-:]\d+$/.test(m.conversationId));
 }
 
-async function queueUserRetry(source: string, accountId: string): Promise<boolean> {
+async function queueUserRetry(source: string, accountId: string): Promise<{ ok: boolean; error?: "rate_limited"; retryAt?: string }> {
   return withAccountStateMutation(async () => {
     const state = await getState();
     const recipes = recipesOf(state);
     const recipe = recipeForSource(recipes, source);
-    if (stableAccountId(state.account) !== accountId || !recipe || state.scanInProgress) return false;
+    if (stableAccountId(state.account) !== accountId || !recipe || state.scanInProgress) return { ok: false };
     const scanSource = sourceOf(recipe);
+    const cooldown = scanCooldown(state, scanSource);
+    if (cooldown) return cooldown;
     const aliases = (source === "x" || source === "x_extension" ? ["x", "x_extension"] : [source])
       .filter(candidate => recipeForSource(recipes, candidate) === recipe);
     const recovery = { ...state.syncRecovery };
@@ -1441,7 +1449,7 @@ async function queueUserRetry(source: string, accountId: string): Promise<boolea
       ...(state.syncTabId != null && closingTabs.has(state.syncTabId) ? { syncTabId: null } : {}),
       scanQueue: [...new Set([...(state.scanQueue ?? []).filter(candidate => !aliases.includes(candidate)), scanSource])] });
     for (const tabId of closingTabs) await chrome.tabs.remove(tabId).catch(() => {});
-    return true;
+    return { ok: true };
   });
 }
 
@@ -1584,6 +1592,7 @@ async function buildStatus(): Promise<Record<string, unknown>> {
         granted: isGranted,
         signedIn: isGranted ? await isSignedIn(recipe) : null,
         pending: pendingSource != null,
+        refreshAvailableAt: scanCooldown(state, source)?.retryAt ?? null,
         lastScanAt: lastSource ? lastBy[lastSource]?.at ?? null : null,
         lastScanCount: lastSource ? lastBy[lastSource]?.count ?? null : null,
       };
@@ -1791,9 +1800,9 @@ async function handleExternal(
       return;
     }
     case "retrySync": {
-      const accepted = await queueUserRetry(message.source, message.accountId);
-      sendResponse({ ok: accepted });
-      if (accepted) void drainScanQueue();
+      const result = await queueUserRetry(message.source, message.accountId);
+      sendResponse(result);
+      if (result.ok) void drainScanQueue();
       return;
     }
     case "syncConfirmed": {

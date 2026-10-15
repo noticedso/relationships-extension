@@ -37,10 +37,15 @@ export async function bindSourceSession(recipe: ScanRecipe, state: Partial<State
   const name = recipe.ownerAccountSource?.sessionCookie;
   if (!name) return { fetch: fetchImpl };
   const sessionHash = async () => {
-    const cookie = await chrome.cookies.get({ url: recipe.targetOrigin, name });
-    if (!cookie?.value) throw new SourceAccountError("unavailable");
-    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(cookie.value));
-    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+    try {
+      const cookie = await chrome.cookies.get({ url: recipe.targetOrigin, name });
+      if (!cookie?.value) throw new SourceAccountError("unavailable");
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(cookie.value));
+      return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+    } catch (error) {
+      if (error instanceof SourceAccountError) throw error;
+      throw new SourceAccountError("unavailable");
+    }
   };
   const expected = await sessionHash();
   if (state.scanSourceSessionHash && state.scanSourceSessionHash !== expected)

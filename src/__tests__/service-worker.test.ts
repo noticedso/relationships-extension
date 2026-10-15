@@ -62,10 +62,12 @@ function inProgress(extra: Record<string, unknown> = {}): Record<string, unknown
 const account = { id: "acct-1", displayName: "Test User" };
 
 describe("source owner binding", () => {
-  it.each(["transport", "json"])("terminates owner %s failures and records a recoverable error", async (mode) => {
+  it.each(["transport", "json", "session", "session-bound"])("terminates owner %s failures and records a recoverable error", async (mode) => {
     const chrome=getChrome(); sw.registerListeners();
-    await chrome.storage.local.set({recipe:{...recipe,ownerAccountSource:{listPathTemplate:"/me",idPath:"id",usernamePath:"handle"}},account,...inProgress()});
+    await chrome.storage.local.set({recipe:{...recipe,ownerAccountSource:{listPathTemplate:"/me",idPath:"id",usernamePath:"handle",...(mode.startsWith("session")?{sessionCookie:"session"}:{})}},account,...inProgress()});
     vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    let checks=0;
+    if(mode.startsWith("session"))vi.mocked(chrome.cookies.get).mockImplementation(async({name})=>{if(name==="session" && (++checks>1 || mode==="session"))throw new Error("cookie service unavailable");return {name,value:"abc"};});
     const fetchImpl=vi.fn(async()=>{if(mode==="transport")throw new TypeError("offline");return new Response("invalid-json");});
     await expect(sw.continueScan({fetchImpl:fetchImpl as typeof fetch})).resolves.toMatchObject({ok:false,note:"source-account-failed"});
     expect(await chrome.storage.local.get(null)).toMatchObject({scanInProgress:false,scanFailures:{linkedin_extension:{message:expect.stringContaining("verify")}}});
@@ -242,10 +244,33 @@ describe("service worker", () => {
     expect(fetch).not.toHaveBeenCalled();
     expect((await chrome.storage.local.get(null)).scanInProgress).not.toBe(true);
   });
+  it("scans another network while reporting the LinkedIn cooldown",async()=>{
+    sw.registerListeners();const chrome=getChrome();const at=Date.now();
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{linkedin_extension:at}});
+    vi.spyOn(chrome.permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    const fetch=vi.fn(async(url:string)=>({ok:true,status:200,json:async()=>url.includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}}));vi.stubGlobal("fetch",fetch);
+    expect(await dispatchInternal({type:"scanNow"})).toMatchObject({ok:true,status:"started"});
+    await vi.waitFor(async()=>expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false));
+    const status=await dispatchInternal({type:"getStatus"}) as {sources:Array<{source:string;refreshAvailableAt:string|null}>};
+    expect(status.sources.find(s=>s.source==="linkedin_extension")?.refreshAvailableAt).toBe(new Date(at+86400000).toISOString());
+    expect(fetch.mock.calls.some(([url])=>url.startsWith(recipe.targetOrigin))).toBe(false);
+    expect(fetch.mock.calls.some(([url])=>url.startsWith(xRecipe.targetOrigin))).toBe(true);
+  });
+  it("retains actionable recovery when a user retry is blocked by the daily limit",async()=>{
+    sw.registerListeners();const chrome=getChrome();
+    const original={message:"Previous failure"};
+    await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{linkedin_extension:Date.now()},scanFailures:{linkedin_extension:original},syncRecovery:{linkedin_extension:{status:"needs_attention",rescans:0,uploads:0}}});
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    expect(await dispatchExternal({type:"retrySync",source:"linkedin_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"rate_limited"});
+    expect(await chrome.storage.local.get(null)).toMatchObject({scanFailures:{linkedin_extension:original},syncRecovery:{linkedin_extension:{status:"needs_attention"}}});
+    expect(fetch).not.toHaveBeenCalled();
+  });
   it("persists attempt throttling through worker restart and permits a fresh scan at the 24-hour boundary", async()=>{
     sw.registerListeners();const chrome=getChrome();const at=Date.now()-86400000+1;
     await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{linkedin_extension:at}});
-    vi.spyOn(Date,"now").mockReturnValue(at+86400000-1);
+    const clock = vi.spyOn(Date,"now").mockReturnValue(at+86400000-1);
+    try {
     vi.spyOn(chrome.permissions,"contains").mockResolvedValue(true);
     vi.spyOn(chrome.cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
     vi.stubGlobal("fetch",vi.fn(async(url:string)=>({ok:true,status:200,json:async()=>url.includes(RECIPE_PATH)?{recipe,recipes:[recipe],account}:{elements:[]}})));
@@ -256,6 +281,10 @@ describe("service worker", () => {
     expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:true,status:"started"});
     await vi.waitFor(async()=>expect((await chrome.storage.local.get(null)).scanInProgress).toBe(false));
     expect((await chrome.storage.local.get(null)).lastScanAttemptBySource).toEqual({linkedin_extension:at+86400000});
+    } finally {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      clock.mockRestore();
+    }
   });
   it("queues the missing source of an overlapping popup plan without replacing the active checkpoint",async()=>{
     sw.registerListeners();const chrome=getChrome();
