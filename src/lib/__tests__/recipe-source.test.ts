@@ -35,6 +35,22 @@ describe("recipe-source", () => {
   });
 
   describe("isValidScanRecipe", () => {
+    const ownerSource = { listPathTemplate: "/me", idPath: "me.id", usernamePath: "me.handle" };
+    it.each([
+      null, [], "bad", {},
+      ...["listPathTemplate", "idPath", "usernamePath"].flatMap((key) =>
+        [undefined, null, "", "   ", 42].map((value) => ({ ...ownerSource, [key]: value }))),
+      { ...ownerSource, listPathTemplate: "//other.example/me" },
+      { ...ownerSource, listPathTemplate: "https://other.example/me" },
+      ...[null, "", "   ", 42, {}].map((sessionCookie) => ({ ...ownerSource, sessionCookie })),
+    ])("rejects malformed owner account configuration before accepting recipes: %j", (ownerAccountSource) => {
+      const malformed = makeRecipe({ ownerAccountSource } as unknown as Partial<ScanRecipe>);
+      expect(isValidScanRecipe(malformed)).toBe(false);
+      expect(parseServedRecipes({ recipes: [makeRecipe(), malformed] })).toBeNull();
+    });
+    it.each([ownerSource, { ...ownerSource, sessionCookie: "li_at" }])("accepts complete owner account configuration: %j", (ownerAccountSource) => {
+      expect(isValidScanRecipe(makeRecipe({ ownerAccountSource }))).toBe(true);
+    });
     const selfIdCookie = { name: "twid", pattern: "u=([0-9]+)" };
     const history = {
       initialPath: "https://api.x.com/initial", inboxPath: "/inbox", requestsPath: "/requests",

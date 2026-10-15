@@ -318,6 +318,11 @@ let handoffReconcile: Promise<void> | null = null;
 
 class ScanSupersededError extends Error {}
 class ScanSourceBusyError extends Error {}
+class SourceAccountError extends Error {
+  constructor(readonly reason: "changed" | "unavailable" | "unproven") {
+    super(`source_account_${reason}`);
+  }
+}
 
 function accountKey(account: Account | null | undefined): string | null {
   const id = typeof account?.id === "string" ? account.id.trim() : "";
@@ -623,17 +628,17 @@ async function readSourceOwner(
   const spec = recipe.ownerAccountSource!;
   const res = await fetchImpl(recipe.targetOrigin + spec.listPathTemplate,
     { credentials: "include", cache: "no-store", headers });
-  if (!res.ok) throw new Error("source_account_unavailable");
+  if (!res.ok) throw new SourceAccountError("unavailable");
   const json = await res.json();
   const memberId = String(getByPath(json, spec.idPath) ?? "").split(":").pop()?.trim() ?? "";
   const username = String(getByPath(json, spec.usernamePath) ?? "").trim().toLowerCase();
-  if (!memberId || !username) throw new Error("source_account_unavailable");
+  if (!memberId || !username) throw new SourceAccountError("unavailable");
   return { memberId, username };
 }
 
 function assertSourceOwner(expected: { memberId: string; username: string }, actual: { memberId: string; username: string }): void {
   if (expected.memberId !== actual.memberId || expected.username !== actual.username)
-    throw new Error("source_account_changed");
+    throw new SourceAccountError("changed");
 }
 
 /**
@@ -827,6 +832,7 @@ async function runLinkedInMessageEventsPass(
 export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResult> {
   if (scanRunning) return { ok: true, note: "already-running" };
   scanRunning = true;
+  let activeScan: { source: string; accountId: string | null; recipe: ScanRecipe } | undefined;
   try {
     const unguardedFetch = deps.fetchImpl ?? globalThis.fetch;
     let fetchImpl = unguardedFetch;
@@ -839,6 +845,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     let recipe = recipesOf(state)[scanSource];
     if (!recipe) return { ok: false };
     const scanAccountId = normalizeAccountKey(state.scanAccountId) ?? accountKey(state.account);
+    activeScan = { source: scanSource, accountId: scanAccountId, recipe };
     const assertCurrent = () => assertCurrentScan(scanSource, scanAccountId);
     if (state.scanAccountId !== scanAccountId) {
       await updateCurrentScan(scanSource, scanAccountId, { scanAccountId });
@@ -902,20 +909,20 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     if (sessionCookie) {
       const sessionHash = async () => {
         const cookie = await chrome.cookies.get({ url: recipe.targetOrigin, name: sessionCookie });
-        if (!cookie?.value) throw new Error("source_account_unavailable");
+        if (!cookie?.value) throw new SourceAccountError("unavailable");
         const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(cookie.value));
         return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
       };
       const expected = await sessionHash();
       if (state.scanSourceSessionHash && state.scanSourceSessionHash !== expected)
-        throw new Error("source_account_changed");
+        throw new SourceAccountError("changed");
       if (!state.scanSourceSessionHash && ((state.scanItems?.length ?? 0) > 0 || (state.scanPhaseIndex ?? 0) > 0))
-        throw new Error("source_account_unproven");
+        throw new SourceAccountError("unproven");
       await updateCurrentScan(scanSource, scanAccountId, { scanSourceSessionHash: expected });
       fetchImpl = async (input, init) => {
-        if (await sessionHash() !== expected) throw new Error("source_account_changed");
+        if (await sessionHash() !== expected) throw new SourceAccountError("changed");
         const response = await unguardedFetch(input, init);
-        if (await sessionHash() !== expected) throw new Error("source_account_changed");
+        if (await sessionHash() !== expected) throw new SourceAccountError("changed");
         return response;
       };
     }
@@ -935,8 +942,8 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       await assertCurrent();
       if (state.scanOwnerAccount) assertSourceOwner(state.scanOwnerAccount, ownerAccount);
       else if ((state.scanItems?.length ?? 0) > 0 || (state.scanPhaseIndex ?? 0) > 0)
-        throw new Error("source_account_unproven");
-      if (selfId && selfId !== ownerAccount.memberId) throw new Error("source_account_changed");
+        throw new SourceAccountError("unproven");
+      if (selfId && selfId !== ownerAccount.memberId) throw new SourceAccountError("changed");
       selfId = ownerAccount.memberId;
       await updateCurrentScan(scanSource, scanAccountId, { scanOwnerAccount: ownerAccount, scanSelfId: selfId });
     }
@@ -1152,6 +1159,25 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     );
   } catch (error) {
     if (error instanceof ScanSupersededError) return { ok: false, note: "superseded" };
+    if (error instanceof SourceAccountError && activeScan) {
+      const current = await getState();
+      const message = error.reason === "changed"
+        ? "The signed-in network account changed. Sign in to the original account and retry."
+        : error.reason === "unproven"
+          ? "This scan's network account could not be verified. Start a new scan."
+          : "We couldn't verify the signed-in network account. Sign in to the network and retry.";
+      try {
+        await updateCurrentScan(activeScan.source, activeScan.accountId, {
+          ...clearedScanState(),
+          ...historyFailureState({ ...current, scanItems: null }, activeScan.source, message, activeScan.recipe),
+        });
+      } catch (failure) {
+        if (failure instanceof ScanSupersededError) return { ok: false, note: "superseded" };
+        throw failure;
+      }
+      clearScanTick();
+      return { ok: false, note: "source-account-failed" };
+    }
     throw error;
   } finally {
     scanRunning = false;
