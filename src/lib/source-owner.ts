@@ -11,14 +11,19 @@ export async function readSourceOwner(
   recipe: ScanRecipe, headers: Record<string, string>, fetchImpl: typeof fetch,
 ): Promise<{ memberId: string; username: string }> {
   const spec = recipe.ownerAccountSource!;
-  const res = await fetchImpl(recipe.targetOrigin + spec.listPathTemplate,
+  try {
+    const res = await fetchImpl(recipe.targetOrigin + spec.listPathTemplate,
     { credentials: "include", cache: "no-store", headers });
-  if (!res.ok) throw new SourceAccountError("unavailable");
-  const json = await res.json();
-  const memberId = String(getByPath(json, spec.idPath) ?? "").split(":").pop()?.trim() ?? "";
-  const username = String(getByPath(json, spec.usernamePath) ?? "").trim().toLowerCase();
-  if (!memberId || !username) throw new SourceAccountError("unavailable");
-  return { memberId, username };
+    if (!res.ok) throw new SourceAccountError("unavailable");
+    const json = await res.json();
+    const memberId = String(getByPath(json, spec.idPath) ?? "").split(":").pop()?.trim() ?? "";
+    const username = String(getByPath(json, spec.usernamePath) ?? "").trim().toLowerCase();
+    if (!memberId || !username) throw new SourceAccountError("unavailable");
+    return { memberId, username };
+  } catch (error) {
+    if (error instanceof SourceAccountError) throw error;
+    throw new SourceAccountError("unavailable");
+  }
 }
 
 export function assertSourceOwner(expected: { memberId: string; username: string }, actual: { memberId: string; username: string }): void {

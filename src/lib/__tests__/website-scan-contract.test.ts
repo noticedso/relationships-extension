@@ -20,7 +20,13 @@ describe("website scan protocol v1", () => {
       error,
     });
   });
+  it("preserves a daily cooldown with its next eligible timestamp", () => {
+    const reply = {ok:false,error:"rate_limited",retryAt:"2026-10-16T12:00:00Z"};
+    expect(parseScanNowResponse(reply)).toEqual(reply);
+  });
   it.each([
+    {ok:false,error:"rate_limited"},
+    {ok:false,error:"rate_limited",retryAt:"invalid"},
     null,
     {},
     { ok: "yes", status: "started" },

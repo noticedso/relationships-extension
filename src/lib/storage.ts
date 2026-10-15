@@ -140,6 +140,8 @@ export type State = {
   lastScanCount: number | null;
   /** When the most recent automatic scan hit the network — drives the once-per-period throttle. */
   lastScanStartedAt: number | null;
+  /** Provider scan attempts survive worker restarts and noticed re-pairing. */
+  lastScanAttemptBySource?: Record<string, number> | null;
   /**
    * NT-99 follow-up — per-conversation had_reply verdict cache, keyed by
    * conversation urn: `{ at: lastActivityAt(ms) when probed, had_reply }`. Makes
@@ -224,6 +226,7 @@ const KEYS: (keyof State)[] = [
   "lastScanAt",
   "lastScanCount",
   "lastScanStartedAt",
+  "lastScanAttemptBySource",
   "hadReplyByConversation",
   "needs",
   "testMode",

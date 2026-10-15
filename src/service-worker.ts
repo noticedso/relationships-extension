@@ -1254,54 +1254,63 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
   return continueScan(deps);
 }
 
-/** All starters use the same policy while holding the account-state lock. */
-function scanPlanAdmission(state: Partial<State>, sources: string[]): ScanNowResponse | null {
-  if (!state.scanInProgress && !(state.scanQueue?.length)) return null;
-  const owed = (state.scanInProgress && sources.includes(state.scanSource ?? ""))
-    || sources.some(source => (state.scanQueue ?? []).includes(source));
-  return owed ? { ok: true, status: "already_running" } : { ok: false, error: "source_busy" };
+const LINKEDIN_MIN_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/** Rate admission is inside the same lock as checkpoint/queue initialization. */
+function scanCooldown(state: Partial<State>, source: string): Extract<ScanNowResponse, { error: "rate_limited" }> | null {
+  if (source !== "linkedin_extension") return null;
+  const last = Math.max(state.lastScanAttemptBySource?.[source] ?? 0,
+    state.lastScanBySource?.[source]?.at ?? 0,
+    // Old installations did not persist per-source attempts.
+    state.lastScanAttemptBySource?.[source] == null ? state.lastScanStartedAt ?? 0 : 0);
+  const retryAt = last + LINKEDIN_MIN_SCAN_INTERVAL_MS;
+  return last > 0 && Date.now() < retryAt
+    ? { ok: false, error: "rate_limited", retryAt: new Date(retryAt).toISOString() } : null;
 }
 
 async function initializeScanPlan(
   sources: string[],
   refreshRecipes: boolean,
-  options: { accountId?: string; beforeStart?: () => Promise<ScanNowError | undefined> } = {},
+  options: { accountId?: string; queueIfBusy?: boolean; beforeStart?: () => Promise<ScanNowError | undefined> } = {},
 ): Promise<ScanNowResponse> {
   return withAccountStateMutation(async () => {
     let state = await getState();
     if (options.accountId && state.account?.id !== options.accountId)
       return { ok: false, error: "account_mismatch" } as const;
-    const current = scanPlanAdmission(state, sources);
+    const admission = async (): Promise<ScanNowResponse | null> => {
+      if (!state.scanInProgress && !state.scanQueue?.length) return null;
+      const owed = new Set([...(state.scanQueue ?? []), ...(state.scanInProgress ? [state.scanSource ?? ""] : [])]);
+      const missing = [...new Set(sources)].filter(source => !owed.has(source) && recipesOf(state)[source]);
+      if (missing.length === 0) return { ok: true, status: "already_running" };
+      if (!options.queueIfBusy) return { ok: false, error: "source_busy" };
+      // Keep all newly requested eligible sources, even if one is cooling down.
+      const eligible = missing.filter(source => !scanCooldown(state, source));
+      if (eligible.length) await setState({ scanQueue: [...(state.scanQueue ?? []), ...eligible] });
+      return { ok: true, status: "already_running" };
+    };
+    const current = await admission();
     if (current) return current;
+    const list = [...new Set(sources)].filter(source => recipesOf(state)[source]);
+    const eligible = list.filter(source => !scanCooldown(state, source));
+    const first = eligible[0];
+    if (!first) return list[0] ? scanCooldown(state, list[0])! : { ok: false, error: "not_connected" };
     const error = await options.beforeStart?.();
     if (error) return { ok: false, error } as const;
-    // Refresh after asynchronous probes; never initialize from their old snapshot.
     state = await getState();
     if (options.accountId && state.account?.id !== options.accountId)
       return { ok: false, error: "account_mismatch" } as const;
-    const latest = scanPlanAdmission(state, sources);
+    const latest = await admission();
     if (latest) return latest;
-    const recipes = recipesOf(state);
-    const list = sources.filter((source) => recipes[source] != null);
-    const first = list[0];
-    if (!first) {
-      await setState({ scanQueue: [] });
-      return { ok: false, error: "not_connected" } as const;
-    }
+    const cooldown = scanCooldown(state, first);
+    if (cooldown) return cooldown;
     await setState({
-      scanInProgress: true,
-      scanSource: first,
-      scanQueue: list.slice(1),
-      scanAccountId: accountKey(state.account),
-      scanPhaseIndex: 0,
-      scanCursor: null,
-      scanItems: [],
-      scanPhaseResults: { connLists: [], messages: [] },
+      scanInProgress: true, scanSource: first, scanQueue: eligible.slice(1),
+      scanAccountId: accountKey(state.account), scanPhaseIndex: 0, scanCursor: null,
+      scanItems: [], scanPhaseResults: { connLists: [], messages: [] },
       scanSelfId: null, scanOwnerAccount: null, scanSourceSessionHash: null,
       scanStartedAt: Date.now(),
-      scanNeedsRecipeRefresh: refreshRecipes,
-      needs: null,
-      ...retrySourceState(state, first),
+      lastScanAttemptBySource: { ...state.lastScanAttemptBySource, [first]: Date.now() },
+      scanNeedsRecipeRefresh: refreshRecipes, needs: null, ...retrySourceState(state, first),
     });
     armScanTick();
     return { ok: true, status: "started" } as const;
@@ -1319,13 +1328,14 @@ async function drainScanQueue(): Promise<void> {
         return null;
       }
       const recipes = recipesOf(state);
-      if (!recipes[candidate]) {
+      if (!recipes[candidate] || scanCooldown(state, candidate)) {
         await setState({ scanQueue: rest });
         return "skip" as const;
       }
       await setState({
         scanInProgress: true,
         scanSource: candidate,
+        lastScanAttemptBySource: { ...state.lastScanAttemptBySource, [candidate]: Date.now() },
         scanQueue: rest,
         scanAccountId: accountKey(state.account),
         scanPhaseIndex: 0,
@@ -1364,7 +1374,7 @@ async function continueScanPlan(): Promise<void> {
  * served recipe. Without the throttle that re-pair re-runs a full scan, which
  * finalizes → opens another /x/sync tab → re-pairs → scans …, an unbounded loop
  * that continuously hammers LinkedIn/X (account-ban risk). A user gesture
- * (scanNow) deliberately bypasses this.
+ * uses the shorter shared daily minimum instead.
  *
  * `refreshRecipes` is false ONLY for the pair path, whose recipes arrived in the
  * pair message microseconds ago — re-fetching them would be a pure double-fetch.
@@ -1391,7 +1401,7 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
     targets.push(src);
   }
   if (targets.length === 0) return;
-  const admission = await initializeScanPlan(targets, opts.refreshRecipes);
+  const admission = await initializeScanPlan(targets, opts.refreshRecipes, { queueIfBusy: true });
   if (admission.ok && admission.status === "started") await continueScanPlan();
 }
 
@@ -1859,9 +1869,9 @@ async function handleInternal(
         for (const source of list) delete syncRecovery[source];
         await setState({ syncRecovery });
       });
-      const admission = await initializeScanPlan(list, true);
+      const admission = await initializeScanPlan(list, true, { queueIfBusy: true });
       const started = admission.ok && admission.status === "started";
-      sendResponse({ ok: true });
+      sendResponse(admission);
 
       // Drive the scan(s) WITHOUT blocking the ack. continueScan picks up the state
       // set above (and self-clears + sets needs:network-signin on a missing session);
@@ -2038,7 +2048,7 @@ export function registerListeners(): void {
         .map(([src]) => src);
       // Grant is a user gesture that starts a real scan → refresh only the first
       // source; the persisted queue survives worker teardown between sources.
-      const admission = await initializeScanPlan(targets, true);
+      const admission = await initializeScanPlan(targets, true, { queueIfBusy: true });
       if (admission.ok && admission.status === "started") await continueScanPlan();
     })();
   });
