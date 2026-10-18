@@ -195,3 +195,9 @@ it("includes history completion evidence only when the history reader completed"
   expect(complete.payload.messageHistory).toEqual({ version: 1, complete: true });
   expect(assembleScanPayload(xRecipe, [], [], "10").payload.messageHistory).toBeUndefined();
 });
+
+it("carries the observed source owner without confusing it with the noticed account", () => {
+  const ownerAccount = { memberId: "ACoAA-owner", username: "owner-handle" };
+  const out = assembleScanPayload(liRecipe, [], [], ownerAccount.memberId, { ownerAccount });
+  expect(out.payload.ownerAccount).toEqual(ownerAccount);
+});

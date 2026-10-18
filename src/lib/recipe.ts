@@ -44,7 +44,7 @@ function toConnectedOn(value: unknown): string | null {
     if (!Number.isFinite(value)) return null;
     const d = new Date(value);
     if (isNaN(d.getTime())) return null;
-    return d.toISOString().slice(0, 10);
+    return d.toISOString();
   }
   if (typeof value === "string") {
     return value;

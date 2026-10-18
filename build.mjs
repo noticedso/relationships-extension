@@ -43,7 +43,13 @@ for (const entry of entries) {
 }
 
 // Copy static files into dist.
-fs.copyFileSync(path.join(root, "manifest.json"), path.join(dist, "manifest.json"));
+const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
+if (DEV) {
+  manifest.name = "noticed Relationships (development)";
+  manifest.host_permissions.push("http://localhost:3011/*");
+  manifest.externally_connectable.matches.push("http://localhost:3011/*");
+}
+fs.writeFileSync(path.join(dist, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 fs.copyFileSync(
   path.join(root, "src", "popup", "popup.html"),
   path.join(dist, "popup", "popup.html"),

@@ -760,3 +760,20 @@ describe("popup", () => {
     expect(notice.parentElement).toBe(version.parentElement);
   });
 });
+
+it("explains daily admission without starting a progress poll",async()=>{
+  const sendMessage=vi.fn(async(m:{type:string})=>m.type==="scanNow"?{ok:false,error:"rate_limited",retryAt:"2026-10-16T12:00:00Z"}:m.type==="getSyncHistory"?{runs:[]}:status);
+  (globalThis as unknown as {chrome:unknown}).chrome={runtime:{sendMessage,id:"abcdefghijklmnopabcdefghijklmnop"},tabs:{create:vi.fn()}};
+  await init(document);
+  (document.getElementById("scan-now") as HTMLButtonElement).click();
+  await vi.waitFor(()=>expect(document.getElementById("needs")?.textContent).toContain("Refresh available after"));
+  expect(document.getElementById("scan-spinner")?.hidden).toBe(true);
+});
+
+it("shows the cooling source beside other networks that can still scan", async()=>{
+  const state={...status,needs:null,sources:[{source:"linkedin_extension",networkLabel:"LinkedIn",granted:true,signedIn:true,lastScanAt:Date.now(),lastScanCount:12,refreshAvailableAt:"2026-10-16T12:00:00Z"},{source:"x",networkLabel:"X",granted:true,signedIn:true,lastScanAt:null}]};
+  (globalThis as unknown as {chrome:unknown}).chrome={runtime:{sendMessage:vi.fn(async(m:{type:string})=>m.type==="getSyncHistory"?{runs:[]}:state),id:"abcdefghijklmnopabcdefghijklmnop"},tabs:{create:vi.fn()}};
+  await init(document);
+  expect(document.getElementById("network-status")?.textContent).toMatch(/LinkedIn.*refresh after/);
+  expect(document.getElementById("network-status")?.textContent).toMatch(/X.*not synced yet/);
+});
