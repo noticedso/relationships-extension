@@ -1562,6 +1562,18 @@ describe("service worker", () => {
     expect(res.scannedCount).toBe(3);
   });
 
+  it("counts X history messages and visited pages instead of the checkpoint wrapper", async () => {
+    const chrome = getChrome();
+    await pair();
+    await chrome.storage.local.set(inProgress({ scanSource: "x", scanItems: [{
+      version: 1, ownerId: "10", jobs: [], messages: { first: {}, second: {} },
+      visited: ["page-a", "page-b", "page-c"], conversations: [], excluded: [],
+    }] }));
+    const res = (await dispatchInternal({ type: "getStatus" })) as Record<string, unknown>;
+    expect(res.scannedCount).toBe(2);
+    expect(res.scannedPages).toBe(3);
+  });
+
   it("23b. getStatus reports scanning false + zero count when idle", async () => {
     await pair();
     const res = (await dispatchInternal({ type: "getStatus" })) as Record<string, unknown>;
