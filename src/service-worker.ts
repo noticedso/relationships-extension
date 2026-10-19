@@ -1599,6 +1599,11 @@ async function buildStatus(): Promise<Record<string, unknown>> {
     }),
   );
   const lastScanAt = state.lastScanAt ?? null;
+  const checkpoint = state.scanItems?.[0] as Partial<XHistoryCheckpoint> | undefined;
+  // History stores one checkpoint, not a list of scanned messages.
+  const history = sourceAliases(state.scanSource ?? "").includes("x") && checkpoint?.version === 1
+    && checkpoint.messages && typeof checkpoint.messages === "object"
+    && !Array.isArray(checkpoint.messages) ? checkpoint : null;
   return {
     account: state.account ?? null,
     recipe: state.recipe ?? null,
@@ -1610,7 +1615,8 @@ async function buildStatus(): Promise<Record<string, unknown>> {
     testMode: state.testMode ?? false,
     scanning: state.scanInProgress === true,
     scanningSource: state.scanSource ?? null,
-    scannedCount: state.scanItems?.length ?? 0,
+    scannedCount: history ? Object.keys(history.messages!).length : state.scanItems?.length ?? 0,
+    scannedPages: history ? (Array.isArray(history.visited) ? history.visited.length : 0) : undefined,
   };
 }
 

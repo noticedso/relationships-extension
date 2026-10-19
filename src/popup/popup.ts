@@ -117,6 +117,7 @@ type Status = {
   // Progress (E2): set by the SW while a checkpoint-and-resume scan is running.
   scanning?: boolean | null;
   scannedCount?: number | null;
+  scannedPages?: number | null;
 };
 
 /** Origins of every paired source, or just the recipe's (legacy single-source). */
@@ -416,6 +417,14 @@ function render(root: Document | HTMLElement, status: Status): void {
 
 const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+function scanProgressLabel(status: Status): string {
+  if (status.scannedPages != null) {
+    const number = new Intl.NumberFormat("en");
+    return `${number.format(status.scannedCount ?? 0)} messages · ${number.format(status.scannedPages)} pages`;
+  }
+  return `scanned ${status.scannedCount ?? 0}…`;
+}
+
 // E2: show live scan progress. A checkpoint-and-resume scan can run for a
 // minute+ (and outlive the popup), so while it's in progress we poll getStatus
 // and update the button to "scanned N…". When scanning ends we re-render via
@@ -440,11 +449,15 @@ export async function pollScanProgress(
     }
     if (btn) {
       btn.disabled = true;
-      btn.textContent = `scanned ${s.scannedCount ?? 0}…`;
+      btn.textContent = scanProgressLabel(s);
     }
     if (spinner) spinner.hidden = false;
     await sleep(pollMs);
   }
+  // This bounds popup polling only; never leave a stale count looking live.
+  if (btn) btn.textContent = "Status updates paused";
+  if (spinner) spinner.hidden = true;
+  setText(root, "needs", "Close and reopen this popup for current scan progress.");
 }
 
 // Kick off a scan and show live progress. Sets the in-progress UI SYNCHRONOUSLY
@@ -571,7 +584,7 @@ export async function init(root: Document | HTMLElement = document): Promise<voi
       // the checkpoint-and-resume scan survives the SW being torn down). Show
       // live progress and poll until it finishes (E2).
       next.disabled = true;
-      next.textContent = `scanned ${status.scannedCount ?? 0}…`;
+      next.textContent = scanProgressLabel(status);
       if (spinner) spinner.hidden = false;
       void pollScanProgress(root);
     } else {

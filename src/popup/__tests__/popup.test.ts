@@ -453,6 +453,30 @@ describe("popup", () => {
     expect(document.getElementById("scan-spinner")!.hidden).toBe(false);
   });
 
+  it("shows message and page progress for X history", async () => {
+    let polls = 0;
+    const sendMessage = vi.fn(async (m: { type: string }) => m.type === "getSyncHistory" ? { runs: [] } :
+      { ...status, needs: null, scanning: polls++ === 0, scannedCount: 1234, scannedPages: 56 });
+    (globalThis as unknown as { chrome: unknown }).chrome = {
+      runtime: { sendMessage, id: "abcdefghijklmnopabcdefghijklmnop" }, tabs: { create: vi.fn() },
+      permissions: { contains: vi.fn(async () => true) },
+    };
+    await pollScanProgress(document, { sleep: async () => {
+      expect(document.getElementById("scan-now")!.textContent).toBe("1,234 messages · 56 pages");
+    } });
+    expect(sendMessage.mock.calls.every(([m]) => m.type !== "scanNow")).toBe(true);
+  });
+
+  it("makes the status timeout explicit without restarting or stopping the scan", async () => {
+    const sendMessage = vi.fn(async () => ({ ...status, needs: null, scanning: true, scannedCount: 12 }));
+    (globalThis as unknown as { chrome: unknown }).chrome = { runtime: { sendMessage } };
+    await pollScanProgress(document, { sleep: async () => {} });
+    expect(document.getElementById("scan-now")!.textContent).toBe("Status updates paused");
+    expect(document.getElementById("needs")!.textContent).toMatch(/reopen/i);
+    expect(document.getElementById("scan-spinner")!.hidden).toBe(true);
+    expect(sendMessage.mock.calls).toHaveLength(800);
+  });
+
   it("E2: pollScanProgress updates 'scanned N…' each tick then re-enables the button when scanning ends", async () => {
     const counts = [10, 25, 25];
     let i = 0;
