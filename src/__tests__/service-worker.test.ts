@@ -1562,10 +1562,10 @@ describe("service worker", () => {
     expect(res.scannedCount).toBe(3);
   });
 
-  it("counts X history messages and visited pages instead of the checkpoint wrapper", async () => {
+  it.each(["x", "x_extension"])("counts %s history messages and pages instead of the checkpoint wrapper", async (source) => {
     const chrome = getChrome();
     await pair();
-    await chrome.storage.local.set(inProgress({ scanSource: "x", scanItems: [{
+    await chrome.storage.local.set(inProgress({ scanSource: source, scanItems: [{
       version: 1, ownerId: "10", jobs: [], messages: { first: {}, second: {} },
       visited: ["page-a", "page-b", "page-c"], conversations: [], excluded: [],
     }] }));

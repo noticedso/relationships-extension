@@ -1601,7 +1601,7 @@ async function buildStatus(): Promise<Record<string, unknown>> {
   const lastScanAt = state.lastScanAt ?? null;
   const checkpoint = state.scanItems?.[0] as Partial<XHistoryCheckpoint> | undefined;
   // History stores one checkpoint, not a list of scanned messages.
-  const history = state.scanSource === "x" && checkpoint?.version === 1
+  const history = sourceAliases(state.scanSource ?? "").includes("x") && checkpoint?.version === 1
     && checkpoint.messages && typeof checkpoint.messages === "object"
     && !Array.isArray(checkpoint.messages) ? checkpoint : null;
   return {
