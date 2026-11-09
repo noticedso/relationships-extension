@@ -50,6 +50,7 @@ export interface ChromeMock {
   };
   cookies: {
     get: (details: { url: string; name: string }) => Promise<{ name: string; value: string } | null>;
+    onChanged: FakeEvent<[{ removed: boolean; cookie: { name: string; domain: string }; cause: string }]>;
   };
   permissions: {
     request: (permissions: unknown) => Promise<boolean>;
@@ -122,6 +123,7 @@ function createChromeMock(): ChromeMock {
       async get(_details: { url: string; name: string }): Promise<{ name: string; value: string } | null> {
         return null;
       },
+      onChanged: createEvent(),
     },
     permissions: {
       async request(_permissions: unknown): Promise<boolean> {

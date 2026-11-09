@@ -37,6 +37,7 @@ declare const chrome: {
   };
   cookies: {
     get(details: { url: string; name: string }): Promise<{ name: string; value: string } | null>;
+    onChanged: ChromeEvent<[{ removed: boolean; cookie: { name: string; domain: string }; cause: string }]>;
   };
   permissions: {
     request(permissions: { origins?: string[]; permissions?: string[] }): Promise<boolean>;

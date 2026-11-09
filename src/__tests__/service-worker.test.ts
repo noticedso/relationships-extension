@@ -3208,3 +3208,70 @@ describe("X history handoff", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 });
+
+describe("network session detection", () => {
+  beforeEach(() => { sw.registerListeners(); });
+  // LinkedIn sets its CSRF cookie (JSESSIONID) for signed-out visitors too; only
+  // the recipe's session cookie (li_at) proves a signed-in account.
+  const sessionRecipe = {
+    ...recipe,
+    ownerAccountSource: { listPathTemplate: "/me", idPath: "id", usernamePath: "handle", sessionCookie: "session" },
+  };
+  const cookieJar = (names: string[]) =>
+    vi.spyOn(getChrome().cookies, "get").mockImplementation(async ({ name }) =>
+      names.includes(name) ? { name, value: "v" } : null);
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
+  const pairWithSession = async () => {
+    const response = await dispatchExternal({ type: "pair", recipe: sessionRecipe, account }, noticedSender);
+    await settle();
+    return response;
+  };
+
+  it("reports signed out when only the CSRF cookie is present", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: sessionRecipe, recipes: { linkedin_extension: sessionRecipe }, account });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    cookieJar(["tok"]);
+    const res = (await dispatchInternal({ type: "getStatus" })) as {
+      sources: Array<{ source: string; signedIn: boolean | null }>;
+    };
+    expect(res.sources.find((s) => s.source === "linkedin_extension")!.signedIn).toBe(false);
+  });
+
+  it("does not start or rate-limit a scan while the network is signed out", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    cookieJar(["tok"]);
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    expect(await pairWithSession()).toMatchObject({ ok: true });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress ?? false).toBe(false);
+    expect((stored.lastScanAttemptBySource as Record<string, number> | undefined)?.linkedin_extension).toBeUndefined();
+  });
+
+  it("starts the sync when the network's session cookie appears after pairing", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const jar = cookieJar(["tok"]);
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    await pairWithSession();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // An unrelated cookie, or the session cookie being removed, changes nothing.
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "other", domain: ".network.example.com" }, cause: "explicit" });
+    chrome.cookies.onChanged.dispatch({ removed: true, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    jar.mockImplementation(async ({ name }) => ({ name, value: "v" }));
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+});

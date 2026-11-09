@@ -244,10 +244,11 @@ export function grantCovers(pattern: string, targetOrigin: string): boolean {
 
 /**
  * Is the owner currently signed in to a source's network? Read live from the
- * session cookie the scanner uses for its CSRF header (present + non-empty →
- * signed in), so noticed's connection page can show "not signed in" without
- * running a scan. Mirrors buildCsrfHeaders' cookie check; needs the source's
- * host permission, so only probe granted sources (others → null/unknown).
+ * recipe's session cookie (LinkedIn's li_at), so noticed's connection page can
+ * show "not signed in" without running a scan. LinkedIn also sets its CSRF
+ * cookie for signed-out visitors, so that cookie is only the fallback for
+ * recipes without a session cookie. Needs the source's host permission, so only
+ * probe granted sources (others → null/unknown).
  *
  * Returns true/false for a definitive answer (cookie present / absent), or null
  * when the probe itself fails — so a transient cookies.get error surfaces as
@@ -258,7 +259,7 @@ async function isSignedIn(recipe: ScanRecipe): Promise<boolean | null> {
   try {
     const cookie = await chrome.cookies.get({
       url: recipe.targetOrigin,
-      name: recipe.csrfRule.cookie,
+      name: recipe.ownerAccountSource?.sessionCookie ?? recipe.csrfRule.cookie,
     });
     return Boolean(cookie && typeof cookie.value === "string" && cookie.value.trim() !== "");
   } catch {
@@ -1427,8 +1428,13 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
   if (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0) return;
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   const targets: string[] = [];
-  for (const src of await grantedSources(recipesOf(state))) {
+  const recipes = recipesOf(state);
+  for (const src of await grantedSources(recipes)) {
     const aliases = sourceAliases(src);
+    // A signed-out network cannot be scanned. Attempting it anyway would record
+    // a failure and start LinkedIn's daily cooldown; signing in starts the scan
+    // instead (cookies.onChanged).
+    if ((await isSignedIn(recipes[src]!)) === false) continue;
     // A terminal failure requires a user retry (or a fresh permission grant).
     // Re-pairing and scheduled scans must not restart the failed checkpoint.
     if (aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias])) continue;
@@ -2088,6 +2094,24 @@ export function registerListeners(): void {
   // grant always completes a sync. A grant during another source's scan (X
   // granted while LinkedIn scans) is queued behind it: initializeScanPlan with
   // queueIfBusy never replaces an in-progress checkpoint.
+  // Signing in to a network after pairing starts its sync, as the connection
+  // page promises. autoScanGrantedSources keeps the throttle, cooldown and
+  // terminal-failure guards, so a refreshed session cookie cannot loop scans.
+  chrome.cookies.onChanged.addListener(({ removed, cookie }) => {
+    if (removed) return;
+    void (async () => {
+      const state = await getState();
+      if (!state.account) return;
+      const domain = cookie.domain.replace(/^\./, "");
+      const signedIn = Object.values(recipesOf(state)).some((recipe) => {
+        const host = new URL(recipe.targetOrigin).hostname;
+        return recipe.ownerAccountSource?.sessionCookie === cookie.name
+          && (host === domain || host.endsWith(`.${domain}`));
+      });
+      if (signedIn) await autoScanGrantedSources({ refreshRecipes: true });
+    })();
+  });
+
   chrome.permissions.onAdded.addListener((perms) => {
     const added = perms?.origins ?? [];
     if (added.length === 0) return;
