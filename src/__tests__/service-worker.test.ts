@@ -286,6 +286,25 @@ describe("service worker", () => {
       clock.mockRestore();
     }
   });
+  it("queues X when access is granted from the toolbar while LinkedIn is still scanning", async () => {
+    sw.registerListeners();
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      ...inProgress({ scanItems: [{ id: "keep" }], scanQueue: [] }),
+    });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    chrome.permissions.onAdded.dispatch({ origins: [xRecipe.targetOrigin + "/*"] });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(await chrome.storage.local.get(null)).toMatchObject({
+      scanSource: "linkedin_extension",
+      scanItems: [{ id: "keep" }],
+      scanQueue: ["x"],
+    });
+  });
   it("queues the missing source of an overlapping popup plan without replacing the active checkpoint",async()=>{
     sw.registerListeners();const chrome=getChrome();
     await chrome.storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanItems:[{id:"keep"}],scanQueue:[]})});

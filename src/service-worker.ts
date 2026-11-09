@@ -2085,14 +2085,14 @@ export function registerListeners(): void {
   // Grant → scan. When the user grants withheld access (from the toolbar
   // button), nothing else would sync until the three-day alarm. The service
   // worker is the durable context: scan the newly-granted source(s) here so a
-  // grant always completes a sync. Skip if a scan is already in flight so we
-  // never clobber an in-progress checkpoint.
+  // grant always completes a sync. A grant during another source's scan (X
+  // granted while LinkedIn scans) is queued behind it: initializeScanPlan with
+  // queueIfBusy never replaces an in-progress checkpoint.
   chrome.permissions.onAdded.addListener((perms) => {
     const added = perms?.origins ?? [];
     if (added.length === 0) return;
     void (async () => {
       const state = await getState();
-      if (state.scanInProgress) return;
       const recipes = recipesOf(state);
       const granted = await grantedSources(recipes);
       const targets = Object.entries(recipes)

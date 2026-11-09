@@ -37,7 +37,7 @@ access the user withheld.)
 harness swaps the global `chrome`):
 - `onMessageExternal` — only from `*.noticed.so` origins (enforced by `isNoticedOrigin`): `ping`, `pair`,
   `getOnboardingStatus`
-  (store recipe+account+`noticedOrigin`, request the host permission, set the three-day alarm),
+  (store recipe+account+`noticedOrigin`, set the three-day alarm; it never requests permissions),
   `getCachedScan`, `syncConfirmed`.
 - `onMessage` (internal) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`. No UI sends these
   since the popup was removed; they remain the extension's internal control surface (tests drive scans
