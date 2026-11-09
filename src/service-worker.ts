@@ -241,13 +241,13 @@ export function grantCovers(pattern: string, targetOrigin: string): boolean {
 /**
  * Is the owner currently signed in to a source's network? Read live from the
  * session cookie the scanner uses for its CSRF header (present + non-empty →
- * signed in), so the popup can show a per-network "not signed in" state without
+ * signed in), so noticed's connection page can show "not signed in" without
  * running a scan. Mirrors buildCsrfHeaders' cookie check; needs the source's
  * host permission, so only probe granted sources (others → null/unknown).
  *
  * Returns true/false for a definitive answer (cookie present / absent), or null
  * when the probe itself fails — so a transient cookies.get error surfaces as
- * "unknown" (the popup shows a plain sync row) rather than a false "not signed
+ * "unknown" (a plain sync row) rather than a false "not signed
  * in" warning.
  */
 async function isSignedIn(recipe: ScanRecipe): Promise<boolean | null> {
@@ -1689,8 +1689,9 @@ async function handleExternal(
       return;
     }
     case "pair": {
-      // Store the per-source recipes + account and arm the three-day alarm. The
-      // host permission is requested from a user gesture in the popup, not here.
+      // Store the per-source recipes + account and arm the three-day alarm. Host
+      // access is granted at install; if the user withheld it, the toolbar
+      // button's click requests it again (openConnectionPage), never this message.
       // Pairing and refresh use the same atomic validation. Reject a malformed
       // served recipe before changing the account, cache, alarms, or handoff tabs.
       const parsed = parseServedRecipes(message);
@@ -1768,8 +1769,8 @@ async function handleExternal(
       // a reconnect syncs with no manual click. This TRULY mirrors the three-day
       // alarm path — including its throttle — via the shared helper, so the
       // /x/sync recipe-refresh re-pair (SyncBroker) can't re-trigger a scan loop.
-      // First-time users (no host permission yet) are scanned by the popup's grant
-      // gesture / permissions.onAdded instead. Fire-and-forget so the connect
+      // Users who withheld host access are scanned once they grant it from the
+      // toolbar button, via permissions.onAdded. Fire-and-forget so the connect
       // page's ack isn't blocked on the scan.
       //
       // refreshRecipes:false — the recipes we just stored ARE the server's current
@@ -1906,7 +1907,7 @@ async function handleInternal(
       const list = targets.length > 0 ? targets : [state.recipe?.source ?? DEFAULT_SOURCE];
       // Cause B (scan-twice): set the in-flight scan state + arm the keepalive tick
       // SYNCHRONOUSLY — before the CSRF cookie round-trip in runScan — and ack
-      // immediately, so the popup's first getStatus after this ack already reads
+      // immediately, so the first getStatus after this ack already reads
       // scanning:true and its poller doesn't bail to idle while the scan runs.
       await withAccountStateMutation(async () => {
         const current = await getState();
@@ -2010,8 +2011,8 @@ export function registerListeners(): void {
   // countdown to "now" each time and could defer the scan indefinitely. Only
   // (re)arm when no alarm exists yet, or when its cadence doesn't match the
   // shipped SCAN_PERIOD_MINUTES (e.g. this release shortened it). A fresh arm
-  // anchors to the last real scan — not "now" — so it agrees with the popup's
-  // `nextScanAt` display (lastScanAt + SCAN_PERIOD_MS) instead of silently
+  // anchors to the last real scan — not "now" — so it agrees with getStatus's
+  // `nextScanAt` (lastScanAt + SCAN_PERIOD_MS) instead of silently
   // pushing the next scan further out on every reconcile.
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
@@ -2077,13 +2078,11 @@ export function registerListeners(): void {
     void autoScanGrantedSources({ refreshRecipes: true });
   });
 
-  // Grant → scan. When the user approves "grant access", Chrome commonly
-  // DISMISSES the extension popup as the permission prompt appears, so the
-  // popup's own post-grant scanNow never runs — the grant would then sync
-  // nothing until the three-day alarm. The service worker is the durable context:
-  // scan the newly-granted source(s) here so grant always completes a sync.
-  // Skip if a scan is already in flight (the popup survived and sent scanNow) so
-  // we never clobber an in-progress checkpoint.
+  // Grant → scan. When the user grants withheld access (from the toolbar
+  // button), nothing else would sync until the three-day alarm. The service
+  // worker is the durable context: scan the newly-granted source(s) here so a
+  // grant always completes a sync. Skip if a scan is already in flight so we
+  // never clobber an in-progress checkpoint.
   chrome.permissions.onAdded.addListener((perms) => {
     const added = perms?.origins ?? [];
     if (added.length === 0) return;

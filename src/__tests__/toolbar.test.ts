@@ -54,6 +54,15 @@ describe("toolbar button", () => {
     expect(create).toHaveBeenLastCalledWith({ url: "https://www.noticed.so/connect" });
   });
 
+  it("asks for access synchronously in the click, before anything else can end the gesture", () => {
+    const chrome = getChrome();
+    const request = vi.spyOn(chrome.permissions, "request");
+    sw.registerListeners();
+    chrome.action.onClicked.dispatch({ id: 9 });
+    // No await: Chrome only honours permissions.request during the click's gesture.
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("still opens the page when the access prompt is dismissed", async () => {
     const chrome = getChrome();
     vi.spyOn(chrome.permissions, "request").mockRejectedValue(new Error("dismissed"));

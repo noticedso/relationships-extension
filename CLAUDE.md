@@ -38,7 +38,10 @@ harness swaps the global `chrome`):
   `getOnboardingStatus`
   (store recipe+account+`noticedOrigin`, request the host permission, set the three-day alarm),
   `getCachedScan`, `syncConfirmed`.
-- `onMessage` (internal) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`.
+- `onMessage` (internal) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`. No UI sends these
+  since the popup was removed; they remain the extension's internal control surface (tests drive scans
+  through them, and in a dev build you can call `chrome.runtime.sendMessage({type: "setTestMode", value:
+  true})` from the service-worker console).
 - `action.onClicked` — the toolbar button (there is no popup): restores withheld site access, then
   focuses or opens noticed's `/connect` page (`openConnectionPage`).
 - `onAlarm` — runs `runScan` at most once per three days (a `lastScanStartedAt` throttle guards
