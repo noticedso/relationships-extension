@@ -8,7 +8,7 @@ const dist = path.join(root, "dist");
 
 // Clean dist so every build is from scratch (reproducible).
 fs.rmSync(dist, { recursive: true, force: true });
-fs.mkdirSync(path.join(dist, "popup"), { recursive: true });
+fs.mkdirSync(dist, { recursive: true });
 
 // Dev-only features (e.g. the test-mode toggle) compile in ONLY when EXT_DEV=1.
 // The published artifact builds with __DEV__ = false (default), so the dev
@@ -29,10 +29,6 @@ const shared = {
 // Entry points, sorted by output path for stable ordering.
 const entries = [
   {
-    entryPoints: [path.join(root, "src", "popup", "popup.ts")],
-    outfile: path.join(dist, "popup", "popup.js"),
-  },
-  {
     entryPoints: [path.join(root, "src", "service-worker.ts")],
     outfile: path.join(dist, "service-worker.js"),
   },
@@ -50,14 +46,6 @@ if (DEV) {
   manifest.externally_connectable.matches.push("http://localhost:3011/*");
 }
 fs.writeFileSync(path.join(dist, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
-fs.copyFileSync(
-  path.join(root, "src", "popup", "popup.html"),
-  path.join(dist, "popup", "popup.html"),
-);
-fs.copyFileSync(
-  path.join(root, "src", "popup", "popup.css"),
-  path.join(dist, "popup", "popup.css"),
-);
 
 // Copy icon set (sorted for stable ordering).
 const iconsSrc = path.join(root, "icons");

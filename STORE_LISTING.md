@@ -42,10 +42,11 @@ releases auto-publish — see [PUBLISHING.md](./PUBLISHING.md).
   noticed Relationships imports the signed-in user's own first-degree LinkedIn connections into their noticed account and shows the import history.
   ```
 - **Permission justifications** (one per item):
-  - `storage` — `Stores the link to the user's noticed account (scan recipe + account summary) and the most recent pending import locally, so the popup can show status and the automatic three-day import can run.`
+  - `storage` — `Stores the link to the user's noticed account (scan recipe + account summary) and the most recent pending import locally, so noticed's connection page can show status and the automatic three-day import can run.`
   - `alarms` — `Runs the connection import every three days so the user's network stays current without manual re-triggering.`
   - `cookies` — `Reads the user's own LinkedIn session cookie in the browser to authenticate the connection-list request as the signed-in user. The value is used only as the request's CSRF header — never sent to our servers or stored.`
-  - Host `*://*.linkedin.com/*` (optional, requested at runtime) — `Reads the signed-in user's own first-degree connection list from LinkedIn (name, headline, profile link, connection date), only when the user clicks Connect or Scan. Requested at runtime, not at install.`
+  - Host `*://*.linkedin.com/*` — `Reads the signed-in user's own first-degree connections and message metadata from LinkedIn (name, headline, profile link, connection date), after the user connects the extension to their noticed account. Requested at install so the connection page can start syncing without a second prompt.`
+  - Hosts `*://*.x.com/*`, `*://*.twitter.com/*` — `Reads the signed-in user's own mutual follows and message metadata from X, after the user connects the extension to their noticed account. Requested at install for the same reason.`
   - Host `https://*.noticed.so/*` — `Sends the user's imported connections to their own noticed account and reads their import history, using the user's existing noticed session.`
 - **Remote code:** **No.** The extension fetches a JSON configuration ("recipe") and the user's data from noticed; it does not download or execute remote JavaScript.
 - **Data usage — collected:**
@@ -67,6 +68,6 @@ releases auto-publish — see [PUBLISHING.md](./PUBLISHING.md).
 5. After approval, grab the **item ID** and set up the auto-publish secrets ([PUBLISHING.md](./PUBLISHING.md)).
 
 ## Review-risk notes
-- Optional host is scoped to `*://*.linkedin.com/*` (not all-sites) with a clear single purpose → low rejection risk.
+- Host access is scoped to LinkedIn and X (not all-sites) with a clear single purpose. Since 1.3.0 it is requested at install rather than at runtime, so expect the reviewer to check the justification above.
 - `cookies` + reading LinkedIn's session is the most scrutinized item; the justification stresses it's the user's own session, used locally only, never transmitted.
 - The "recipe" is configuration/data, not code → answer "No" to remote code; if asked in review, explain the extension's behavior is fixed (import connections) and only the endpoint/field-mapping config is fetched.

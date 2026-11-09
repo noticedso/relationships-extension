@@ -96,6 +96,36 @@ export function isNoticedOrigin(origin: string | null | undefined): boolean {
   }
 }
 
+// ── Toolbar button ───────────────────────────────────────────────────────────
+
+/** Where people manage the extension's accounts: noticed's connection page. */
+export const CONNECT_PATH = "/connect";
+const DEFAULT_NOTICED_ORIGIN = "https://www.noticed.so";
+/** The networks the extension reads; granted at install, but users can withhold them. */
+const SOURCE_ORIGINS = ["*://*.linkedin.com/*", "*://*.x.com/*", "*://*.twitter.com/*"];
+
+/**
+ * The toolbar button replaces the popup: it restores any site access the user
+ * withheld (the click is the user gesture Chrome requires), then focuses an
+ * open connection page or opens one on the noticed origin it was paired from.
+ */
+export async function openConnectionPage(): Promise<void> {
+  // Request first, before any other await, while the click still counts as a
+  // gesture; it resolves without a prompt when access is already granted.
+  const access = chrome.permissions.request({ origins: SOURCE_ORIGINS }).catch(() => false);
+  const { noticedOrigin } = await getState();
+  const origin = isNoticedOrigin(noticedOrigin) ? (noticedOrigin as string) : DEFAULT_NOTICED_ORIGIN;
+  const url = origin + CONNECT_PATH;
+  await access;
+  const [open] = await chrome.tabs.query({ url: `${url}*` }).catch(() => []);
+  if (open?.id !== undefined) {
+    await chrome.tabs.update(open.id, { active: true });
+    if (open.windowId !== undefined) await chrome.windows.update(open.windowId, { focused: true });
+    return;
+  }
+  await chrome.tabs.create({ url });
+}
+
 function senderOrigin(sender: { origin?: string; url?: string }): string | null {
   if (sender.origin) return sender.origin;
   if (sender.url) {
@@ -1995,6 +2025,10 @@ export function registerListeners(): void {
       const when = (lastScanAt ?? Date.now()) + SCAN_PERIOD_MS;
       chrome.alarms.create(SCAN_ALARM, { when, periodInMinutes: SCAN_PERIOD_MINUTES });
     })();
+  });
+
+  chrome.action.onClicked.addListener(() => {
+    void openConnectionPage().catch(() => undefined);
   });
 
   chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {

@@ -47,5 +47,13 @@ declare const chrome: {
     create(createProperties: { url?: string; active?: boolean }): Promise<{ id?: number; url?: string }>;
     get(tabId: number): Promise<{ id?: number; url?: string }>;
     remove(tabId: number): Promise<void>;
+    query(queryInfo: { url?: string | string[] }): Promise<Array<{ id?: number; windowId?: number; url?: string }>>;
+    update(tabId: number, updateProperties: { active?: boolean }): Promise<{ id?: number }>;
+  };
+  windows: {
+    update(windowId: number, updateInfo: { focused?: boolean }): Promise<{ id?: number }>;
+  };
+  action: {
+    onClicked: ChromeEvent<[{ id?: number; url?: string }]>;
   };
 };

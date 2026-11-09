@@ -29,8 +29,8 @@ Releasing is tag-driven (`git tag vX.Y.Z && git push origin vX.Y.Z`) — see `PU
 endpoints to hit. At pair time, noticed serves a JSON **"recipe"** (`targetOrigin`, `listPathTemplate`
 with `{start}`/`{count}`, `paginationParams`, `csrfRule`, `fieldMap`, `pacing`, `excludeSources`) that is
 stored in `chrome.storage` and drives a scan. This is config/data, never executable code. (`manifest.json`
-scopes the optional host permission to `*.linkedin.com` for the Web Store; it is **requested at runtime**,
-not at install.)
+declares LinkedIn and X as host permissions **granted at install** (NT-300); users can still withhold
+them in Chrome, and the toolbar button asks again.)
 
 **`src/service-worker.ts` is the brain.** It registers listeners (idempotently — re-binds when the test
 harness swaps the global `chrome`):
@@ -38,7 +38,9 @@ harness swaps the global `chrome`):
   `getOnboardingStatus`
   (store recipe+account+`noticedOrigin`, request the host permission, set the three-day alarm),
   `getCachedScan`, `syncConfirmed`.
-- `onMessage` (popup) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`.
+- `onMessage` (internal) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`.
+- `action.onClicked` — the toolbar button (there is no popup): restores withheld site access, then
+  focuses or opens noticed's `/connect` page (`openConnectionPage`).
 - `onAlarm` — runs `runScan` at most once per three days (a `lastScanStartedAt` throttle guards
   catch-up/duplicate fires).
 
@@ -49,20 +51,16 @@ harness swaps the global `chrome`):
 the first-party noticed page POSTs the data with the user's session cookie, then `syncConfirmed` clears the
 pending scan and stamps `lastScanAt`/`lastScanCount`.
 
-**Pairing has no env-id dependency.** The popup opens
-`https://www.noticed.so/x/connect?ext_id=<chrome.runtime.id>`; noticed signs the user in if needed and
-`pair`s back to that exact id. Works for any unpacked/dev id and the Web Store id alike.
+**Pairing has no env-id dependency.** noticed's `/connect` page pairs the extension it finds over
+`externally_connectable` (`pair` with the account's recipes); the legacy `/x/connect?ext_id=` broker
+still works for older flows.
 
 **`lib/storage.ts`** is the single typed `chrome.storage.local` state (recipe, account, noticedOrigin,
 pendingScan, lastScanAt, lastScanStartedAt, lastScanCount, needs, testMode). All other modules read/write
 through `getState`/`setState`.
 
-**`src/popup/`** is the user-facing trust surface and is state-driven by `getStatus` + `getSyncHistory`:
-not-connected → a **Connect to noticed** button; connected → account + next/last scan + a recent-syncs
-list (fetched from `/api/sync/runs`, filtered by `recipe.excludeSources`); session-expired (401) → a
-**Sign in to noticed** button. The "noticed" wordmark is the exact outlined brand SVG inlined in
-`popup.html` (no bundled font). No platform name is hardcoded in the popup — the network label comes from
-`recipe.networkLabel` / server-provided `label` at runtime.
+**No popup (NT-300).** Status, retry and setup live on noticed's `/connect` page, which polls
+`getOnboardingStatus` and sends `retrySync`; the toolbar button opens it.
 
 ## Conventions & gotchas
 
