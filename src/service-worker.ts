@@ -96,6 +96,40 @@ export function isNoticedOrigin(origin: string | null | undefined): boolean {
   }
 }
 
+// ── Toolbar button ───────────────────────────────────────────────────────────
+
+/** Where people manage the extension's accounts: noticed's connection page. */
+export const CONNECT_PATH = "/connect";
+const DEFAULT_NOTICED_ORIGIN = "https://www.noticed.so";
+/**
+ * The networks the extension reads. LinkedIn is granted at install (users can
+ * still withhold it); X is optional and asked for here, so connecting it never
+ * disables an existing LinkedIn-only install on update.
+ */
+const SOURCE_ORIGINS = ["*://*.linkedin.com/*", "*://*.x.com/*", "*://*.twitter.com/*"];
+
+/**
+ * The toolbar button replaces the popup: it restores any site access the user
+ * withheld (the click is the user gesture Chrome requires), then focuses an
+ * open connection page or opens one on the noticed origin it was paired from.
+ */
+export async function openConnectionPage(): Promise<void> {
+  // Request first, before any other await, while the click still counts as a
+  // gesture; it resolves without a prompt when access is already granted.
+  const access = chrome.permissions.request({ origins: SOURCE_ORIGINS }).catch(() => false);
+  const { noticedOrigin } = await getState();
+  const origin = isNoticedOrigin(noticedOrigin) ? (noticedOrigin as string) : DEFAULT_NOTICED_ORIGIN;
+  const url = origin + CONNECT_PATH;
+  await access;
+  const [open] = await chrome.tabs.query({ url: `${url}*` }).catch(() => []);
+  if (open?.id !== undefined) {
+    await chrome.tabs.update(open.id, { active: true });
+    if (open.windowId !== undefined) await chrome.windows.update(open.windowId, { focused: true });
+    return;
+  }
+  await chrome.tabs.create({ url });
+}
+
 function senderOrigin(sender: { origin?: string; url?: string }): string | null {
   if (sender.origin) return sender.origin;
   if (sender.url) {
@@ -210,21 +244,22 @@ export function grantCovers(pattern: string, targetOrigin: string): boolean {
 
 /**
  * Is the owner currently signed in to a source's network? Read live from the
- * session cookie the scanner uses for its CSRF header (present + non-empty →
- * signed in), so the popup can show a per-network "not signed in" state without
- * running a scan. Mirrors buildCsrfHeaders' cookie check; needs the source's
- * host permission, so only probe granted sources (others → null/unknown).
+ * recipe's session cookie (LinkedIn's li_at), so noticed's connection page can
+ * show "not signed in" without running a scan. LinkedIn also sets its CSRF
+ * cookie for signed-out visitors, so that cookie is only the fallback for
+ * recipes without a session cookie. Needs the source's host permission, so only
+ * probe granted sources (others → null/unknown).
  *
  * Returns true/false for a definitive answer (cookie present / absent), or null
  * when the probe itself fails — so a transient cookies.get error surfaces as
- * "unknown" (the popup shows a plain sync row) rather than a false "not signed
+ * "unknown" (a plain sync row) rather than a false "not signed
  * in" warning.
  */
 async function isSignedIn(recipe: ScanRecipe): Promise<boolean | null> {
   try {
     const cookie = await chrome.cookies.get({
       url: recipe.targetOrigin,
-      name: recipe.csrfRule.cookie,
+      name: recipe.ownerAccountSource?.sessionCookie ?? recipe.csrfRule.cookie,
     });
     return Boolean(cookie && typeof cookie.value === "string" && cookie.value.trim() !== "");
   } catch {
@@ -1261,8 +1296,9 @@ function scanCooldown(state: Partial<State>, source: string): Extract<ScanNowRes
   if (source !== "linkedin_extension") return null;
   const last = Math.max(state.lastScanAttemptBySource?.[source] ?? 0,
     state.lastScanBySource?.[source]?.at ?? 0,
-    // Old installations did not persist per-source attempts.
-    state.lastScanAttemptBySource?.[source] == null ? state.lastScanStartedAt ?? 0 : 0);
+    // Old installations did not persist per-source attempts. Once the map
+    // exists, another source's scan says nothing about this one.
+    state.lastScanAttemptBySource == null ? state.lastScanStartedAt ?? 0 : 0);
   const retryAt = last + LINKEDIN_MIN_SCAN_INTERVAL_MS;
   return last > 0 && Date.now() < retryAt
     ? { ok: false, error: "rate_limited", retryAt: new Date(retryAt).toISOString() } : null;
@@ -1393,8 +1429,13 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
   if (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0) return;
   if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   const targets: string[] = [];
-  for (const src of await grantedSources(recipesOf(state))) {
+  const recipes = recipesOf(state);
+  for (const src of await grantedSources(recipes)) {
     const aliases = sourceAliases(src);
+    // A signed-out network cannot be scanned. Attempting it anyway would record
+    // a failure and start LinkedIn's daily cooldown; signing in starts the scan
+    // instead (cookies.onChanged).
+    if ((await isSignedIn(recipes[src]!)) === false) continue;
     // A terminal failure requires a user retry (or a fresh permission grant).
     // Re-pairing and scheduled scans must not restart the failed checkpoint.
     if (aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias])) continue;
@@ -1659,8 +1700,9 @@ async function handleExternal(
       return;
     }
     case "pair": {
-      // Store the per-source recipes + account and arm the three-day alarm. The
-      // host permission is requested from a user gesture in the popup, not here.
+      // Store the per-source recipes + account and arm the three-day alarm. Host
+      // access is granted at install; if the user withheld it, the toolbar
+      // button's click requests it again (openConnectionPage), never this message.
       // Pairing and refresh use the same atomic validation. Reject a malformed
       // served recipe before changing the account, cache, alarms, or handoff tabs.
       const parsed = parseServedRecipes(message);
@@ -1738,8 +1780,8 @@ async function handleExternal(
       // a reconnect syncs with no manual click. This TRULY mirrors the three-day
       // alarm path — including its throttle — via the shared helper, so the
       // /x/sync recipe-refresh re-pair (SyncBroker) can't re-trigger a scan loop.
-      // First-time users (no host permission yet) are scanned by the popup's grant
-      // gesture / permissions.onAdded instead. Fire-and-forget so the connect
+      // Users who withheld host access are scanned once they grant it from the
+      // toolbar button, via permissions.onAdded. Fire-and-forget so the connect
       // page's ack isn't blocked on the scan.
       //
       // refreshRecipes:false — the recipes we just stored ARE the server's current
@@ -1876,7 +1918,7 @@ async function handleInternal(
       const list = targets.length > 0 ? targets : [state.recipe?.source ?? DEFAULT_SOURCE];
       // Cause B (scan-twice): set the in-flight scan state + arm the keepalive tick
       // SYNCHRONOUSLY — before the CSRF cookie round-trip in runScan — and ack
-      // immediately, so the popup's first getStatus after this ack already reads
+      // immediately, so the first getStatus after this ack already reads
       // scanning:true and its poller doesn't bail to idle while the scan runs.
       await withAccountStateMutation(async () => {
         const current = await getState();
@@ -1980,8 +2022,8 @@ export function registerListeners(): void {
   // countdown to "now" each time and could defer the scan indefinitely. Only
   // (re)arm when no alarm exists yet, or when its cadence doesn't match the
   // shipped SCAN_PERIOD_MINUTES (e.g. this release shortened it). A fresh arm
-  // anchors to the last real scan — not "now" — so it agrees with the popup's
-  // `nextScanAt` display (lastScanAt + SCAN_PERIOD_MS) instead of silently
+  // anchors to the last real scan — not "now" — so it agrees with getStatus's
+  // `nextScanAt` (lastScanAt + SCAN_PERIOD_MS) instead of silently
   // pushing the next scan further out on every reconcile.
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
@@ -1995,6 +2037,10 @@ export function registerListeners(): void {
       const when = (lastScanAt ?? Date.now()) + SCAN_PERIOD_MS;
       chrome.alarms.create(SCAN_ALARM, { when, periodInMinutes: SCAN_PERIOD_MINUTES });
     })();
+  });
+
+  chrome.action.onClicked.addListener(() => {
+    void openConnectionPage().catch(() => undefined);
   });
 
   chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => {
@@ -2043,19 +2089,53 @@ export function registerListeners(): void {
     void autoScanGrantedSources({ refreshRecipes: true });
   });
 
-  // Grant → scan. When the user approves "grant access", Chrome commonly
-  // DISMISSES the extension popup as the permission prompt appears, so the
-  // popup's own post-grant scanNow never runs — the grant would then sync
-  // nothing until the three-day alarm. The service worker is the durable context:
-  // scan the newly-granted source(s) here so grant always completes a sync.
-  // Skip if a scan is already in flight (the popup survived and sent scanNow) so
-  // we never clobber an in-progress checkpoint.
+  // Signing in to a network after pairing starts its sync, as the connection
+  // page promises. A network that never synced for this account starts directly:
+  // the routine three-day throttle covers rescans, not a first sync another
+  // source's scan just stamped. Its daily cooldown, failure and pending guards
+  // still apply. Later session-cookie refreshes go through the throttled path,
+  // so they cannot loop scans.
+  chrome.cookies.onChanged.addListener(({ removed, cookie }) => {
+    if (removed) return;
+    void (async () => {
+      const state = await getState();
+      if (!state.account) return;
+      const domain = cookie.domain.replace(/^\./, "");
+      const sources = Object.entries(recipesOf(state))
+        .filter(([, recipe]) => {
+          const host = new URL(recipe.targetOrigin).hostname;
+          return recipe.ownerAccountSource?.sessionCookie === cookie.name
+            && (host === domain || host.endsWith(`.${domain}`));
+        })
+        .map(([source]) => source);
+      if (sources.length === 0) return;
+      const firstSync = sources.filter((source) => {
+        const aliases = sourceAliases(source);
+        // lastScanBySource resets when the paired account changes; attempts don't.
+        return !state.lastScanBySource?.[source]
+          && !aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias] || state.pendingScans?.[alias]);
+      });
+      if (firstSync.length === 0) {
+        await autoScanGrantedSources({ refreshRecipes: true });
+        return;
+      }
+      if (!(await grantedSources(recipesOf(state))).some((source) => firstSync.includes(source))) return;
+      const admission = await initializeScanPlan(firstSync, true, { queueIfBusy: true });
+      if (admission.ok && admission.status === "started") await continueScanPlan();
+    })();
+  });
+
+  // Grant → scan. When the user grants withheld access (from the toolbar
+  // button), nothing else would sync until the three-day alarm. The service
+  // worker is the durable context: scan the newly-granted source(s) here so a
+  // grant always completes a sync. A grant during another source's scan (X
+  // granted while LinkedIn scans) is queued behind it: initializeScanPlan with
+  // queueIfBusy never replaces an in-progress checkpoint.
   chrome.permissions.onAdded.addListener((perms) => {
     const added = perms?.origins ?? [];
     if (added.length === 0) return;
     void (async () => {
       const state = await getState();
-      if (state.scanInProgress) return;
       const recipes = recipesOf(state);
       const granted = await grantedSources(recipes);
       const targets = Object.entries(recipes)

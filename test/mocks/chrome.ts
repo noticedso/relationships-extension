@@ -50,6 +50,7 @@ export interface ChromeMock {
   };
   cookies: {
     get: (details: { url: string; name: string }) => Promise<{ name: string; value: string } | null>;
+    onChanged: FakeEvent<[{ removed: boolean; cookie: { name: string; domain: string }; cause: string }]>;
   };
   permissions: {
     request: (permissions: unknown) => Promise<boolean>;
@@ -60,6 +61,14 @@ export interface ChromeMock {
     create: (createProperties: { url?: string; active?: boolean }) => Promise<{ id: number; url?: string }>;
     get: (tabId: number) => Promise<{ id: number; url?: string }>;
     remove: (tabId: number) => Promise<void>;
+    query: (queryInfo: { url?: string | string[] }) => Promise<Array<{ id?: number; windowId?: number; url?: string }>>;
+    update: (tabId: number, updateProperties: { active?: boolean }) => Promise<{ id: number }>;
+  };
+  windows: {
+    update: (windowId: number, updateInfo: { focused?: boolean }) => Promise<{ id: number }>;
+  };
+  action: {
+    onClicked: FakeEvent<[{ id?: number; url?: string }]>;
   };
 }
 
@@ -114,6 +123,7 @@ function createChromeMock(): ChromeMock {
       async get(_details: { url: string; name: string }): Promise<{ name: string; value: string } | null> {
         return null;
       },
+      onChanged: createEvent(),
     },
     permissions: {
       async request(_permissions: unknown): Promise<boolean> {
@@ -132,6 +142,20 @@ function createChromeMock(): ChromeMock {
         return { id: tabId };
       },
       async remove(_tabId: number): Promise<void> {},
+      async query(_queryInfo: { url?: string | string[] }): Promise<Array<{ id?: number; windowId?: number; url?: string }>> {
+        return [];
+      },
+      async update(tabId: number, _updateProperties: { active?: boolean }): Promise<{ id: number }> {
+        return { id: tabId };
+      },
+    },
+    windows: {
+      async update(windowId: number, _updateInfo: { focused?: boolean }): Promise<{ id: number }> {
+        return { id: windowId };
+      },
+    },
+    action: {
+      onClicked: createEvent(),
     },
   };
 }

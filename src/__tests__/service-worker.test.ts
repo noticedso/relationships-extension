@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChromeMock } from "../../test/mocks/chrome";
 import { RECIPE_PATH } from "../lib/recipe-source";
 import * as sw from "../service-worker";
@@ -285,6 +285,25 @@ describe("service worker", () => {
       await new Promise(resolve => setTimeout(resolve, 0));
       clock.mockRestore();
     }
+  });
+  it("queues X when access is granted from the toolbar while LinkedIn is still scanning", async () => {
+    sw.registerListeners();
+    const chrome = getChrome();
+    await chrome.storage.local.set({
+      recipe,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      account,
+      noticedOrigin: "https://app.noticed.so",
+      ...inProgress({ scanItems: [{ id: "keep" }], scanQueue: [] }),
+    });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    chrome.permissions.onAdded.dispatch({ origins: [xRecipe.targetOrigin + "/*"] });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(await chrome.storage.local.get(null)).toMatchObject({
+      scanSource: "linkedin_extension",
+      scanItems: [{ id: "keep" }],
+      scanQueue: ["x"],
+    });
   });
   it("queues the missing source of an overlapping popup plan without replacing the active checkpoint",async()=>{
     sw.registerListeners();const chrome=getChrome();
@@ -3189,3 +3208,137 @@ describe("X history handoff", () => {
     expect(fetchImpl).toHaveBeenCalledTimes(3);
   });
 });
+
+describe("network session detection", () => {
+  beforeEach(() => { sw.registerListeners(); });
+  // Scans these tests start run on their own; let each finish while this
+  // test's Chrome mock is still installed (see pair()).
+  afterEach(async () => {
+    await vi.waitFor(async () => {
+      const { scanInProgress } = await getChrome().storage.local.get("scanInProgress");
+      expect(scanInProgress ?? false).toBe(false);
+    }, { timeout: 4000, interval: 20 });
+  });
+  // LinkedIn sets its CSRF cookie (JSESSIONID) for signed-out visitors too; only
+  // the recipe's session cookie (li_at) proves a signed-in account.
+  const sessionRecipe = {
+    ...recipe,
+    ownerAccountSource: { listPathTemplate: "/me", idPath: "id", usernamePath: "handle", sessionCookie: "session" },
+  };
+  const cookieJar = (names: string[]) =>
+    vi.spyOn(getChrome().cookies, "get").mockImplementation(async ({ name }) =>
+      names.includes(name) ? { name, value: "v" } : null);
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
+  const pairWithSession = async () => {
+    const response = await dispatchExternal({ type: "pair", recipe: sessionRecipe, account }, noticedSender);
+    await settle();
+    return response;
+  };
+
+  it("reports signed out when only the CSRF cookie is present", async () => {
+    const chrome = getChrome();
+    await chrome.storage.local.set({ recipe: sessionRecipe, recipes: { linkedin_extension: sessionRecipe }, account });
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    cookieJar(["tok"]);
+    const res = (await dispatchInternal({ type: "getStatus" })) as {
+      sources: Array<{ source: string; signedIn: boolean | null }>;
+    };
+    expect(res.sources.find((s) => s.source === "linkedin_extension")!.signedIn).toBe(false);
+  });
+
+  it("does not start or rate-limit a scan while the network is signed out", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    cookieJar(["tok"]);
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    expect(await pairWithSession()).toMatchObject({ ok: true });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanInProgress ?? false).toBe(false);
+    expect((stored.lastScanAttemptBySource as Record<string, number> | undefined)?.linkedin_extension).toBeUndefined();
+  });
+
+  it("starts the sync when the network's session cookie appears after pairing", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const jar = cookieJar(["tok"]);
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    await pairWithSession();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // An unrelated cookie, or the session cookie being removed, changes nothing.
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "other", domain: ".network.example.com" }, cause: "explicit" });
+    chrome.cookies.onChanged.dispatch({ removed: true, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    jar.mockImplementation(async ({ name }) => ({ name, value: "v" }));
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("starts a never-synced network on sign-in even when another source just scanned", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const jar = cookieJar(["tok"]);
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    await pairWithSession();
+    // Another source (X) scanned moments ago: the routine three-day throttle is active.
+    await chrome.storage.local.set({ lastScanStartedAt: Date.now(), lastScanAttemptBySource: { x: Date.now() } });
+
+    jar.mockImplementation(async ({ name }) => ({ name, value: "v" }));
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("applies the legacy global scan time as LinkedIn's cooldown only for installs without per-source attempts", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response));
+    const base = { recipe, recipes: { linkedin_extension: recipe }, account, noticedOrigin: "https://app.noticed.so" };
+    const scan = () => dispatchExternal({ type: "scanNow", source: "linkedin_extension", accountId: account.id }, noticedSender);
+
+    await chrome.storage.local.set({ ...base, lastScanStartedAt: Date.now() });
+    expect(await scan()).toMatchObject({ ok: false, error: "rate_limited" });
+
+    await chrome.storage.local.set({ ...base, lastScanStartedAt: Date.now(), lastScanAttemptBySource: { x: Date.now() } });
+    expect(await scan()).toMatchObject({ ok: true });
+  });
+
+  it("treats a network as never synced for a newly paired account despite another account's old attempt", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const jar = cookieJar(["tok"]);
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    await pairWithSession();
+    // A previous account tried LinkedIn two days ago (past the daily cooldown);
+    // this account just scanned X.
+    const twoDaysAgo = Date.now() - 2 * 86_400_000;
+    await chrome.storage.local.set({
+      lastScanStartedAt: Date.now(),
+      lastScanAttemptBySource: { linkedin_extension: twoDaysAgo, x: Date.now() },
+    });
+
+    jar.mockImplementation(async ({ name }) => ({ name, value: "v" }));
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+});
+
