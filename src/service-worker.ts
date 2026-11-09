@@ -1296,8 +1296,9 @@ function scanCooldown(state: Partial<State>, source: string): Extract<ScanNowRes
   if (source !== "linkedin_extension") return null;
   const last = Math.max(state.lastScanAttemptBySource?.[source] ?? 0,
     state.lastScanBySource?.[source]?.at ?? 0,
-    // Old installations did not persist per-source attempts.
-    state.lastScanAttemptBySource?.[source] == null ? state.lastScanStartedAt ?? 0 : 0);
+    // Old installations did not persist per-source attempts. Once the map
+    // exists, another source's scan says nothing about this one.
+    state.lastScanAttemptBySource == null ? state.lastScanStartedAt ?? 0 : 0);
   const retryAt = last + LINKEDIN_MIN_SCAN_INTERVAL_MS;
   return last > 0 && Date.now() < retryAt
     ? { ok: false, error: "rate_limited", retryAt: new Date(retryAt).toISOString() } : null;
@@ -2088,30 +2089,47 @@ export function registerListeners(): void {
     void autoScanGrantedSources({ refreshRecipes: true });
   });
 
-  // Grant → scan. When the user grants withheld access (from the toolbar
-  // button), nothing else would sync until the three-day alarm. The service
-  // worker is the durable context: scan the newly-granted source(s) here so a
-  // grant always completes a sync. A grant during another source's scan (X
-  // granted while LinkedIn scans) is queued behind it: initializeScanPlan with
-  // queueIfBusy never replaces an in-progress checkpoint.
   // Signing in to a network after pairing starts its sync, as the connection
-  // page promises. autoScanGrantedSources keeps the throttle, cooldown and
-  // terminal-failure guards, so a refreshed session cookie cannot loop scans.
+  // page promises. A network that never synced for this account starts directly:
+  // the routine three-day throttle covers rescans, not a first sync another
+  // source's scan just stamped. Its daily cooldown, failure and pending guards
+  // still apply. Later session-cookie refreshes go through the throttled path,
+  // so they cannot loop scans.
   chrome.cookies.onChanged.addListener(({ removed, cookie }) => {
     if (removed) return;
     void (async () => {
       const state = await getState();
       if (!state.account) return;
       const domain = cookie.domain.replace(/^\./, "");
-      const signedIn = Object.values(recipesOf(state)).some((recipe) => {
-        const host = new URL(recipe.targetOrigin).hostname;
-        return recipe.ownerAccountSource?.sessionCookie === cookie.name
-          && (host === domain || host.endsWith(`.${domain}`));
+      const sources = Object.entries(recipesOf(state))
+        .filter(([, recipe]) => {
+          const host = new URL(recipe.targetOrigin).hostname;
+          return recipe.ownerAccountSource?.sessionCookie === cookie.name
+            && (host === domain || host.endsWith(`.${domain}`));
+        })
+        .map(([source]) => source);
+      if (sources.length === 0) return;
+      const firstSync = sources.filter((source) => {
+        const aliases = sourceAliases(source);
+        return !state.lastScanAttemptBySource?.[source] && !state.lastScanBySource?.[source]
+          && !aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias] || state.pendingScans?.[alias]);
       });
-      if (signedIn) await autoScanGrantedSources({ refreshRecipes: true });
+      if (firstSync.length === 0) {
+        await autoScanGrantedSources({ refreshRecipes: true });
+        return;
+      }
+      if (!(await grantedSources(recipesOf(state))).some((source) => firstSync.includes(source))) return;
+      const admission = await initializeScanPlan(firstSync, true, { queueIfBusy: true });
+      if (admission.ok && admission.status === "started") await continueScanPlan();
     })();
   });
 
+  // Grant → scan. When the user grants withheld access (from the toolbar
+  // button), nothing else would sync until the three-day alarm. The service
+  // worker is the durable context: scan the newly-granted source(s) here so a
+  // grant always completes a sync. A grant during another source's scan (X
+  // granted while LinkedIn scans) is queued behind it: initializeScanPlan with
+  // queueIfBusy never replaces an in-progress checkpoint.
   chrome.permissions.onAdded.addListener((perms) => {
     const added = perms?.origins ?? [];
     if (added.length === 0) return;

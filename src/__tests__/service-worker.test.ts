@@ -3274,4 +3274,39 @@ describe("network session detection", () => {
     await settle();
     expect(fetchSpy).toHaveBeenCalled();
   });
+
+  it("starts a never-synced network on sign-in even when another source just scanned", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const jar = cookieJar(["tok"]);
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    await pairWithSession();
+    // Another source (X) scanned moments ago: the routine three-day throttle is active.
+    await chrome.storage.local.set({ lastScanStartedAt: Date.now(), lastScanAttemptBySource: { x: Date.now() } });
+
+    jar.mockImplementation(async ({ name }) => ({ name, value: "v" }));
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("applies the legacy global scan time as LinkedIn's cooldown only for installs without per-source attempts", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response));
+    const base = { recipe, recipes: { linkedin_extension: recipe }, account, noticedOrigin: "https://app.noticed.so" };
+    const scan = () => dispatchExternal({ type: "scanNow", source: "linkedin_extension", accountId: account.id }, noticedSender);
+
+    await chrome.storage.local.set({ ...base, lastScanStartedAt: Date.now() });
+    expect(await scan()).toMatchObject({ ok: false, error: "rate_limited" });
+
+    await chrome.storage.local.set({ ...base, lastScanStartedAt: Date.now(), lastScanAttemptBySource: { x: Date.now() } });
+    expect(await scan()).toMatchObject({ ok: true });
+  });
 });
+
