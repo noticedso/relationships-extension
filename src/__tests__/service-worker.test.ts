@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChromeMock } from "../../test/mocks/chrome";
 import { RECIPE_PATH } from "../lib/recipe-source";
 import * as sw from "../service-worker";
@@ -3211,6 +3211,14 @@ describe("X history handoff", () => {
 
 describe("network session detection", () => {
   beforeEach(() => { sw.registerListeners(); });
+  // Scans these tests start run on their own; let each finish while this
+  // test's Chrome mock is still installed (see pair()).
+  afterEach(async () => {
+    await vi.waitFor(async () => {
+      const { scanInProgress } = await getChrome().storage.local.get("scanInProgress");
+      expect(scanInProgress ?? false).toBe(false);
+    }, { timeout: 4000, interval: 20 });
+  });
   // LinkedIn sets its CSRF cookie (JSESSIONID) for signed-out visitors too; only
   // the recipe's session cookie (li_at) proves a signed-in account.
   const sessionRecipe = {
