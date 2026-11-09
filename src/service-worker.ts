@@ -101,7 +101,11 @@ export function isNoticedOrigin(origin: string | null | undefined): boolean {
 /** Where people manage the extension's accounts: noticed's connection page. */
 export const CONNECT_PATH = "/connect";
 const DEFAULT_NOTICED_ORIGIN = "https://www.noticed.so";
-/** The networks the extension reads; granted at install, but users can withhold them. */
+/**
+ * The networks the extension reads. LinkedIn is granted at install (users can
+ * still withhold it); X is optional and asked for here, so connecting it never
+ * disables an existing LinkedIn-only install on update.
+ */
 const SOURCE_ORIGINS = ["*://*.linkedin.com/*", "*://*.x.com/*", "*://*.twitter.com/*"];
 
 /**
