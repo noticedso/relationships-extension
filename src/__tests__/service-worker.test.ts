@@ -3308,5 +3308,29 @@ describe("network session detection", () => {
     await chrome.storage.local.set({ ...base, lastScanStartedAt: Date.now(), lastScanAttemptBySource: { x: Date.now() } });
     expect(await scan()).toMatchObject({ ok: true });
   });
+
+  it("treats a network as never synced for a newly paired account despite another account's old attempt", async () => {
+    const chrome = getChrome();
+    vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
+    const jar = cookieJar(["tok"]);
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    await pairWithSession();
+    // A previous account tried LinkedIn two days ago (past the daily cooldown);
+    // this account just scanned X.
+    const twoDaysAgo = Date.now() - 2 * 86_400_000;
+    await chrome.storage.local.set({
+      lastScanStartedAt: Date.now(),
+      lastScanAttemptBySource: { linkedin_extension: twoDaysAgo, x: Date.now() },
+    });
+
+    jar.mockImplementation(async ({ name }) => ({ name, value: "v" }));
+    chrome.cookies.onChanged.dispatch({ removed: false, cookie: { name: "session", domain: ".network.example.com" }, cause: "explicit" });
+    await settle();
+    expect(fetchSpy).toHaveBeenCalled();
+  });
 });
 

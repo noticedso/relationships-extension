@@ -2111,7 +2111,8 @@ export function registerListeners(): void {
       if (sources.length === 0) return;
       const firstSync = sources.filter((source) => {
         const aliases = sourceAliases(source);
-        return !state.lastScanAttemptBySource?.[source] && !state.lastScanBySource?.[source]
+        // lastScanBySource resets when the paired account changes; attempts don't.
+        return !state.lastScanBySource?.[source]
           && !aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias] || state.pendingScans?.[alias]);
       });
       if (firstSync.length === 0) {
