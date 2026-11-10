@@ -43,9 +43,11 @@ import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
 declare const __DEV__: boolean;
 
 const SCAN_ALARM = "scan";
-const SCAN_PERIOD_MINUTES = 3 * 24 * 60;
-const SCAN_PERIOD_MS = SCAN_PERIOD_MINUTES * 60 * 1000;
-const SCAN_THROTTLE_MS = SCAN_PERIOD_MS;
+// Each network syncs every three days. The alarm only checks which networks are
+// due, so a sync that a closed browser, an account switch or LinkedIn's daily
+// limit blocked runs within hours of becoming possible, not a whole period later.
+const SCAN_PERIOD_MS = 3 * 24 * 60 * 60 * 1000;
+const SCAN_CHECK_PERIOD_MINUTES = 6 * 60;
 const SYNC_PATH = "/x/sync";
 const HANDOFF_RETRY_ALARM = "handoff-retry";
 
@@ -1407,27 +1409,44 @@ async function continueScanPlan(): Promise<void> {
 }
 
 /**
- * Auto-scan every source whose host permission is already granted, at most once
- * per throttle window. The SHARED path for the three-day alarm AND auto-scan-on-
- * pair (NT-66) — a single implementation so the two can never drift.
+ * Auto-scan every granted source that scanDue says is due. The SHARED path for
+ * the scheduled check AND auto-scan-on-pair (NT-66) — a single implementation so
+ * the two can never drift.
  *
- * The `lastScanStartedAt` throttle is load-bearing for the pair path: the /x/sync
+ * The per-source schedule is load-bearing for the pair path: the /x/sync
  * handoff page (SyncBroker) re-pairs after EVERY finished scan to refresh the
- * served recipe. Without the throttle that re-pair re-runs a full scan, which
+ * served recipe. A finished scan is pending or just confirmed, and any attempt
+ * waits a day, so that re-pair never rescans. Without these guards it would
+ * re-run a full scan, which
  * finalizes → opens another /x/sync tab → re-pairs → scans …, an unbounded loop
  * that continuously hammers LinkedIn/X (account-ban risk). A user gesture
  * uses the shorter shared daily minimum instead.
  *
  * `refreshRecipes` is false ONLY for the pair path, whose recipes arrived in the
  * pair message microseconds ago — re-fetching them would be a pure double-fetch.
- * The three-day alarm passes true so every automatic scan uses fresh recipes.
+ * The scheduled check passes true so every automatic scan uses fresh recipes.
  * Either way only the FIRST source refreshes — one response carries every
  * source's recipe.
  */
+/** Whether a network is due for its automatic sync. Each network keeps its own
+ * three-day cadence from its last confirmed sync for this account, so one
+ * network's sync never postpones another's. Any attempt — confirmed or not —
+ * waits out the shared daily minimum, so an unconfirmed scan (for example one
+ * an account switch discarded) is retried the next day rather than in a loop. */
+function scanDue(state: Partial<State>, source: string): boolean {
+  const now = Date.now();
+  // Old installations recorded only the shared start time.
+  if (state.lastScanBySource == null && state.lastScanAttemptBySource == null)
+    return state.lastScanStartedAt == null || now - state.lastScanStartedAt >= SCAN_PERIOD_MS;
+  const synced = state.lastScanBySource?.[source]?.at;
+  if (synced != null && now - synced < SCAN_PERIOD_MS) return false;
+  const attempted = state.lastScanAttemptBySource?.[source];
+  return attempted == null || now - attempted >= LINKEDIN_MIN_SCAN_INTERVAL_MS;
+}
+
 async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promise<void> {
   const state = await getState();
   if (state.scanInProgress || (state.scanQueue?.length ?? 0) > 0) return;
-  if (state.lastScanStartedAt != null && Date.now() - state.lastScanStartedAt < SCAN_THROTTLE_MS) return;
   const targets: string[] = [];
   const recipes = recipesOf(state);
   for (const src of await grantedSources(recipes)) {
@@ -1445,6 +1464,7 @@ async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promis
     // stronger than the timestamp throttle and also covers legacy installs where
     // lastScanStartedAt was never persisted.
     if (aliases.some((alias) => state.pendingScans?.[alias])) continue;
+    if (!scanDue(state, src)) continue;
     targets.push(src);
   }
   if (targets.length === 0) return;
@@ -1774,11 +1794,11 @@ async function handleExternal(
           // The old account's handoff tab may already be gone.
         }
       }
-      chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_PERIOD_MINUTES });
+      chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_CHECK_PERIOD_MINUTES });
       sendResponse({ ok: true });
       // NT-66 auto-scan on pair: import the already-granted sources immediately so
       // a reconnect syncs with no manual click. This TRULY mirrors the three-day
-      // alarm path — including its throttle — via the shared helper, so the
+      // alarm path — including its per-source schedule — via the shared helper, so the
       // /x/sync recipe-refresh re-pair (SyncBroker) can't re-trigger a scan loop.
       // Users who withheld host access are scanned once they grant it from the
       // toolbar button, via permissions.onAdded. Fire-and-forget so the connect
@@ -1786,7 +1806,7 @@ async function handleExternal(
       //
       // refreshRecipes:false — the recipes we just stored ARE the server's current
       // ones (the connect page GET them from RECIPE_PATH immediately before it
-      // pairs), so a pair-triggered scan must not re-fetch them. The throttle
+      // pairs), so a pair-triggered scan must not re-fetch them. The schedule
       // above still guards the /x/sync re-pair → scan loop.
       void autoScanGrantedSources({ refreshRecipes: false });
       void openPendingHandoffs(origin);
@@ -2017,25 +2037,18 @@ export function registerListeners(): void {
   lastChrome = chrome;
 
   // Reconcile the named alarm on install/update. `onInstalled` also fires on
-  // every BROWSER update (not just extension updates), which happens far more
-  // often than SCAN_PERIOD_MINUTES — recreating unconditionally would reset the
-  // countdown to "now" each time and could defer the scan indefinitely. Only
-  // (re)arm when no alarm exists yet, or when its cadence doesn't match the
-  // shipped SCAN_PERIOD_MINUTES (e.g. this release shortened it). A fresh arm
-  // anchors to the last real scan — not "now" — so it agrees with getStatus's
-  // `nextScanAt` (lastScanAt + SCAN_PERIOD_MS) instead of silently
-  // pushing the next scan further out on every reconcile.
+  // every BROWSER update (not just extension updates); recreating the alarm
+  // unconditionally would keep resetting its countdown. Only (re)arm when no
+  // alarm exists yet, or when its cadence doesn't match the shipped
+  // SCAN_CHECK_PERIOD_MINUTES (e.g. an older release's three-day alarm).
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
       await recoverObsoleteHistory();
       const existing = await chrome.alarms.get(SCAN_ALARM);
-      if (existing && existing.periodInMinutes === SCAN_PERIOD_MINUTES) return;
-      const { lastScanAt } = await getState();
-      // A `when` in the past is fine — Chrome fires it as soon as possible,
-      // which is exactly right for a Team that's overdue: catch up now rather
-      // than silently deferring another full period from this reconcile.
-      const when = (lastScanAt ?? Date.now()) + SCAN_PERIOD_MS;
-      chrome.alarms.create(SCAN_ALARM, { when, periodInMinutes: SCAN_PERIOD_MINUTES });
+      if (existing && existing.periodInMinutes === SCAN_CHECK_PERIOD_MINUTES) return;
+      // Check soon: a network that is already overdue catches up now instead of
+      // waiting another period; one that is not due is left alone by scanDue.
+      chrome.alarms.create(SCAN_ALARM, { when: Date.now() + 60_000, periodInMinutes: SCAN_CHECK_PERIOD_MINUTES });
     })();
   });
 
@@ -2091,7 +2104,7 @@ export function registerListeners(): void {
 
   // Signing in to a network after pairing starts its sync, as the connection
   // page promises. A network that never synced for this account starts directly:
-  // the routine three-day throttle covers rescans, not a first sync another
+  // the routine three-day schedule covers rescans, not a first sync another
   // source's scan just stamped. Its daily cooldown, failure and pending guards
   // still apply. Later session-cookie refreshes go through the throttled path,
   // so they cannot loop scans.
