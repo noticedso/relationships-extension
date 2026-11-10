@@ -440,7 +440,7 @@ describe("service worker", () => {
     expect(stored.account).toMatchObject({ id: "acct-1" });
     expect(stored.noticedOrigin).toBe("https://app.noticed.so");
 
-    expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 4320 });
+    expect(createAlarm).toHaveBeenCalledWith("scan", { periodInMinutes: 360 });
     // pair must always ack — requesting permission here would throw (no gesture)
     // and leave the connect page hanging. Permission is requested in the popup.
     expect(reqPerms).not.toHaveBeenCalled();
@@ -1530,35 +1530,31 @@ describe("service worker", () => {
     expect(createAlarm).toHaveBeenCalledTimes(1);
     const [name, info] = createAlarm.mock.calls[0] as [string, { periodInMinutes?: number; when?: number }];
     expect(name).toBe("scan");
-    expect(info.periodInMinutes).toBe(4320);
+    expect(info.periodInMinutes).toBe(360);
     expect(info.when).toBeGreaterThan(Date.now());
   });
 
-  it("22c. an old installation on a stale (30-day) cadence gets re-armed anchored to its last real scan — not to now", async () => {
+  it("22c. an old installation on a longer cadence is re-armed to check soon, so an overdue network catches up", async () => {
     const chrome = getChrome();
     const settle = () => new Promise((r) => setTimeout(r, 25));
-    const lastScanAt = Date.now() - 5 * 24 * 60 * 60 * 1000; // scanned 5 days ago
-    await chrome.storage.local.set({ lastScanAt });
-    // Simulate the pre-PR14 30-day alarm already being armed.
-    chrome.alarms.create("scan", { periodInMinutes: 43200 });
+    await chrome.storage.local.set({ lastScanAt: Date.now() - 5 * 24 * 60 * 60 * 1000 });
+    chrome.alarms.create("scan", { periodInMinutes: 4320 });
     const createAlarm = vi.spyOn(chrome.alarms, "create");
 
-    chrome.runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.2.9" });
+    chrome.runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.3.0" });
     await settle();
 
     expect(createAlarm).toHaveBeenCalledTimes(1);
     const [name, info] = createAlarm.mock.calls[0] as [string, { periodInMinutes?: number; when?: number }];
     expect(name).toBe("scan");
-    expect(info.periodInMinutes).toBe(4320);
-    // Anchored to lastScanAt + 3 days — already in the past — not "now + 3 days".
-    expect(info.when).toBe(lastScanAt + 3 * 24 * 60 * 60 * 1000);
-    expect(info.when).toBeLessThan(Date.now());
+    expect(info.periodInMinutes).toBe(360);
+    expect(info.when).toBeLessThanOrEqual(Date.now() + 60_000);
   });
 
   it("22d. a browser update that fires onInstalled again leaves an already-current alarm untouched", async () => {
     const chrome = getChrome();
     const settle = () => new Promise((r) => setTimeout(r, 25));
-    chrome.alarms.create("scan", { periodInMinutes: 4320 });
+    chrome.alarms.create("scan", { periodInMinutes: 360 });
     const createAlarm = vi.spyOn(chrome.alarms, "create");
 
     chrome.runtime.onInstalled.dispatch({ reason: "chrome_update" });
@@ -3342,3 +3338,134 @@ describe("network session detection", () => {
   });
 });
 
+
+describe("per-source automatic sync schedule", () => {
+  beforeEach(() => { sw.registerListeners(); });
+  afterEach(async () => {
+    await vi.waitFor(async () => {
+      const { scanInProgress } = await getChrome().storage.local.get("scanInProgress");
+      expect(scanInProgress ?? false).toBe(false);
+    }, { timeout: 4000, interval: 20 });
+  });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
+  const HOUR = 60 * 60 * 1000;
+  const DAY = 24 * HOUR;
+  const base = { recipe, recipes: { linkedin_extension: recipe }, account, noticedOrigin: "https://app.noticed.so" };
+  const scanFetch = () => {
+    vi.spyOn(getChrome().permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: false, status: 404 } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchSpy);
+    return () => fetchSpy.mock.calls.filter(([url]) => String(url).startsWith(recipe.targetOrigin)).length;
+  };
+
+  it("retries a LinkedIn sync an account switch dropped once its daily limit ends, although X just synced", async () => {
+    const networkCalls = scanFetch();
+    // The re-pair discarded the in-flight LinkedIn scan (no success recorded for
+    // this account) but kept its attempt; X then synced and stamped the shared time.
+    await getChrome().storage.local.set({
+      ...base,
+      lastScanStartedAt: Date.now() - HOUR,
+      lastScanBySource: { x: { at: Date.now() - HOUR, count: 3 } },
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - DAY - HOUR, x: Date.now() - HOUR },
+    });
+    getChrome().alarms.onAlarm.dispatch({ name: "scan" });
+    await settle();
+    expect(networkCalls()).toBeGreaterThan(0);
+  });
+
+  it("does not retry LinkedIn inside its daily limit", async () => {
+    const networkCalls = scanFetch();
+    await getChrome().storage.local.set({
+      ...base,
+      lastScanStartedAt: Date.now() - 10 * DAY,
+      lastScanBySource: {},
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - HOUR },
+    });
+    getChrome().alarms.onAlarm.dispatch({ name: "scan" });
+    await settle();
+    expect(networkCalls()).toBe(0);
+  });
+
+  it("does not rescan a network that synced within three days", async () => {
+    const networkCalls = scanFetch();
+    await getChrome().storage.local.set({
+      ...base,
+      lastScanStartedAt: Date.now() - 4 * DAY,
+      lastScanBySource: { linkedin_extension: { at: Date.now() - 2 * DAY, count: 5 } },
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - 2 * DAY },
+    });
+    getChrome().alarms.onAlarm.dispatch({ name: "scan" });
+    await settle();
+    expect(networkCalls()).toBe(0);
+  });
+
+  it("rescans a network whose last sync is older than three days", async () => {
+    const networkCalls = scanFetch();
+    await getChrome().storage.local.set({
+      ...base,
+      lastScanStartedAt: Date.now() - HOUR,
+      lastScanBySource: { linkedin_extension: { at: Date.now() - 4 * DAY, count: 5 }, x: { at: Date.now() - HOUR, count: 2 } },
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - 4 * DAY, x: Date.now() - HOUR },
+    });
+    getChrome().alarms.onAlarm.dispatch({ name: "scan" });
+    await settle();
+    expect(networkCalls()).toBeGreaterThan(0);
+  });
+
+  it("does not rescan on the handoff re-pair after a scan that ended unconfirmed within the day", async () => {
+    const networkCalls = scanFetch();
+    // The scan ended with no pending payload and no recorded failure (a
+    // discarded or stale LinkedIn scan); /x/sync then re-pairs as it always does.
+    await getChrome().storage.local.set({
+      ...base,
+      lastScanBySource: {},
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - HOUR },
+    });
+    await pair();
+    await settle();
+    expect(networkCalls()).toBe(0);
+    expect((await getChrome().storage.local.get("scanInProgress")).scanInProgress ?? false).toBe(false);
+  });
+
+  it("does not rescan X on the handoff re-pair after an unconfirmed X attempt within the day", async () => {
+    vi.spyOn(getChrome().permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn(async (_url: string) => ({ ok: true, json: async () => ({ elements: [] }) }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+    await getChrome().storage.local.set({
+      recipe: xRecipe, recipes: { x: xRecipe }, account, noticedOrigin: "https://app.noticed.so",
+      lastScanBySource: {},
+      lastScanAttemptBySource: { x: Date.now() - HOUR },
+    });
+    await dispatchExternal({ type: "pair", recipe: xRecipe, account }, noticedSender);
+    await settle();
+    expect(fetchSpy.mock.calls.filter(([url]) => String(url).startsWith(xRecipe.targetOrigin))).toHaveLength(0);
+  });
+
+  it("reports when each network's next automatic sync is due", async () => {
+    await getChrome().storage.local.set({
+      ...base,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      lastScanAt: Date.now() - HOUR,
+      lastScanBySource: { x: { at: Date.now() - HOUR, count: 2 } },
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - 20 * HOUR, x: Date.now() - HOUR },
+    });
+    const status = (await dispatchInternal({ type: "getStatus" })) as { nextScanAt: number };
+    // LinkedIn's daily minimum ends in 4 hours, well before X's three days.
+    expect(status.nextScanAt).toBeGreaterThan(Date.now() + 3 * HOUR);
+    expect(status.nextScanAt).toBeLessThan(Date.now() + 5 * HOUR);
+  });
+
+  it("checks the schedule every six hours so a missed or blocked sync is not deferred for days", async () => {
+    const createAlarm = vi.spyOn(getChrome().alarms, "create");
+    getChrome().alarms.create("scan", { periodInMinutes: 4320 });
+    createAlarm.mockClear();
+    getChrome().runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.3.0" });
+    await settle();
+    expect(createAlarm).toHaveBeenCalledWith("scan", expect.objectContaining({ periodInMinutes: 360 }));
+  });
+});

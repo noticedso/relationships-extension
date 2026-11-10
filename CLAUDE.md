@@ -37,7 +37,7 @@ access the user withheld.)
 harness swaps the global `chrome`):
 - `onMessageExternal` — only from `*.noticed.so` origins (enforced by `isNoticedOrigin`): `ping`, `pair`,
   `getOnboardingStatus`
-  (store recipe+account+`noticedOrigin`, set the three-day alarm; it never requests permissions),
+  (store recipe+account+`noticedOrigin`, set the six-hourly sync check; it never requests permissions),
   `getCachedScan`, `syncConfirmed`.
 - `onMessage` (internal) — `getStatus`, `scanNow`, `setTestMode`, `getSyncHistory`. No UI sends these
   since the popup was removed; they remain the extension's internal control surface and tests drive scans
@@ -45,8 +45,8 @@ harness swaps the global `chrome`):
   service-worker console (a worker's own `runtime.sendMessage` never reaches its `onMessage`).
 - `action.onClicked` — the toolbar button (there is no popup): restores withheld site access, then
   focuses or opens noticed's `/connect` page (`openConnectionPage`).
-- `onAlarm` — runs `runScan` at most once per three days (a `lastScanStartedAt` throttle guards
-  catch-up/duplicate fires).
+- `onAlarm` — every six hours, syncs each granted network that `scanDue` says is due: three days
+  after its own last confirmed sync, and never within 24 hours of its last attempt.
 
 `runScan` composes the pure libs: `cookies.ts` (read the session cookie → CSRF header) → `fetch-engine.ts`
 (`scanConnections`: paced, jittered, page-capped pagination; test mode caps to 2 requests) → `recipe.ts`
