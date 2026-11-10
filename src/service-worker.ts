@@ -100,8 +100,8 @@ export function isNoticedOrigin(origin: string | null | undefined): boolean {
 
 // ── Toolbar button ───────────────────────────────────────────────────────────
 
-/** Where people manage the extension's accounts: noticed's connection page. */
-export const CONNECT_PATH = "/connect";
+/** Where people manage the extension's accounts: noticed's Connectors page. */
+export const CONNECT_PATH = "/connectors";
 const DEFAULT_NOTICED_ORIGIN = "https://www.noticed.so";
 /**
  * The networks the extension reads. LinkedIn is granted at install (users can

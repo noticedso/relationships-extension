@@ -20,13 +20,13 @@ describe("toolbar button", () => {
     chrome.action.onClicked.dispatch({ id: 9 });
     await settle();
     expect(request).toHaveBeenCalledWith({ origins: SOURCE_ORIGINS });
-    expect(create).toHaveBeenCalledWith({ url: "https://www.noticed.so/connect" });
+    expect(create).toHaveBeenCalledWith({ url: "https://www.noticed.so/connectors" });
   });
 
   it("focuses a connection page that is already open instead of opening another", async () => {
     const chrome = getChrome();
     vi.spyOn(chrome.tabs, "query").mockResolvedValue([
-      { id: 4, windowId: 2, url: "https://www.noticed.so/connect?preview=ready" },
+      { id: 4, windowId: 2, url: "https://www.noticed.so/connectors?preview=connectors" },
     ]);
     const update = vi.spyOn(chrome.tabs, "update");
     const focus = vi.spyOn(chrome.windows, "update");
@@ -46,12 +46,12 @@ describe("toolbar button", () => {
     await chrome.storage.local.set({ noticedOrigin: "https://app.noticed.so" });
     chrome.action.onClicked.dispatch({ id: 9 });
     await settle();
-    expect(create).toHaveBeenLastCalledWith({ url: "https://app.noticed.so/connect" });
+    expect(create).toHaveBeenLastCalledWith({ url: "https://app.noticed.so/connectors" });
 
     await chrome.storage.local.set({ noticedOrigin: "https://evil.example" });
     chrome.action.onClicked.dispatch({ id: 9 });
     await settle();
-    expect(create).toHaveBeenLastCalledWith({ url: "https://www.noticed.so/connect" });
+    expect(create).toHaveBeenLastCalledWith({ url: "https://www.noticed.so/connectors" });
   });
 
   it("asks for access synchronously in the click, before anything else can end the gesture", () => {
@@ -70,7 +70,7 @@ describe("toolbar button", () => {
     sw.registerListeners();
     chrome.action.onClicked.dispatch({ id: 9 });
     await settle();
-    expect(create).toHaveBeenCalledWith({ url: "https://www.noticed.so/connect" });
+    expect(create).toHaveBeenCalledWith({ url: "https://www.noticed.so/connectors" });
   });
 });
 

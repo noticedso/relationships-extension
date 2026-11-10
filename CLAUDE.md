@@ -44,7 +44,7 @@ harness swaps the global `chrome`):
   through them. To cap scans in a dev build, run `chrome.storage.local.set({ testMode: true })` in the
   service-worker console (a worker's own `runtime.sendMessage` never reaches its `onMessage`).
 - `action.onClicked` — the toolbar button (there is no popup): restores withheld site access, then
-  focuses or opens noticed's `/connect` page (`openConnectionPage`).
+  focuses or opens noticed's `/connectors` page (`openConnectionPage`).
 - `onAlarm` — every six hours, syncs each granted network that `scanDue` says is due: three days
   after its own last confirmed sync, and never within 24 hours of its last attempt.
 
@@ -55,7 +55,7 @@ harness swaps the global `chrome`):
 the first-party noticed page POSTs the data with the user's session cookie, then `syncConfirmed` clears the
 pending scan and stamps `lastScanAt`/`lastScanCount`.
 
-**Pairing has no env-id dependency.** noticed's `/connect` page pairs the extension it finds over
+**Pairing has no env-id dependency.** noticed's `/connectors` page pairs the extension it finds over
 `externally_connectable` (`pair` with the account's recipes); the legacy `/x/connect?ext_id=` broker
 still works for older flows.
 
@@ -63,7 +63,7 @@ still works for older flows.
 pendingScan, lastScanAt, lastScanStartedAt, lastScanCount, needs, testMode). All other modules read/write
 through `getState`/`setState`.
 
-**No popup (NT-300).** Status, retry and setup live on noticed's `/connect` page, which polls
+**No popup (NT-300).** Status, retry and setup live on noticed's `/connectors` page, which polls
 `getOnboardingStatus` and sends `retrySync`; the toolbar button opens it.
 
 ## Conventions & gotchas
