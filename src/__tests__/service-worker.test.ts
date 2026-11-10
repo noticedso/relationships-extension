@@ -3416,6 +3416,35 @@ describe("per-source automatic sync schedule", () => {
     expect(networkCalls()).toBeGreaterThan(0);
   });
 
+  it("does not rescan on the handoff re-pair after a scan that ended unconfirmed within the day", async () => {
+    const networkCalls = scanFetch();
+    // The scan ended with no pending payload and no recorded failure (a
+    // discarded or stale LinkedIn scan); /x/sync then re-pairs as it always does.
+    await getChrome().storage.local.set({
+      ...base,
+      lastScanBySource: {},
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - HOUR },
+    });
+    await pair();
+    await settle();
+    expect(networkCalls()).toBe(0);
+    expect((await getChrome().storage.local.get("scanInProgress")).scanInProgress ?? false).toBe(false);
+  });
+
+  it("reports when each network's next automatic sync is due", async () => {
+    await getChrome().storage.local.set({
+      ...base,
+      recipes: { linkedin_extension: recipe, x: xRecipe },
+      lastScanAt: Date.now() - HOUR,
+      lastScanBySource: { x: { at: Date.now() - HOUR, count: 2 } },
+      lastScanAttemptBySource: { linkedin_extension: Date.now() - 20 * HOUR, x: Date.now() - HOUR },
+    });
+    const status = (await dispatchInternal({ type: "getStatus" })) as { nextScanAt: number };
+    // LinkedIn's daily minimum ends in 4 hours, well before X's three days.
+    expect(status.nextScanAt).toBeGreaterThan(Date.now() + 3 * HOUR);
+    expect(status.nextScanAt).toBeLessThan(Date.now() + 5 * HOUR);
+  });
+
   it("checks the schedule every six hours so a missed or blocked sync is not deferred for days", async () => {
     const createAlarm = vi.spyOn(getChrome().alarms, "create");
     getChrome().alarms.create("scan", { periodInMinutes: 4320 });

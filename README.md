@@ -38,7 +38,7 @@ It's built in the open so you can verify exactly what it does.
 
 1. Click the extension, then **Connect to noticed**.
 2. Sign in to noticed if prompted — it opens `noticed.so/x/connect` and pairs back to this extension.
-3. Approve the one-time LinkedIn access prompt, then **Scan now** (or wait for the next three-day run).
+3. Approve the one-time LinkedIn access prompt, then **Scan now** (or wait for the next automatic sync, every three days).
 
 ## Updating
 

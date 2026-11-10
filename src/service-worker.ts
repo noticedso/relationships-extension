@@ -1434,14 +1434,22 @@ async function continueScanPlan(): Promise<void> {
  * waits out the shared daily minimum, so an unconfirmed scan (for example one
  * an account switch discarded) is retried the next day rather than in a loop. */
 function scanDue(state: Partial<State>, source: string): boolean {
-  const now = Date.now();
+  const at = nextScanDueAt(state, source);
+  return at == null || Date.now() >= at;
+}
+
+/** When scanDue next becomes true for a source; null when it has no history. */
+function nextScanDueAt(state: Partial<State>, source: string): number | null {
   // Old installations recorded only the shared start time.
   if (state.lastScanBySource == null && state.lastScanAttemptBySource == null)
-    return state.lastScanStartedAt == null || now - state.lastScanStartedAt >= SCAN_PERIOD_MS;
+    return state.lastScanStartedAt == null ? null : state.lastScanStartedAt + SCAN_PERIOD_MS;
   const synced = state.lastScanBySource?.[source]?.at;
-  if (synced != null && now - synced < SCAN_PERIOD_MS) return false;
   const attempted = state.lastScanAttemptBySource?.[source];
-  return attempted == null || now - attempted >= LINKEDIN_MIN_SCAN_INTERVAL_MS;
+  const due = [
+    synced == null ? null : synced + SCAN_PERIOD_MS,
+    attempted == null ? null : attempted + LINKEDIN_MIN_SCAN_INTERVAL_MS,
+  ].filter((at): at is number => at != null);
+  return due.length ? Math.max(...due) : null;
 }
 
 async function autoScanGrantedSources(opts: { refreshRecipes: boolean }): Promise<void> {
@@ -1669,7 +1677,10 @@ async function buildStatus(): Promise<Record<string, unknown>> {
     account: state.account ?? null,
     recipe: state.recipe ?? null,
     sources,
-    nextScanAt: lastScanAt != null ? lastScanAt + SCAN_PERIOD_MS : null,
+    // The earliest automatic sync any network is waiting for.
+    nextScanAt: Object.keys(recipesOf(state))
+      .map((source) => nextScanDueAt(state, source))
+      .reduce<number | null>((min, at) => (at == null ? min : min == null ? at : Math.min(min, at)), null),
     lastScanAt,
     lastScanCount: state.lastScanCount ?? null,
     needs: state.needs ?? null,
@@ -1720,7 +1731,7 @@ async function handleExternal(
       return;
     }
     case "pair": {
-      // Store the per-source recipes + account and arm the three-day alarm. Host
+      // Store the per-source recipes + account and arm the six-hourly sync check. Host
       // access is granted at install; if the user withheld it, the toolbar
       // button's click requests it again (openConnectionPage), never this message.
       // Pairing and refresh use the same atomic validation. Reject a malformed
@@ -1797,7 +1808,7 @@ async function handleExternal(
       chrome.alarms.create(SCAN_ALARM, { periodInMinutes: SCAN_CHECK_PERIOD_MINUTES });
       sendResponse({ ok: true });
       // NT-66 auto-scan on pair: import the already-granted sources immediately so
-      // a reconnect syncs with no manual click. This TRULY mirrors the three-day
+      // a reconnect syncs with no manual click. This TRULY mirrors the scheduled
       // alarm path — including its per-source schedule — via the shared helper, so the
       // /x/sync recipe-refresh re-pair (SyncBroker) can't re-trigger a scan loop.
       // Users who withheld host access are scanned once they grant it from the
@@ -2098,7 +2109,7 @@ export function registerListeners(): void {
       return;
     }
     if (alarm.name !== SCAN_ALARM) return;
-    // Refresh live-served recipes before every three-day automatic scan.
+    // Refresh live-served recipes before every scheduled automatic scan.
     void autoScanGrantedSources({ refreshRecipes: true });
   });
 
@@ -2139,7 +2150,7 @@ export function registerListeners(): void {
   });
 
   // Grant → scan. When the user grants withheld access (from the toolbar
-  // button), nothing else would sync until the three-day alarm. The service
+  // button), nothing else would sync until the next scheduled check. The service
   // worker is the durable context: scan the newly-granted source(s) here so a
   // grant always completes a sync. A grant during another source's scan (X
   // granted while LinkedIn scans) is queued behind it: initializeScanPlan with
