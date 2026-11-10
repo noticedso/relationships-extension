@@ -2136,7 +2136,9 @@ export function registerListeners(): void {
       const firstSync = sources.filter((source) => {
         const aliases = sourceAliases(source);
         // lastScanBySource resets when the paired account changes; attempts don't.
-        return !state.lastScanBySource?.[source]
+        // scanDue still applies the daily minimum after any attempt, so repeated
+        // session-cookie refreshes cannot restart a sync that keeps ending unconfirmed.
+        return !state.lastScanBySource?.[source] && scanDue(state, source)
           && !aliases.some((alias) => state.scanFailures?.[alias] || state.syncRecovery?.[alias] || state.pendingScans?.[alias]);
       });
       if (firstSync.length === 0) {

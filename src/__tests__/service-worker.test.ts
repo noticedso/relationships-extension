@@ -3431,6 +3431,21 @@ describe("per-source automatic sync schedule", () => {
     expect((await getChrome().storage.local.get("scanInProgress")).scanInProgress ?? false).toBe(false);
   });
 
+  it("does not rescan X on the handoff re-pair after an unconfirmed X attempt within the day", async () => {
+    vi.spyOn(getChrome().permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn(async (_url: string) => ({ ok: true, json: async () => ({ elements: [] }) }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+    await getChrome().storage.local.set({
+      recipe: xRecipe, recipes: { x: xRecipe }, account, noticedOrigin: "https://app.noticed.so",
+      lastScanBySource: {},
+      lastScanAttemptBySource: { x: Date.now() - HOUR },
+    });
+    await dispatchExternal({ type: "pair", recipe: xRecipe, account }, noticedSender);
+    await settle();
+    expect(fetchSpy.mock.calls.filter(([url]) => String(url).startsWith(xRecipe.targetOrigin))).toHaveLength(0);
+  });
+
   it("reports when each network's next automatic sync is due", async () => {
     await getChrome().storage.local.set({
       ...base,
