@@ -3516,3 +3516,22 @@ describe("networks withheld after a Connectors disconnect", () => {
     expect((stored.scanFailures as Record<string, unknown> | undefined)?.linkedin_extension).toBeUndefined();
   });
 });
+
+describe("pending uploads for withheld networks", () => {
+  beforeEach(() => { sw.registerListeners(); });
+
+  it("drops a waiting upload whose network noticed no longer serves", async () => {
+    await getChrome().storage.local.set({
+      recipe, recipes: { linkedin_extension: recipe, x: xRecipe }, account,
+      pendingScans: {
+        x: { id: "p-x", source: "x", ingestPath: "/api/x/import/extension", payload: {}, count: 1, accountKey: "id:acct-1" },
+        linkedin_extension: { id: "p-li", source: "linkedin_extension", ingestPath: "/api/linkedin/import/extension", payload: {}, count: 2, accountKey: "id:acct-1" },
+      },
+      lastScanStartedAt: Date.now(),
+    });
+    await dispatchExternal({ type: "pair", recipe, recipes: [recipe], account }, noticedSender);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const { pendingScans } = await getChrome().storage.local.get("pendingScans");
+    expect(Object.keys(pendingScans as Record<string, unknown>)).toEqual(["linkedin_extension"]);
+  });
+});

@@ -177,7 +177,11 @@ function rebindPendingIngestPaths(
 ): Record<string, PendingScan> | null {
   if (!pendingScans) return null;
   return Object.fromEntries(
-    Object.entries(pendingScans).map(([key, pending]) => {
+    Object.entries(pendingScans)
+      // noticed withholds a network disconnected on Connectors; its waiting
+      // upload would only be refused, so it is dropped.
+      .filter(([, pending]) => recipeForSource(recipes, pending.source))
+      .map(([key, pending]) => {
       const ingestPath = recipeForSource(recipes, pending.source)?.ingestPath;
       return [
         key,
