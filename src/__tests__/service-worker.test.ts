@@ -3469,3 +3469,69 @@ describe("per-source automatic sync schedule", () => {
     expect(createAlarm).toHaveBeenCalledWith("scan", expect.objectContaining({ periodInMinutes: 360 }));
   });
 });
+
+describe("networks withheld after a Connectors disconnect", () => {
+  beforeEach(() => { sw.registerListeners(); });
+  afterEach(async () => {
+    await vi.waitFor(async () => {
+      const { scanInProgress } = await getChrome().storage.local.get("scanInProgress");
+      expect(scanInProgress ?? false).toBe(false);
+    }, { timeout: 4000, interval: 20 });
+  });
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 25));
+
+  it("pairs with no networks when noticed withholds both, and then never scans", async () => {
+    vi.spyOn(getChrome().permissions, "contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const fetchSpy = vi.fn(async (_url: string) => ({ ok: true, json: async () => ({ elements: [] }) }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+    await getChrome().storage.local.set({ recipe, recipes: { linkedin_extension: recipe }, account });
+    const reply = await dispatchExternal({ type: "pair", recipe: null, recipes: [], account }, noticedSender);
+    await settle();
+    expect(reply).toMatchObject({ ok: true });
+    const stored = await getChrome().storage.local.get(null);
+    expect(stored.recipes).toEqual({});
+    expect(stored.recipe ?? null).toBeNull();
+    getChrome().alarms.onAlarm.dispatch({ name: "scan" });
+    await settle();
+    expect(fetchSpy.mock.calls.filter(([url]) => String(url).startsWith(recipe.targetOrigin))).toHaveLength(0);
+  });
+
+  it("drops a scan whose network noticed stopped serving at its start", async () => {
+    vi.spyOn(getChrome().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    await getChrome().storage.local.set({
+      recipe, recipes: { linkedin_extension: recipe }, account, noticedOrigin: "https://app.noticed.so",
+      ...inProgress({ scanNeedsRecipeRefresh: true }),
+    });
+    const fetchImpl = vi.fn(async (url: string) =>
+      String(url).includes(RECIPE_PATH)
+        ? ({ ok: true, json: async () => ({ recipe: null, recipes: [] }) } as Response)
+        : ({ ok: true, json: async () => ({ elements: [] }) } as Response));
+    vi.stubGlobal("fetch", fetchImpl);
+    const result = await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 });
+    expect(result).toMatchObject({ ok: false, note: "source-withdrawn" });
+    expect(fetchImpl.mock.calls.filter(([url]) => String(url).startsWith(recipe.targetOrigin))).toHaveLength(0);
+    const stored = await getChrome().storage.local.get(null);
+    expect(stored).toMatchObject({ scanInProgress: false, recipes: {} });
+    expect((stored.scanFailures as Record<string, unknown> | undefined)?.linkedin_extension).toBeUndefined();
+  });
+});
+
+describe("pending uploads for withheld networks", () => {
+  beforeEach(() => { sw.registerListeners(); });
+
+  it("drops a waiting upload whose network noticed no longer serves", async () => {
+    await getChrome().storage.local.set({
+      recipe, recipes: { linkedin_extension: recipe, x: xRecipe }, account,
+      pendingScans: {
+        x: { id: "p-x", source: "x", ingestPath: "/api/x/import/extension", payload: {}, count: 1, accountKey: "id:acct-1" },
+        linkedin_extension: { id: "p-li", source: "linkedin_extension", ingestPath: "/api/linkedin/import/extension", payload: {}, count: 2, accountKey: "id:acct-1" },
+      },
+      lastScanStartedAt: Date.now(),
+    });
+    await dispatchExternal({ type: "pair", recipe, recipes: [recipe], account }, noticedSender);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const { pendingScans } = await getChrome().storage.local.get("pendingScans");
+    expect(Object.keys(pendingScans as Record<string, unknown>)).toEqual(["linkedin_extension"]);
+  });
+});
