@@ -211,19 +211,30 @@ function rebindPendingIngestPaths(
  */
 async function refreshRecipesFromServer(
   noticedOrigin: string | null | undefined,
-): Promise<{ recipe: ScanRecipe; recipes: Record<string, ScanRecipe> } | null> {
+): Promise<ServedRecipes | null> {
   if (!noticedOrigin) return null;
   try {
     const res = await fetch(noticedOrigin + RECIPE_PATH, { credentials: "include" });
     if (!res.ok) return null;
     // Validated + ATOMIC: a garbage/partial body yields null rather than
     // clobbering a known-good cached recipe.
-    const parsed = parseServedRecipes(await res.json());
-    if (!parsed) return null;
-    return parsed;
+    return servedRecipes(await res.json());
   } catch {
     return null;
   }
+}
+
+type ServedRecipes = { recipe: ScanRecipe | null; recipes: Record<string, ScanRecipe> };
+
+/**
+ * A served recipe body, or none when it is malformed. noticed withholds a
+ * network the person disconnected on Connectors; an explicit empty list means
+ * every network is disconnected, so nothing should be scanned at all.
+ */
+function servedRecipes(body: unknown): ServedRecipes | null {
+  const recipes = (body as { recipes?: unknown } | null)?.recipes;
+  if (Array.isArray(recipes) && recipes.length === 0) return { recipe: null, recipes: {} };
+  return parseServedRecipes(body);
 }
 
 /**
@@ -895,7 +906,19 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
     // and a scan that cannot run must not make a request to noticed either.
     if (state.scanNeedsRecipeRefresh) {
       const refreshed = await refreshRecipesFromServer(noticedOrigin);
-      const fresh = refreshed?.recipes[scanSource];
+      const fresh = refreshed ? recipeForSource(refreshed.recipes, scanSource) : undefined;
+      // noticed stopped serving this network (disconnected on Connectors):
+      // drop the scan without a failure and keep only what it still serves.
+      if (refreshed && !fresh) {
+        await updateCurrentScan(scanSource, scanAccountId, {
+          ...clearedScanState(),
+          recipe: refreshed.recipe,
+          recipes: refreshed.recipes,
+          scanNeedsRecipeRefresh: false,
+        });
+        clearScanTick();
+        return { ok: false, note: "source-withdrawn" };
+      }
       const patch: Partial<State> = {
         ...(refreshed
           ? { recipe: refreshed.recipe, recipes: refreshed.recipes }
@@ -1736,7 +1759,7 @@ async function handleExternal(
       // button's click requests it again (openConnectionPage), never this message.
       // Pairing and refresh use the same atomic validation. Reject a malformed
       // served recipe before changing the account, cache, alarms, or handoff tabs.
-      const parsed = parseServedRecipes(message);
+      const parsed = servedRecipes(message);
       if (!parsed) {
         sendResponse({ ok: false, error: "invalid_recipe" });
         return;
