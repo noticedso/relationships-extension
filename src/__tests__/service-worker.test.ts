@@ -62,6 +62,38 @@ function inProgress(extra: Record<string, unknown> = {}): Record<string, unknown
 const account = { id: "acct-1", displayName: "Test User" };
 
 describe("source owner binding", () => {
+  it("reports a terminal scan with its original timing and retries the same receipt when offline", async () => {
+    const chrome = getChrome();
+    sw.registerListeners();
+    const alarm = vi.spyOn(chrome.alarms, "create");
+    const accountId = "a4d15fea-9f45-4ed8-9115-dde4ec3cd97e";
+    const startedAt = Date.now() - 20_000;
+    const origin = "https://www.noticed.so";
+    const report = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", report);
+    await chrome.storage.local.set({
+      recipe: { ...recipe, ownerAccountSource: { listPathTemplate: "/me", idPath: "id", usernamePath: "handle" } },
+      account: { id: accountId }, noticedOrigin: origin, ...inProgress({ scanStartedAt: startedAt }),
+    });
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+
+    const fetchImpl = vi.fn<typeof fetch>().mockRejectedValue(new TypeError("provider unavailable"));
+    await expect(sw.continueScan({ fetchImpl })).resolves.toMatchObject({ note: "source-account-failed" });
+    await vi.waitFor(() => expect(alarm).toHaveBeenCalledWith("scan-failure-report", { delayInMinutes: 1 }));
+    expect(report).toHaveBeenCalledTimes(1);
+    const [url, options] = report.mock.calls[0]!;
+    expect(url).toBe(origin + "/api/connectors/scan-failure");
+    expect(options).toMatchObject({ method: "POST", credentials: "include" });
+    const body = JSON.parse(options?.body as string);
+    expect(body).toEqual({ id: expect.any(String), accountId, source: "linkedin_extension", startedAt, failedAt: expect.any(Number) });
+    expect(body.failedAt).toBeGreaterThan(startedAt);
+
+    chrome.alarms.onAlarm.dispatch({ name: "scan-failure-report" });
+    await vi.waitFor(async () => expect((await chrome.storage.local.get(null)).failedScanReports).toEqual({}));
+    expect(report.mock.calls[1]?.[1]?.body).toBe(options?.body);
+  });
   it.each(["transport", "json", "session", "session-bound"])("terminates owner %s failures and records a recoverable error", async (mode) => {
     const chrome=getChrome(); sw.registerListeners();
     await chrome.storage.local.set({recipe:{...recipe,ownerAccountSource:{listPathTemplate:"/me",idPath:"id",usernamePath:"handle",...(mode.startsWith("session")?{sessionCookie:"session"}:{})}},account,...inProgress()});
