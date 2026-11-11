@@ -39,7 +39,7 @@ import {
   sourceOf,
 } from "./lib/recipe-source";
 import { getState, setState } from "./lib/storage";
-import type { Account, ScanRecipe, PendingScan, State } from "./lib/storage";
+import type { Account, FailedScanReport, ScanRecipe, PendingScan, State } from "./lib/storage";
 declare const __DEV__: boolean;
 
 const SCAN_ALARM = "scan";
@@ -50,6 +50,7 @@ const SCAN_PERIOD_MS = 3 * 24 * 60 * 60 * 1000;
 const SCAN_CHECK_PERIOD_MINUTES = 6 * 60;
 const SYNC_PATH = "/x/sync";
 const HANDOFF_RETRY_ALARM = "handoff-retry";
+const SCAN_FAILURE_REPORT_ALARM = "scan-failure-report";
 
 const SCAN_TICK_ALARM = "scan-tick";
 const SCAN_TICK_PERIOD_MINUTES = 0.5;
@@ -490,6 +491,65 @@ function clearedScanState(extra?: { needs?: "network-signin" }): Partial<State> 
   };
 }
 
+function failedScanReport(state: Partial<State>, source: string): Partial<State> {
+  const accountId = stableAccountId(state.account);
+  const origin = state.noticedOrigin;
+  const startedAt = state.scanStartedAt;
+  const canonical = source === "x" ? "x_extension" : source;
+  if (state.testMode || !accountId || !/^[a-f0-9-]{36}$/i.test(accountId)
+    || !origin || !isNoticedOrigin(origin) || !startedAt
+    || (canonical !== "x_extension" && canonical !== "linkedin_extension")) return {};
+  const report: FailedScanReport = {
+    id: crypto.randomUUID(), accountId, origin, source: canonical,
+    startedAt, failedAt: Math.max(startedAt, Date.now()),
+  };
+  return { failedScanReports: { ...state.failedScanReports, [canonical]: report } };
+}
+
+let flushingScanFailures = false;
+async function flushScanFailures(): Promise<void> {
+  if (flushingScanFailures) return;
+  flushingScanFailures = true;
+  let retry = false;
+  try {
+    const state = await getState();
+    const reports = Object.values(state.failedScanReports ?? {});
+    for (const report of reports) {
+      const { origin, ...body } = report;
+      if (!isNoticedOrigin(origin) || stableAccountId(state.account) !== body.accountId) continue;
+      try {
+        const response = await fetch(origin + "/api/connectors/scan-failure", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(15_000),
+        });
+        // Signed-out or switched browsers retry on startup or the regular scan alarm.
+        if ([401, 403, 404].includes(response.status)) continue;
+        if (response.status !== 204 && response.status !== 400) {
+          retry = true;
+          continue;
+        }
+        await withAccountStateMutation(async () => {
+          const latest = (await getState()).failedScanReports ?? {};
+          if (latest[report.source]?.id !== report.id) return;
+          delete latest[report.source];
+          await setState({ failedScanReports: latest });
+        });
+      } catch {
+        retry = true;
+      }
+    }
+    const seen = new Set(reports.map((report) => report.id));
+    const latest = await getState();
+    retry ||= Object.values(latest.failedScanReports ?? {}).some((report) => !seen.has(report.id));
+  } finally {
+    flushingScanFailures = false;
+    if (retry) chrome.alarms.create(SCAN_FAILURE_REPORT_ALARM, { delayInMinutes: 1 });
+  }
+}
+
 async function clearCurrentScan(
   source: string,
   accountId: string | null,
@@ -501,7 +561,8 @@ async function clearCurrentScan(
       ? "Sign in to the network, then retry the scan."
       : "History collection timed out. Retry the scan.")
     : {};
-  await updateCurrentScan(source, accountId, { ...clearedScanState(extra), ...failure });
+  await updateCurrentScan(source, accountId, { ...clearedScanState(extra), ...failure, ...failedScanReport(state, source) });
+  void flushScanFailures().catch(() => undefined);
 }
 
 class HistoryFetchError extends Error {
@@ -1035,8 +1096,10 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
             }
             await updateCurrentScan(scanSource, scanAccountId, {
               ...clearedScanState(), ...historyFailureState(current, scanSource, historyFailureMessage(error), recipe),
+              ...failedScanReport(current, scanSource),
             });
             clearScanTick();
+            void flushScanFailures().catch(() => undefined);
             return { ok: false, note: "history-failed" };
           }
         } else {
@@ -1189,12 +1252,14 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
         await updateCurrentScan(activeScan.source, activeScan.accountId, {
           ...clearedScanState(),
           ...historyFailureState({ ...current, scanItems: null }, activeScan.source, message, activeScan.recipe),
+          ...failedScanReport(current, activeScan.source),
         });
       } catch (failure) {
         if (failure instanceof ScanSupersededError) return { ok: false, note: "superseded" };
         throw failure;
       }
       clearScanTick();
+      void flushScanFailures().catch(() => undefined);
       return { ok: false, note: "source-account-failed" };
     }
     throw error;
@@ -1233,7 +1298,7 @@ async function finalizeScan(
       id: crypto.randomUUID(),
       source,
       ingestPath,
-      payload,
+      payload: state.scanStartedAt == null ? payload : { ...payload, chromeScanStartedAt: state.scanStartedAt },
       count,
       accountKey: scanAccountId,
     };
@@ -1803,6 +1868,7 @@ async function handleExternal(
                 lastScanStartedAt: null,
                 hadReplyByConversation: {},
                 scanFailures: {},
+                failedScanReports: {},
                 syncRecovery: {},
                 scanRetryCount: 0,
                 scanRetryAt: null,
@@ -1851,6 +1917,7 @@ async function handleExternal(
       return;
     }
     case "getOnboardingStatus": {
+      void flushScanFailures().catch(() => undefined);
       sendResponse(await buildStatus());
       return;
     }
@@ -2131,6 +2198,10 @@ export function registerListeners(): void {
       })();
       return;
     }
+    if (alarm.name === SCAN_FAILURE_REPORT_ALARM || alarm.name === SCAN_ALARM) {
+      void flushScanFailures().catch(() => undefined);
+    }
+    if (alarm.name === SCAN_FAILURE_REPORT_ALARM) return;
     if (alarm.name === HANDOFF_RETRY_ALARM) {
       void getState().then(async state => { if (state.noticedOrigin) await openPendingHandoffs(state.noticedOrigin); });
       return;
@@ -2228,6 +2299,7 @@ export function registerListeners(): void {
       armScanTick();
     }
     if (noticedOrigin) await openPendingHandoffs(noticedOrigin);
+    void flushScanFailures().catch(() => undefined);
   })();
 }
 

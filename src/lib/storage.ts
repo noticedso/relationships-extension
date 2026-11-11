@@ -124,6 +124,15 @@ export type SyncRecovery = {
   retryAt?: number;
 };
 
+export type FailedScanReport = {
+  id: string;
+  accountId: string;
+  origin: string;
+  source: "linkedin_extension" | "x_extension";
+  startedAt: number;
+  failedAt: number;
+};
+
 export type State = {
   syncRecovery?: Record<string, SyncRecovery> | null;
   /** Back-compat single recipe (the LinkedIn one). New code reads `recipes`. */
@@ -204,6 +213,7 @@ export type State = {
       phaseResults: NonNullable<State["scanPhaseResults"]>;
     };
   }> | null;
+  failedScanReports?: Record<string, FailedScanReport>;
   scanRetryCount?: number | null;
   scanRetryAt?: number | null;
   /**
@@ -244,6 +254,7 @@ const KEYS: (keyof State)[] = [
   "scanStartedAt",
   "scanNeedsRecipeRefresh",
   "scanFailures",
+  "failedScanReports",
   "scanRetryCount",
   "scanRetryAt",
   "syncTabId",
