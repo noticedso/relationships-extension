@@ -49,6 +49,8 @@ const SCAN_ALARM = "scan";
 const SCAN_PERIOD_MS = 3 * 24 * 60 * 60 * 1000;
 const SCAN_CHECK_PERIOD_MINUTES = 6 * 60;
 const SYNC_PATH = "/x/sync";
+const HANDOFF_SESSION_PATH = RECIPE_PATH + "?handoff=1";
+const SESSION_TIMEOUT_MS = 5_000;
 const HANDOFF_RETRY_ALARM = "handoff-retry";
 const SCAN_FAILURE_REPORT_ALARM = "scan-failure-report";
 
@@ -1281,7 +1283,7 @@ async function finalizeScan(
 ): Promise<RunScanResult> {
   const source = sourceOf(recipe);
   const { ingestPath, payload, count } = assembleScanPayload(recipe, connLists, messages, selfId, extras);
-  return withAccountStateMutation(async () => {
+  const result = await withAccountStateMutation(async () => {
     const state = await getState();
     if (
       !state.scanInProgress
@@ -1316,26 +1318,29 @@ async function finalizeScan(
       scanNeedsRecipeRefresh: false,
     } as const;
 
-    if (!noticedOrigin) {
-      await setState({ pendingScans, needs: null, lastScanStartedAt: startedAt, ...cleared });
-      return { ok: true, count, note: "no-handoff-origin" };
-    }
-
-    await setState({ pendingScans, needs: "noticed-signin", lastScanStartedAt: startedAt, ...cleared });
-    // E7 silent handoff: open /x/sync?ext_id=…&source=<src> in a BACKGROUND tab.
-    const tab = await chrome.tabs.create({
-      url: `${noticedOrigin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`,
-      active: false,
-    });
+    // A broker already at the sync URL may have failed an earlier upload.
+    // Invalidate its tab ID when replacing its payload so the new scan can run.
+    const syncTabIds = { ...state.syncTabIds };
+    const oldTabId = syncTabIds[source];
+    delete syncTabIds[source];
     await setState({
-      syncTabId: tab?.id ?? null,
-      syncTabIds:
-        tab?.id != null
-          ? { ...(state.syncTabIds ?? {}), [source]: tab.id }
-          : state.syncTabIds ?? {},
+      pendingScans,
+      syncTabIds,
+      ...(oldTabId != null && oldTabId === state.syncTabId ? { syncTabId: null } : {}),
+      needs: noticedOrigin ? "noticed-signin" : null,
+      lastScanStartedAt: startedAt,
+      ...cleared,
     });
-    return { ok: true, count };
+    if (noticedOrigin && oldTabId != null) {
+      const existing = await chrome.tabs.get(oldTabId).catch(() => null);
+      if ((existing?.pendingUrl ?? existing?.url) === syncHandoffUrl(noticedOrigin, source)) {
+        await chrome.tabs.remove(oldTabId).catch(() => undefined);
+      }
+    }
+    return noticedOrigin ? { ok: true, count } : { ok: true, count, note: "no-handoff-origin" };
   });
+  if (result.ok && noticedOrigin) await reconcilePendingHandoffs(noticedOrigin);
+  return result;
 }
 
 /**
@@ -1683,10 +1688,36 @@ async function recoverObsoleteHistory(): Promise<void> {
   }
 }
 
+function syncHandoffUrl(origin: string, source: string): string {
+  return `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`;
+}
+
+/** Confirm a live session before any tab can navigate to the protected broker. */
+async function hasNoticedSession(origin: string, paired: State["account"] | undefined): Promise<boolean> {
+  try {
+    const response = await fetch(origin + HANDOFF_SESSION_PATH, {
+      credentials: "include",
+      redirect: "error",
+      signal: AbortSignal.timeout(SESSION_TIMEOUT_MS),
+    });
+    if (!response.ok) return false;
+    // The broker already requires this endpoint. It returns account metadata
+    // without returning the session credential to the extension.
+    const pairing = await response.json() as { account?: Account } | null;
+    return stableAccountId(pairing?.account) !== null && accountsMatch(paired, pairing?.account);
+  } catch {
+    // An unavailable session check is retried on the next alarm or sign-in.
+    return false;
+  }
+}
+
 async function reconcilePendingHandoffs(origin: string): Promise<void> {
+  if (!isNoticedOrigin(origin)) return;
   await withAccountStateMutation(async () => {
     const state = await getState();
+    if (state.noticedOrigin !== origin) return;
     const tabIds = { ...(state.syncTabIds ?? {}) };
+    let signedIn: boolean | undefined;
     for (const pending of Object.values(state.pendingScans ?? {})) {
       const recovery = state.syncRecovery?.[pending.source];
       if (recovery?.status === "needs_attention") continue;
@@ -1695,26 +1726,25 @@ async function reconcilePendingHandoffs(origin: string): Promise<void> {
         continue;
       }
       if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
-      const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
+      const handoffUrl = syncHandoffUrl(origin, pending.source);
       const existingTabId = tabIds[pending.source];
       if (existingTabId != null) {
-        try {
-          const existing = await chrome.tabs.get(existingTabId);
-          if (existing.url === handoffUrl) continue;
-          delete tabIds[pending.source];
-        } catch {
-          delete tabIds[pending.source];
-        }
+        const existing = await chrome.tabs.get(existingTabId).catch(() => null);
+        if ((existing?.pendingUrl ?? existing?.url) === handoffUrl) continue;
       }
+
+      // Redirects (including /signin) cannot finish the cached upload. Keep
+      // the payload and its ID until there is a real session to try again.
+      signedIn ??= await hasNoticedSession(origin, state.account);
+      if (!signedIn) continue;
       pending.id = crypto.randomUUID();
       await setState({ pendingScans: { ...state.pendingScans, [pending.source]: pending } });
-      const tab = await chrome.tabs.create({
-        url: handoffUrl,
-        active: false,
-      });
-      if (tab?.id != null) tabIds[pending.source] = tab.id;
+      const tab = await chrome.tabs.create({ url: handoffUrl, active: false }).catch(() => null);
+      if (tab?.id != null) {
+        tabIds[pending.source] = tab.id;
+        await setState({ syncTabIds: tabIds, syncTabId: tab.id });
+      }
     }
-    await setState({ syncTabIds: tabIds });
   });
 }
 
@@ -2202,9 +2232,10 @@ export function registerListeners(): void {
       void flushScanFailures().catch(() => undefined);
     }
     if (alarm.name === SCAN_FAILURE_REPORT_ALARM) return;
-    if (alarm.name === HANDOFF_RETRY_ALARM) {
-      void getState().then(async state => { if (state.noticedOrigin) await openPendingHandoffs(state.noticedOrigin); });
-      return;
+    if (alarm.name === HANDOFF_RETRY_ALARM || alarm.name === SCAN_ALARM) {
+      void getState().then(async ({ noticedOrigin }) => {
+        if (noticedOrigin) await openPendingHandoffs(noticedOrigin);
+      });
     }
     if (alarm.name !== SCAN_ALARM) return;
     // Refresh live-served recipes before every scheduled automatic scan.
@@ -2223,6 +2254,18 @@ export function registerListeners(): void {
       const state = await getState();
       if (!state.account) return;
       const domain = cookie.domain.replace(/^\./, "");
+      const origin = state.noticedOrigin;
+      if (origin && isNoticedOrigin(origin)
+        && /^(?:__Secure-)?authjs\.session-token(?:\.\d+)?$/.test(cookie.name)) {
+        const host = new URL(origin).hostname;
+        if (host === domain || host.endsWith(`.${domain}`)) {
+          // The current pass may have queried the session before this cookie
+          // was set. Recheck afterward; simultaneous cookie events share it.
+          await handoffReconcile;
+          await openPendingHandoffs(origin);
+        }
+        return;
+      }
       const sources = Object.entries(recipesOf(state))
         .filter(([, recipe]) => {
           const host = new URL(recipe.targetOrigin).hostname;

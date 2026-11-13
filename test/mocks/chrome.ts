@@ -59,7 +59,7 @@ export interface ChromeMock {
   };
   tabs: {
     create: (createProperties: { url?: string; active?: boolean }) => Promise<{ id: number; url?: string }>;
-    get: (tabId: number) => Promise<{ id: number; url?: string }>;
+    get: (tabId: number) => Promise<{ id: number; url?: string; pendingUrl?: string }>;
     remove: (tabId: number) => Promise<void>;
     query: (queryInfo: { url?: string | string[] }) => Promise<Array<{ id?: number; windowId?: number; url?: string }>>;
     update: (tabId: number, updateProperties: { active?: boolean }) => Promise<{ id: number }>;
