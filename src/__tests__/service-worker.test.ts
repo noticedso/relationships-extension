@@ -590,7 +590,7 @@ describe("service worker", () => {
   it("3f. re-pairing reopens a cached handoff without rescanning", async () => {
     const chrome = getChrome();
     const createTab = vi.spyOn(chrome.tabs, "create");
-    const fetchSpy = vi.fn();
+    const fetchSpy = vi.fn(async () => Response.json({ user: {} }));
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
     await chrome.storage.local.set({
       recipe,
@@ -623,7 +623,9 @@ describe("service worker", () => {
       url: "https://app.noticed.so/x/sync?ext_id=test-extension-id&source=linkedin_extension",
       active: false,
     });
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(
+      noticedSender.origin + "/api/auth/session", expect.objectContaining({ credentials: "include" }),
+    );
     const stored = await chrome.storage.local.get(null);
     expect(stored.pendingScans).toMatchObject({
       linkedin_extension: { count: 1, ingestPath: correlatedPath },
@@ -632,6 +634,7 @@ describe("service worker", () => {
 
   it("3g. re-pairing replaces a handoff tab that redirected away", async () => {
     const chrome = getChrome();
+    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
     const createTab = vi.spyOn(chrome.tabs, "create");
     vi.spyOn(chrome.tabs, "get").mockResolvedValueOnce({
       id: 99,
@@ -983,6 +986,7 @@ describe("service worker", () => {
 
   it("5. runScan with cookie caches pendingScan + opens handoff tab", async () => {
     const chrome = getChrome();
+    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
     await pair();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     const tabSpy = vi.spyOn(chrome.tabs, "create");
@@ -1751,9 +1755,7 @@ describe("service worker", () => {
     const chrome = getChrome();
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
-    const fetchSpy = vi.fn(
-      async () => ({ ok: true, json: async () => ({ elements: [] }) }) as Response,
-    );
+    const fetchSpy = vi.fn(async () => Response.json({ user: {} }));
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
     const tabSpy = vi.spyOn(chrome.tabs, "create");
     const settle = () => new Promise((r) => setTimeout(r, 25));
@@ -1773,7 +1775,9 @@ describe("service worker", () => {
     await pair();
     await settle();
 
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(
+      noticedSender.origin + "/api/auth/session", expect.objectContaining({ credentials: "include" }),
+    );
     expect(tabSpy).toHaveBeenCalledTimes(1);
     const stored = await chrome.storage.local.get(null);
     expect(pendingConns(stored)).toEqual([{ profileUrl: "already-scanned" }]);
@@ -1933,8 +1937,58 @@ describe("service worker", () => {
     expect(stored.pendingScans).toMatchObject({ x: { count: 0 } });
   });
 
+  it("leaves the queued scan alone when the old handoff redirected to sign-in", async () => {
+    const chrome = getChrome();
+    await settle();
+    const origin = noticedSender.origin;
+    await chrome.storage.local.set({
+      account, noticedOrigin: origin, needs: "noticed-signin",
+      ...pending([{ profileUrl: "queued" }]),
+      syncTabIds: { linkedin_extension: 99 },
+    });
+    const createTab = vi.spyOn(chrome.tabs, "create");
+    vi.spyOn(chrome.tabs, "get").mockResolvedValue({ id: 99, url: origin + "/signin" });
+    const session = vi.fn<typeof fetch>().mockImplementation(async () => Response.json(null));
+    vi.stubGlobal("fetch", session);
+
+    sw.registerListenersForTest();
+    await settle();
+    chrome.alarms.onAlarm.dispatch({ name: "scan" });
+    await settle();
+
+    expect(createTab).not.toHaveBeenCalled();
+    expect(pendingConns(await chrome.storage.local.get(null))).toEqual([{ profileUrl: "queued" }]);
+
+    session.mockImplementation(async () => Response.json({ user: { name: "Test User" } }));
+    chrome.cookies.onChanged.dispatch({
+      removed: false, cookie: { name: "__Secure-authjs.session-token", domain: "app.noticed.so" }, cause: "explicit",
+    });
+    await vi.waitFor(() => expect(createTab).toHaveBeenCalledExactlyOnceWith({
+      url: origin + "/x/sync?ext_id=test-extension-id&source=linkedin_extension",
+      active: false,
+    }));
+  });
+
+  it("queues a newly finished scan without opening a tab when noticed is signed out", async () => {
+    const chrome = getChrome();
+    await pair();
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation(async () => Response.json(null)));
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    const createTab = vi.spyOn(chrome.tabs, "create");
+
+    await expect(sw.runScan(undefined, {
+      fetchImpl: async () => Response.json({ elements: [makeElement("queued")] }),
+      sleep: async () => {},
+      refreshRecipes: false,
+    })).resolves.toMatchObject({ ok: true, count: 1 });
+
+    expect(createTab).not.toHaveBeenCalled();
+    expect(pendingConns(await chrome.storage.local.get(null))).toHaveLength(1);
+  });
+
   it("27f. startup reopens a durable pending handoff when no tab was recorded", async () => {
     const chrome = getChrome();
+    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     await chrome.storage.local.set({
       recipe,
@@ -1968,6 +2022,7 @@ describe("service worker", () => {
 
   it("27g. startup and a simultaneous pair open only one durable handoff tab", async () => {
     const chrome = getChrome();
+    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     await chrome.storage.local.set({
       recipe,
@@ -2701,6 +2756,7 @@ describe("service worker", () => {
     let connCall = 0;
     return vi.fn(async (url: string) => {
       const u = String(url);
+      if (u.endsWith("/api/auth/session")) return Response.json({ user: {} });
       if (u.includes(RECIPE_PATH)) {
         if (recipeStatus !== 200) return { ok: false, status: recipeStatus } as Response;
         return { ok: true, json: async () => served } as Response;
