@@ -2239,7 +2239,12 @@ export function registerListeners(): void {
       if (origin && isNoticedOrigin(origin)
         && /^(?:__Secure-)?authjs\.session-token(?:\.\d+)?$/.test(cookie.name)) {
         const host = new URL(origin).hostname;
-        if (host === domain || host.endsWith(`.${domain}`)) await openPendingHandoffs(origin);
+        if (host === domain || host.endsWith(`.${domain}`)) {
+          // The current pass may have queried the session before this cookie
+          // was set. Recheck afterward; simultaneous cookie events share it.
+          await handoffReconcile;
+          await openPendingHandoffs(origin);
+        }
         return;
       }
       const sources = Object.entries(recipesOf(state))

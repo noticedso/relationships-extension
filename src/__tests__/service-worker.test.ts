@@ -1969,6 +1969,36 @@ describe("service worker", () => {
     }));
   });
 
+  it("rechecks the session if sign-in arrives during a signed-out probe", async () => {
+    const chrome = getChrome();
+    await settle();
+    const origin = noticedSender.origin;
+    await chrome.storage.local.set({
+      account, noticedOrigin: origin, ...pending([{ profileUrl: "queued" }]),
+    });
+    const createTab = vi.spyOn(chrome.tabs, "create");
+    let release!: (response: Response) => void;
+    const firstResponse = new Promise<Response>(resolve => { release = resolve; });
+    const session = vi.fn<typeof fetch>()
+      .mockReturnValueOnce(firstResponse)
+      .mockImplementation(async () => Response.json({ user: {} }));
+    vi.stubGlobal("fetch", session);
+
+    sw.registerListenersForTest();
+    await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(1));
+    try {
+      chrome.cookies.onChanged.dispatch({
+        removed: false, cookie: { name: "__Secure-authjs.session-token", domain: "app.noticed.so" }, cause: "explicit",
+      });
+      await settle();
+      expect(createTab).not.toHaveBeenCalled();
+    } finally {
+      release(Response.json(null));
+    }
+    await vi.waitFor(() => expect(createTab).toHaveBeenCalledTimes(1));
+    expect(session).toHaveBeenCalledTimes(2);
+  });
+
   it("queues a newly finished scan without opening a tab when noticed is signed out", async () => {
     const chrome = getChrome();
     await pair();
