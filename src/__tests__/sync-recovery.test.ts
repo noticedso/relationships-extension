@@ -23,7 +23,7 @@ beforeEach(async () => { registerListenersForTest(); await settle(); });
 
 it("acknowledges durable upload retries and bounds them across worker restarts", async () => {
   await seed();
-  vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+  vi.stubGlobal("fetch", async () => Response.json({ account }));
   const remove = vi.spyOn(browser().tabs, "remove");
   const create = vi.spyOn(browser().tabs, "create");
   let now = Date.now();
@@ -101,7 +101,7 @@ it.each([["x_extension", "x"], ["x", "x_extension"]])("re-pairing %s pending dat
   });
   vi.spyOn(browser().permissions, "contains").mockResolvedValue(true);
   vi.spyOn(browser().cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
-  const fetcher = vi.fn(async () => Response.json({ user: {} }));
+  const fetcher = vi.fn(async () => Response.json({ account }));
   globalThis.fetch = fetcher;
 
   await send({ type: "pair", recipe: paired, account });
@@ -109,7 +109,7 @@ it.each([["x_extension", "x"], ["x", "x_extension"]])("re-pairing %s pending dat
 
   const state = await browser().storage.local.get(null) as any;
   expect(fetcher).toHaveBeenCalledExactlyOnceWith(
-    sender.origin + "/api/auth/session", expect.objectContaining({ credentials: "include" }),
+    sender.origin + "/api/linkedin/extension/recipe?handoff=1", expect.objectContaining({ credentials: "include" }),
   );
   expect(state.scanInProgress).not.toBe(true);
   expect(state.pendingScans).toHaveProperty(pendingSource);

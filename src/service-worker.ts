@@ -49,7 +49,7 @@ const SCAN_ALARM = "scan";
 const SCAN_PERIOD_MS = 3 * 24 * 60 * 60 * 1000;
 const SCAN_CHECK_PERIOD_MINUTES = 6 * 60;
 const SYNC_PATH = "/x/sync";
-const SESSION_PATH = "/api/auth/session";
+const HANDOFF_SESSION_PATH = RECIPE_PATH + "?handoff=1";
 const SESSION_TIMEOUT_MS = 5_000;
 const HANDOFF_RETRY_ALARM = "handoff-retry";
 const SCAN_FAILURE_REPORT_ALARM = "scan-failure-report";
@@ -1693,16 +1693,18 @@ function syncHandoffUrl(origin: string, source: string): string {
 }
 
 /** Confirm a live session before any tab can navigate to the protected broker. */
-async function hasNoticedSession(origin: string): Promise<boolean> {
+async function hasNoticedSession(origin: string, paired: State["account"] | undefined): Promise<boolean> {
   try {
-    const response = await fetch(origin + SESSION_PATH, {
+    const response = await fetch(origin + HANDOFF_SESSION_PATH, {
       credentials: "include",
       redirect: "error",
       signal: AbortSignal.timeout(SESSION_TIMEOUT_MS),
     });
     if (!response.ok) return false;
-    const session = await response.json() as { user?: object } | null;
-    return !!session?.user && typeof session.user === "object";
+    // The broker already requires this endpoint. It returns account metadata
+    // without returning the session credential to the extension.
+    const pairing = await response.json() as { account?: Account } | null;
+    return stableAccountId(pairing?.account) !== null && accountsMatch(paired, pairing?.account);
   } catch {
     // An unavailable session check is retried on the next alarm or sign-in.
     return false;
@@ -1733,7 +1735,7 @@ async function reconcilePendingHandoffs(origin: string): Promise<void> {
 
       // Redirects (including /signin) cannot finish the cached upload. Keep
       // the payload and its ID until there is a real session to try again.
-      signedIn ??= await hasNoticedSession(origin);
+      signedIn ??= await hasNoticedSession(origin, state.account);
       if (!signedIn) continue;
       pending.id = crypto.randomUUID();
       await setState({ pendingScans: { ...state.pendingScans, [pending.source]: pending } });

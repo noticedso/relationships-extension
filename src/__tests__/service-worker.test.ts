@@ -590,7 +590,7 @@ describe("service worker", () => {
   it("3f. re-pairing reopens a cached handoff without rescanning", async () => {
     const chrome = getChrome();
     const createTab = vi.spyOn(chrome.tabs, "create");
-    const fetchSpy = vi.fn(async () => Response.json({ user: {} }));
+    const fetchSpy = vi.fn(async () => Response.json({ account }));
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
     await chrome.storage.local.set({
       recipe,
@@ -624,7 +624,7 @@ describe("service worker", () => {
       active: false,
     });
     expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(
-      noticedSender.origin + "/api/auth/session", expect.objectContaining({ credentials: "include" }),
+      noticedSender.origin + "/api/linkedin/extension/recipe?handoff=1", expect.objectContaining({ credentials: "include" }),
     );
     const stored = await chrome.storage.local.get(null);
     expect(stored.pendingScans).toMatchObject({
@@ -634,7 +634,7 @@ describe("service worker", () => {
 
   it("3g. re-pairing replaces a handoff tab that redirected away", async () => {
     const chrome = getChrome();
-    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+    vi.stubGlobal("fetch", async () => Response.json({ account }));
     const createTab = vi.spyOn(chrome.tabs, "create");
     vi.spyOn(chrome.tabs, "get").mockResolvedValueOnce({
       id: 99,
@@ -986,7 +986,7 @@ describe("service worker", () => {
 
   it("5. runScan with cookie caches pendingScan + opens handoff tab", async () => {
     const chrome = getChrome();
-    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+    vi.stubGlobal("fetch", async () => Response.json({ account }));
     await pair();
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     const tabSpy = vi.spyOn(chrome.tabs, "create");
@@ -1755,7 +1755,7 @@ describe("service worker", () => {
     const chrome = getChrome();
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
-    const fetchSpy = vi.fn(async () => Response.json({ user: {} }));
+    const fetchSpy = vi.fn(async () => Response.json({ account }));
     (globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch;
     const tabSpy = vi.spyOn(chrome.tabs, "create");
     const settle = () => new Promise((r) => setTimeout(r, 25));
@@ -1776,7 +1776,7 @@ describe("service worker", () => {
     await settle();
 
     expect(fetchSpy).toHaveBeenCalledExactlyOnceWith(
-      noticedSender.origin + "/api/auth/session", expect.objectContaining({ credentials: "include" }),
+      noticedSender.origin + "/api/linkedin/extension/recipe?handoff=1", expect.objectContaining({ credentials: "include" }),
     );
     expect(tabSpy).toHaveBeenCalledTimes(1);
     const stored = await chrome.storage.local.get(null);
@@ -1959,7 +1959,7 @@ describe("service worker", () => {
     expect(createTab).not.toHaveBeenCalled();
     expect(pendingConns(await chrome.storage.local.get(null))).toEqual([{ profileUrl: "queued" }]);
 
-    session.mockImplementation(async () => Response.json({ user: { name: "Test User" } }));
+    session.mockImplementation(async () => Response.json({ account }));
     chrome.cookies.onChanged.dispatch({
       removed: false, cookie: { name: "__Secure-authjs.session-token", domain: "app.noticed.so" }, cause: "explicit",
     });
@@ -1981,7 +1981,7 @@ describe("service worker", () => {
     const firstResponse = new Promise<Response>(resolve => { release = resolve; });
     const session = vi.fn<typeof fetch>()
       .mockReturnValueOnce(firstResponse)
-      .mockImplementation(async () => Response.json({ user: {} }));
+      .mockImplementation(async () => Response.json({ account }));
     vi.stubGlobal("fetch", session);
 
     sw.registerListenersForTest();
@@ -1999,10 +1999,10 @@ describe("service worker", () => {
     expect(session).toHaveBeenCalledTimes(2);
   });
 
-  it("queues a newly finished scan without opening a tab when noticed is signed out", async () => {
+  it.each([null, { account: {} }, { account: { id: "different-account" } }])("queues a newly finished scan without a verified session (%j)", async session => {
     const chrome = getChrome();
     await pair();
-    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation(async () => Response.json(null)));
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation(async () => Response.json(session)));
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     const createTab = vi.spyOn(chrome.tabs, "create");
 
@@ -2025,7 +2025,7 @@ describe("service worker", () => {
       syncTabId: 99,
       syncTabIds: { linkedin_extension: 99 },
     });
-    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+    vi.stubGlobal("fetch", async () => Response.json({ account }));
     vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
     vi.spyOn(chrome.tabs, "get").mockResolvedValue({ id: 99, url });
     const createTab = vi.spyOn(chrome.tabs, "create");
@@ -2044,7 +2044,7 @@ describe("service worker", () => {
 
   it("27f. startup reopens a durable pending handoff when no tab was recorded", async () => {
     const chrome = getChrome();
-    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+    vi.stubGlobal("fetch", async () => Response.json({ account }));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     await chrome.storage.local.set({
       recipe,
@@ -2078,7 +2078,7 @@ describe("service worker", () => {
 
   it("27g. startup and a simultaneous pair open only one durable handoff tab", async () => {
     const chrome = getChrome();
-    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+    vi.stubGlobal("fetch", async () => Response.json({ account }));
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
     await chrome.storage.local.set({
       recipe,
@@ -2812,7 +2812,7 @@ describe("service worker", () => {
     let connCall = 0;
     return vi.fn(async (url: string) => {
       const u = String(url);
-      if (u.endsWith("/api/auth/session")) return Response.json({ user: {} });
+      if (u.endsWith("/api/linkedin/extension/recipe?handoff=1")) return Response.json({ account });
       if (u.includes(RECIPE_PATH)) {
         if (recipeStatus !== 200) return { ok: false, status: recipeStatus } as Response;
         return { ok: true, json: async () => served } as Response;
@@ -2945,7 +2945,7 @@ describe("service worker", () => {
     await settle();
 
     const urls = urlsOf(fetchSpy);
-    expect(urls.some((u) => u.includes(RECIPE_PATH))).toBe(false); // never re-fetched
+    expect(urls.some((u) => u.endsWith(RECIPE_PATH))).toBe(false); // never re-fetched
     expect(urls.some((u) => u.includes("/msg/events"))).toBe(false); // never swapped in
 
     const stored = await chrome.storage.local.get(null);
@@ -2969,7 +2969,7 @@ describe("service worker", () => {
     await settle();
 
     // The pair-triggered auto-scan must not re-fetch what it was just handed.
-    expect(urlsOf(fetchSpy).filter((u) => u.includes(RECIPE_PATH))).toHaveLength(0);
+    expect(urlsOf(fetchSpy).filter((u) => u.endsWith(RECIPE_PATH))).toHaveLength(0);
 
     const stored = await chrome.storage.local.get(null);
     expect(pendingConns(stored).length).toBeGreaterThan(0); // it DID scan
