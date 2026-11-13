@@ -1318,12 +1318,25 @@ async function finalizeScan(
       scanNeedsRecipeRefresh: false,
     } as const;
 
+    // A broker already at the sync URL may have failed an earlier upload.
+    // Invalidate its tab ID when replacing its payload so the new scan can run.
+    const syncTabIds = { ...state.syncTabIds };
+    const oldTabId = syncTabIds[source];
+    delete syncTabIds[source];
     await setState({
       pendingScans,
+      syncTabIds,
+      ...(oldTabId != null && oldTabId === state.syncTabId ? { syncTabId: null } : {}),
       needs: noticedOrigin ? "noticed-signin" : null,
       lastScanStartedAt: startedAt,
       ...cleared,
     });
+    if (noticedOrigin && oldTabId != null) {
+      const existing = await chrome.tabs.get(oldTabId).catch(() => null);
+      if ((existing?.pendingUrl ?? existing?.url) === syncHandoffUrl(noticedOrigin, source)) {
+        await chrome.tabs.remove(oldTabId).catch(() => undefined);
+      }
+    }
     return noticedOrigin ? { ok: true, count } : { ok: true, count, note: "no-handoff-origin" };
   });
   if (result.ok && noticedOrigin) await reconcilePendingHandoffs(noticedOrigin);
@@ -1675,6 +1688,10 @@ async function recoverObsoleteHistory(): Promise<void> {
   }
 }
 
+function syncHandoffUrl(origin: string, source: string): string {
+  return `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(source)}`;
+}
+
 /** Confirm a live session before any tab can navigate to the protected broker. */
 async function hasNoticedSession(origin: string): Promise<boolean> {
   try {
@@ -1707,7 +1724,7 @@ async function reconcilePendingHandoffs(origin: string): Promise<void> {
         continue;
       }
       if (!accountOwnsKey(state.account, pending.accountKey ?? null)) continue;
-      const handoffUrl = `${origin}${SYNC_PATH}?ext_id=${chrome.runtime.id}&source=${encodeURIComponent(pending.source)}`;
+      const handoffUrl = syncHandoffUrl(origin, pending.source);
       const existingTabId = tabIds[pending.source];
       if (existingTabId != null) {
         const existing = await chrome.tabs.get(existingTabId).catch(() => null);

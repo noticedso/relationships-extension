@@ -2016,6 +2016,32 @@ describe("service worker", () => {
     expect(pendingConns(await chrome.storage.local.get(null))).toHaveLength(1);
   });
 
+  it("hands off a fresh scan even if a previous failed broker is still open", async () => {
+    const chrome = getChrome();
+    await pair();
+    const url = noticedSender.origin + "/x/sync?ext_id=test-extension-id&source=linkedin_extension";
+    await chrome.storage.local.set({
+      ...pending([{ profileUrl: "old" }]),
+      syncTabId: 99,
+      syncTabIds: { linkedin_extension: 99 },
+    });
+    vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
+    vi.spyOn(chrome.cookies, "get").mockResolvedValue({ name: "tok", value: "abc" });
+    vi.spyOn(chrome.tabs, "get").mockResolvedValue({ id: 99, url });
+    const createTab = vi.spyOn(chrome.tabs, "create");
+    const removeTab = vi.spyOn(chrome.tabs, "remove");
+
+    await expect(sw.runScan(undefined, {
+      fetchImpl: async () => Response.json({ elements: [makeElement("fresh")] }),
+      sleep: async () => {},
+      refreshRecipes: false,
+    })).resolves.toMatchObject({ ok: true, count: 1 });
+
+    expect(createTab).toHaveBeenCalledExactlyOnceWith({ url, active: false });
+    expect(removeTab).toHaveBeenCalledWith(99);
+    expect(pendingConns(await chrome.storage.local.get(null))).toMatchObject([{ profileUrl: "fresh" }]);
+  });
+
   it("27f. startup reopens a durable pending handoff when no tab was recorded", async () => {
     const chrome = getChrome();
     vi.stubGlobal("fetch", async () => Response.json({ user: {} }));
