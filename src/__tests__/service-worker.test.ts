@@ -87,7 +87,7 @@ describe("source owner binding", () => {
     expect(url).toBe(origin + "/api/connectors/scan-failure");
     expect(options).toMatchObject({ method: "POST", credentials: "include" });
     const body = JSON.parse(options?.body as string);
-    expect(body).toEqual({ id: expect.any(String), accountId, source: "linkedin_extension", startedAt, failedAt: expect.any(Number) });
+    expect(body).toEqual({ id: expect.any(String), accountId, source: "linkedin_extension", startedAt, failedAt: expect.any(Number), reason: "account_unavailable" });
     expect(body.failedAt).toBeGreaterThan(startedAt);
 
     chrome.alarms.onAlarm.dispatch({ name: "scan-failure-report" });
@@ -128,14 +128,56 @@ describe("source owner binding", () => {
       .toEqual({ memberId: "ACoAA-owner", username: "owner-handle" });
     expect(fetchImpl.mock.calls[0]?.[0]).toContain("/me");
   });
-  it("detects a session-cookie change during a page request without storing the credential", async () => {
+  const owner = { me: { id: "ACoAA-owner", handle: "owner-handle" } };
+  const sessionRecipe = { ...recipe, ownerAccountSource: { ...ownerAccountSource, sessionCookie: "session" } };
+  function sessionCookies(read: () => string) {
+    vi.spyOn(getChrome().cookies, "get").mockImplementation(async ({ name }) => ({ name, value: name === "session" ? read() : "abc" }));
+  }
+  it("adopts a re-issued session cookie for the same owner and completes without storing the credential", async () => {
     const chrome = getChrome();
     let session = "PRIVATE-CREDENTIAL-ONE";
-    await chrome.storage.local.set({ recipe: { ...recipe, ownerAccountSource: { ...ownerAccountSource, sessionCookie: "session" } }, account, ...inProgress() });
-    vi.spyOn(chrome.cookies, "get").mockImplementation(async ({ name }) => ({ name, value: name === "session" ? session : "abc" }));
+    await chrome.storage.local.set({ recipe: sessionRecipe, account, ...inProgress() });
+    sessionCookies(() => session);
+    let pages = 0;
     const fetchImpl = vi.fn(async (url: string) => {
-      if (url.endsWith("/me")) return new Response(JSON.stringify({ me: { id: "ACoAA-owner", handle: "owner-handle" } }), { status: 200 });
+      if (url.endsWith("/me")) return new Response(JSON.stringify(owner), { status: 200 });
+      // LinkedIn refreshes li_at on the first page after the browser wakes.
+      if (++pages === 1) session = "PRIVATE-CREDENTIAL-TWO";
+      return new Response(JSON.stringify({ elements: [makeElement("jane")] }), { status: 200 });
+    });
+    await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanFailures ?? {}).toEqual({});
+    expect(pendingConns(stored).length).toBeGreaterThan(0);
+    expect((stored.pendingScans as any).linkedin_extension.payload.ownerAccount).toEqual({ memberId: "ACoAA-owner", username: "owner-handle" });
+    expect(JSON.stringify(stored)).not.toContain("PRIVATE-CREDENTIAL");
+  });
+  it("adopts a session re-issued during the owner read of a fresh scan", async () => {
+    const chrome = getChrome();
+    let session = "one";
+    await chrome.storage.local.set({ recipe: sessionRecipe, account, ...inProgress() });
+    sessionCookies(() => session);
+    let reads = 0;
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/me")) { if (++reads === 1) session = "two"; return new Response(JSON.stringify(owner), { status: 200 }); }
+      return new Response(JSON.stringify({ elements: [makeElement("jane")] }), { status: 200 });
+    });
+    await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 });
+    const stored = await chrome.storage.local.get(null);
+    expect(stored.scanFailures ?? {}).toEqual({});
+    expect(pendingConns(stored).length).toBeGreaterThan(0);
+  });
+  it("fails as an account switch when the re-issued session belongs to someone else", async () => {
+    const chrome = getChrome();
+    let session = "PRIVATE-CREDENTIAL-ONE";
+    let switched = false;
+    await chrome.storage.local.set({ recipe: sessionRecipe, account, ...inProgress() });
+    sessionCookies(() => session);
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith("/me")) return new Response(JSON.stringify(switched
+        ? { me: { id: "ACoAA-other", handle: "other" } } : owner), { status: 200 });
       session = "PRIVATE-CREDENTIAL-TWO";
+      switched = true;
       return new Response(JSON.stringify({ elements: [makeElement("jane")] }), { status: 200 });
     });
     await expect(sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 }))
@@ -144,8 +186,56 @@ describe("source owner binding", () => {
     expect(stored.pendingScans).toBeUndefined();
     expect(stored.scanInProgress).toBe(false);
     expect(stored.scanSourceSessionHash).toBeNull();
-    expect(stored.scanFailures).toMatchObject({ linkedin_extension: { message: expect.stringContaining("account changed") } });
+    expect(stored.scanFailures).toMatchObject({ linkedin_extension: { message: expect.stringContaining("account changed"), reason: "account_changed" } });
     expect(JSON.stringify(stored)).not.toContain("PRIVATE-CREDENTIAL");
+  });
+  it("stops a scan whose session keeps changing", async () => {
+    const chrome = getChrome();
+    let n = 0;
+    await chrome.storage.local.set({ recipe: sessionRecipe, account, ...inProgress() });
+    sessionCookies(() => `session-${n++}`);
+    const fetchImpl = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/me")
+      ? owner : { elements: [makeElement("jane")] }), { status: 200 }));
+    await expect(sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 }))
+      .resolves.toMatchObject({ ok: false, note: "source-account-failed" });
+    expect((await chrome.storage.local.get(null)).scanFailures).toMatchObject({ linkedin_extension: { reason: "account_changed" } });
+  });
+  it.each([
+    ["the same owner", owner, true],
+    ["a different owner", { me: { id: "ACoAA-other", handle: "other" } }, false],
+  ])("resumes a checkpoint across a re-issued session only for %s", async (_label, me, resumes) => {
+    const chrome = getChrome();
+    const scanOwnerAccount = { memberId: "ACoAA-owner", username: "owner-handle" };
+    await chrome.storage.local.set({ recipe: sessionRecipe, account,
+      ...inProgress({ scanOwnerAccount, scanSelfId: "ACoAA-owner", scanItems: [makeElement("prior")], scanSourceSessionHash: "f".repeat(64) }) });
+    sessionCookies(() => "rotated");
+    const fetchImpl = vi.fn(async (url: string) => new Response(JSON.stringify(url.endsWith("/me")
+      ? me : { elements: [makeElement("jane")] }), { status: 200 }));
+    const result = await sw.continueScan({ fetchImpl: fetchImpl as unknown as typeof fetch, sleep: async () => {}, jitter: () => 0 });
+    const stored = await chrome.storage.local.get(null);
+    if (resumes) {
+      expect(stored.scanFailures ?? {}).toEqual({});
+      // The stored checkpoint item and the new page both reach the handoff.
+      expect(pendingConns(stored)).toHaveLength(2);
+    } else {
+      expect(result).toMatchObject({ ok: false, note: "source-account-failed" });
+      expect(pendingConns(stored)).toEqual([]);
+      expect(stored.scanFailures).toMatchObject({ linkedin_extension: { reason: "account_changed" } });
+    }
+  });
+  it("releases legacy session-change failures on update and keeps reasoned and other failures", async () => {
+    const chrome = getChrome();
+    const legacy = "The signed-in network account changed. Sign in to the original account and retry.";
+    await chrome.storage.local.set({ scanFailures: {
+      linkedin_extension: { message: legacy },
+      x: { message: legacy, reason: "account_changed" },
+      other: { message: "We couldn't finish this import. Try again." },
+    } });
+    chrome.runtime.onInstalled.dispatch({ reason: "update", previousVersion: "1.3.4" });
+    await vi.waitFor(async () => expect((await chrome.storage.local.get(null)).scanFailures).toEqual({
+      x: { message: legacy, reason: "account_changed" },
+      other: { message: "We couldn't finish this import. Try again." },
+    }));
   });
   it.each(["resume", "during scan"])("rejects a source-account switch %s without handing off mixed data", async (mode) => {
     const chrome = getChrome();

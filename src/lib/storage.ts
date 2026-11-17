@@ -124,6 +124,15 @@ export type SyncRecovery = {
   retryAt?: number;
 };
 
+/** Why a scan ended without an upload; sent to noticed with the report. */
+export type ScanFailureReason =
+  | "account_changed"
+  | "account_unavailable"
+  | "account_unproven"
+  | "network_signin"
+  | "scan_timeout"
+  | "history_failed";
+
 export type FailedScanReport = {
   id: string;
   accountId: string;
@@ -131,6 +140,7 @@ export type FailedScanReport = {
   source: "linkedin_extension" | "x_extension";
   startedAt: number;
   failedAt: number;
+  reason?: ScanFailureReason;
 };
 
 export type State = {
@@ -205,6 +215,8 @@ export type State = {
   /** Actionable failures and metadata-only checkpoints, scoped to this account. */
   scanFailures?: Record<string, {
     message: string;
+    /** Absent on failures recorded before 1.3.5. */
+    reason?: ScanFailureReason;
     checkpoint?: XHistoryCheckpoint;
     resume?: {
       accountId: string;
