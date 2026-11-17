@@ -31,9 +31,33 @@ export function assertSourceOwner(expected: { memberId: string; username: string
     throw new SourceAccountError("changed");
 }
 
-/** Credentials remain in Chrome; a changed session cannot contribute to an old checkpoint. */
-export async function bindSourceSession(recipe: ScanRecipe, state: Partial<State>, fetchImpl: typeof fetch):
-  Promise<{ fetch: typeof fetch; sessionHash?: string }> {
+type SourceOwner = { memberId: string; username: string };
+
+/** A session cookie may be re-issued this many times in one scan step. */
+export const MAX_SESSION_ROTATIONS = 3;
+
+export interface SessionRotationOptions {
+  /** CSRF headers for the owner re-read. */
+  headers: () => Record<string, string>;
+  /** The owner this scan is bound to, once known. */
+  owner: () => SourceOwner | undefined;
+  /** Persists the adopted session hash so a resumed step accepts it. */
+  onRotate?: (sessionHash: string) => Promise<void>;
+}
+
+/**
+ * Credentials remain in Chrome; a changed session cannot contribute to an old
+ * checkpoint. Sites re-issue their session cookie for the SAME signed-in
+ * account (LinkedIn refreshes `li_at` after the browser sleeps), so a changed
+ * cookie is not by itself an account switch: the owner is read again, and the
+ * new session is adopted only when it still belongs to the scan's owner.
+ */
+export async function bindSourceSession(
+  recipe: ScanRecipe,
+  state: Partial<State>,
+  fetchImpl: typeof fetch,
+  rotation?: SessionRotationOptions,
+): Promise<{ fetch: typeof fetch; sessionHash?: string }> {
   const name = recipe.ownerAccountSource?.sessionCookie;
   if (!name) return { fetch: fetchImpl };
   const sessionHash = async () => {
@@ -47,15 +71,33 @@ export async function bindSourceSession(recipe: ScanRecipe, state: Partial<State
       throw new SourceAccountError("unavailable");
     }
   };
-  const expected = await sessionHash();
-  if (state.scanSourceSessionHash && state.scanSourceSessionHash !== expected)
-    throw new SourceAccountError("changed");
+  let expected = await sessionHash();
+  let rotations = 0;
+  // Adopt a re-issued session only after proving it is still the scan's owner.
+  // Without a known owner there is nothing collected to protect yet (a fresh
+  // scan reads its owner next, and the final owner check compares against it).
+  const adopt = async (next: string, known: SourceOwner | undefined) => {
+    if (!rotation || ++rotations > MAX_SESSION_ROTATIONS) throw new SourceAccountError("changed");
+    if (known) assertSourceOwner(known, await readSourceOwner(recipe, rotation.headers(), fetchImpl));
+    if (await sessionHash() !== next) throw new SourceAccountError("changed");
+    expected = next;
+    await rotation.onRotate?.(next);
+  };
   if (!state.scanSourceSessionHash && ((state.scanItems?.length ?? 0) > 0 || (state.scanPhaseIndex ?? 0) > 0))
     throw new SourceAccountError("unproven");
+  if (state.scanSourceSessionHash && state.scanSourceSessionHash !== expected) {
+    // A resumed step must prove its stored owner before reusing a checkpoint.
+    if (!state.scanOwnerAccount) throw new SourceAccountError("changed");
+    await adopt(expected, state.scanOwnerAccount);
+  }
+  const verify = async () => {
+    const current = await sessionHash();
+    if (current !== expected) await adopt(current, rotation?.owner());
+  };
   return { sessionHash: expected, fetch: async (input, init) => {
-    if (await sessionHash() !== expected) throw new SourceAccountError("changed");
+    await verify();
     const response = await fetchImpl(input, init);
-    if (await sessionHash() !== expected) throw new SourceAccountError("changed");
+    await verify();
     return response;
   } };
 }

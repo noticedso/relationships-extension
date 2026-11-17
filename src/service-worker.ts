@@ -39,7 +39,7 @@ import {
   sourceOf,
 } from "./lib/recipe-source";
 import { getState, setState } from "./lib/storage";
-import type { Account, FailedScanReport, ScanRecipe, PendingScan, State } from "./lib/storage";
+import type { Account, FailedScanReport, ScanFailureReason, ScanRecipe, PendingScan, State } from "./lib/storage";
 declare const __DEV__: boolean;
 
 const SCAN_ALARM = "scan";
@@ -493,7 +493,7 @@ function clearedScanState(extra?: { needs?: "network-signin" }): Partial<State> 
   };
 }
 
-function failedScanReport(state: Partial<State>, source: string): Partial<State> {
+function failedScanReport(state: Partial<State>, source: string, reason: ScanFailureReason): Partial<State> {
   const accountId = stableAccountId(state.account);
   const origin = state.noticedOrigin;
   const startedAt = state.scanStartedAt;
@@ -503,7 +503,7 @@ function failedScanReport(state: Partial<State>, source: string): Partial<State>
     || (canonical !== "x_extension" && canonical !== "linkedin_extension")) return {};
   const report: FailedScanReport = {
     id: crypto.randomUUID(), accountId, origin, source: canonical,
-    startedAt, failedAt: Math.max(startedAt, Date.now()),
+    startedAt, failedAt: Math.max(startedAt, Date.now()), reason,
   };
   return { failedScanReports: { ...state.failedScanReports, [canonical]: report } };
 }
@@ -563,7 +563,8 @@ async function clearCurrentScan(
       ? "Sign in to the network, then retry the scan."
       : "History collection timed out. Retry the scan.")
     : {};
-  await updateCurrentScan(source, accountId, { ...clearedScanState(extra), ...failure, ...failedScanReport(state, source) });
+  const reason: ScanFailureReason = extra?.needs === "network-signin" ? "network_signin" : "scan_timeout";
+  await updateCurrentScan(source, accountId, { ...clearedScanState(extra), ...failure, ...failedScanReport(state, source, reason) });
   void flushScanFailures().catch(() => undefined);
 }
 
@@ -572,13 +573,15 @@ class HistoryFetchError extends Error {
   get transient() { return this.status === 0 || this.status === 429 || this.status >= 500; }
 }
 
-function historyFailureState(state: Partial<State>, source: string, message: string, recipe = recipesOf(state)[source]): Partial<State> {
+function historyFailureState(
+  state: Partial<State>, source: string, message: string, recipe = recipesOf(state)[source], reason?: ScanFailureReason,
+): Partial<State> {
   const checkpoint = state.scanItems?.[0] as XHistoryCheckpoint | undefined;
   const accountId = accountKey(state.account);
   return {
     ...(state.syncRecovery?.[source] ? { syncRecovery: { ...state.syncRecovery, [source]: { ...state.syncRecovery[source], status: "needs_attention", retryAt: undefined } } } : {}),
     scanFailures: { ...state.scanFailures, [source]: {
-    message, ...(checkpoint?.version === 1 ? { checkpoint } : {}),
+    message, ...(reason ? { reason } : {}), ...(checkpoint?.version === 1 ? { checkpoint } : {}),
     ...(checkpoint?.version === 1 && accountId && recipe && state.scanPhaseIndex != null && state.scanPhaseResults
       ? { resume: { accountId, recipe, phaseIndex: state.scanPhaseIndex, phaseResults: state.scanPhaseResults } } : {}),
   } } };
@@ -1007,7 +1010,14 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       // refreshed == null → keep the cached recipe + headers and scan as before.
     }
 
-    const boundSession = await bindSourceSession(recipe, state, unguardedFetch);
+    let ownerAccount: { memberId: string; username: string } | undefined;
+    const boundSession = await bindSourceSession(recipe, state, unguardedFetch, {
+      headers: () => headers!,
+      owner: () => ownerAccount ?? state.scanOwnerAccount ?? undefined,
+      onRotate: async (sessionHash) => {
+        await updateCurrentScan(scanSource, scanAccountId, { scanSourceSessionHash: sessionHash });
+      },
+    });
     fetchImpl = boundSession.fetch;
     if (boundSession.sessionHash) {
       await updateCurrentScan(scanSource, scanAccountId, { scanSourceSessionHash: boundSession.sessionHash });
@@ -1022,7 +1032,6 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
 
     const results = state.scanPhaseResults ?? { connLists: [], messages: [] };
     let selfId = state.scanSelfId ?? "";
-    let ownerAccount: { memberId: string; username: string } | undefined;
     if (recipe.ownerAccountSource) {
       ownerAccount = await readSourceOwner(recipe, headers, fetchImpl);
       await assertCurrent();
@@ -1098,7 +1107,7 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
             }
             await updateCurrentScan(scanSource, scanAccountId, {
               ...clearedScanState(), ...historyFailureState(current, scanSource, historyFailureMessage(error), recipe),
-              ...failedScanReport(current, scanSource),
+              ...failedScanReport(current, scanSource, "history_failed"),
             });
             clearScanTick();
             void flushScanFailures().catch(() => undefined);
@@ -1253,8 +1262,8 @@ export async function continueScan(deps: RunScanDeps = {}): Promise<RunScanResul
       try {
         await updateCurrentScan(activeScan.source, activeScan.accountId, {
           ...clearedScanState(),
-          ...historyFailureState({ ...current, scanItems: null }, activeScan.source, message, activeScan.recipe),
-          ...failedScanReport(current, activeScan.source),
+          ...historyFailureState({ ...current, scanItems: null }, activeScan.source, message, activeScan.recipe, `account_${error.reason}`),
+          ...failedScanReport(current, activeScan.source, `account_${error.reason}`),
         });
       } catch (failure) {
         if (failure instanceof ScanSupersededError) return { ok: false, note: "superseded" };
@@ -1667,6 +1676,26 @@ async function recoverFailedUpload(message: {
   });
   if (result.ok) void drainScanQueue();
   return result;
+}
+
+/**
+ * Before 1.3.5 a re-issued session cookie (LinkedIn refreshes `li_at` for the
+ * same account) ended a scan as an account switch that only a manual retry
+ * cleared. Those failures carry no reason code; release them so the next
+ * check scans again. Failures that prove a real switch carry a reason and stay.
+ */
+export async function releaseLegacySessionFailures(): Promise<void> {
+  const legacy = sourceAccountFailureMessage(new SourceAccountError("changed"));
+  await withAccountStateMutation(async () => {
+    const { scanFailures } = await getState();
+    const stuck = Object.entries(scanFailures ?? {})
+      .filter(([, failure]) => failure.message === legacy && !failure.reason && !failure.checkpoint && !failure.resume)
+      .map(([source]) => source);
+    if (stuck.length === 0) return;
+    const remaining = { ...scanFailures };
+    for (const source of stuck) delete remaining[source];
+    await setState({ scanFailures: remaining });
+  });
 }
 
 async function recoverObsoleteHistory(): Promise<void> {
@@ -2179,6 +2208,7 @@ export function registerListeners(): void {
   chrome.runtime.onInstalled.addListener(() => {
     void (async () => {
       await recoverObsoleteHistory();
+      await releaseLegacySessionFailures();
       const existing = await chrome.alarms.get(SCAN_ALARM);
       if (existing && existing.periodInMinutes === SCAN_CHECK_PERIOD_MINUTES) return;
       // Check soon: a network that is already overdue catches up now instead of
