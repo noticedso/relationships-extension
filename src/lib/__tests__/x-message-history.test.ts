@@ -61,7 +61,7 @@ describe("complete X DM history", () => {
     expect(result.messages).toHaveLength(2);
     expect(result.messages.map((m) => m.messageId)).toEqual(["101", "102"]);
     const wire = assembleScanPayload({ source: "x" } as ScanRecipe, [], result.messages, "10").payload.messages;
-    expect(wire).toEqual(result.messages.map((m) => ({ counterpartAccountId: "20", lastMessageAt: m.lastMessageAt, direction: "sent", had_reply: false, messageId: m.messageId, conversationId: "10-20" })));
+    expect(wire).toEqual(result.messages.map((m) => ({ counterpartAccountId: "20", lastMessageAt: m.lastMessageAt, direction: "sent", had_reply: false, request_status: "inbox", messageId: m.messageId, conversationId: "10-20" })));
   });
   it("restarts old timestamp-only checkpoints before claiming complete history", async () => {
     const checkpoint = { version: 1 as const, ownerId: "10", jobs: [], messages: { old: { counterpart: "20", time: "2026-08-21T09:32:00.000Z", direction: "sent" as const } }, conversations: [], excluded: [], visited: ["old-page"] };
@@ -139,7 +139,7 @@ describe("complete X DM history", () => {
       "/legacy": legacyEnd,
     };
     const result = await scanXMessageHistory({ ...base, fetchJson: transport(pages) });
-    expect(result.messages).toEqual([{ counterpartProfileUrl: "30", messageId: "message-100", conversationId: "10-30", lastMessageAt: "2026-08-21T09:32:00.000Z", direction: "received", had_reply: false }]);
+    expect(result.messages).toEqual([{ counterpartProfileUrl: "30", messageId: "message-100", conversationId: "10-30", lastMessageAt: "2026-08-21T09:32:00.000Z", direction: "received", had_reply: false, request_status: "pending" }]);
   });
 
   it.each([

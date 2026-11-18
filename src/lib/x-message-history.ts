@@ -11,7 +11,7 @@ type Job = {
   conversation?: string;
   timeline?: "trusted" | "untrusted";
 };
-type Observation = { messageId?: string; conversationId?: string; counterpart: string; time: string; direction: "sent" | "received" };
+type Observation = { sequenceId?: string; legacyEventId?: string; legacy?: boolean; legacyMessageId?: string; messageId?: string; conversationId?: string; counterpart: string; time: string; direction: "sent" | "received" };
 export type XHistoryCheckpoint = {
   version: 1;
   ownerId: string;
@@ -20,6 +20,7 @@ export type XHistoryCheckpoint = {
   conversations: string[];
   excluded: string[];
   visited: string[];
+  inboxStatus?: Record<string, "pending" | "inbox">;
 };
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("x_history_invalid_response");
@@ -91,27 +92,32 @@ export async function scanXMessageHistory(opts: {
   if (opts.checkpoint && (opts.checkpoint.version !== 1 || opts.checkpoint.ownerId !== opts.ownerId)) throw new Error("x_history_account_changed");
   // Old checkpoints already collapsed same-time messages; rescan instead of
   // claiming complete provider history from lossy timestamp-only observations.
-  const reusable = opts.checkpoint && Object.values(opts.checkpoint.messages).every((m) => m.messageId && m.conversationId);
+  const reusable = opts.checkpoint && (opts.checkpoint.inboxStatus || !opts.checkpoint.visited.length) && Object.values(opts.checkpoint.messages).every((m) => m.messageId && m.conversationId);
   const state: XHistoryCheckpoint = reusable ? structuredClone(opts.checkpoint!) : {
     version: 1, ownerId: opts.ownerId,
     jobs: [{ kind: "initial" }, { kind: "requests" }, { kind: "legacyInitial" }],
-    messages: {}, conversations: [], excluded: [], visited: [],
+    messages: {}, conversations: [], excluded: [], visited: [], inboxStatus: {},
   };
-  const add = (id: string, sender: string, time: string, messageId: string) => {
+  const inboxStatus = state.inboxStatus ??= {};
+  const add = (id: string, sender: string, time: string, messageId: string, sequenceId?: string, legacyEventId?: string) => {
     const other = counterpart(id, opts.ownerId);
     if (!other || state.excluded.includes(other)) return;
     if (sender !== opts.ownerId && sender !== other) throw new Error("x_history_invalid_sender");
     const direction = sender === opts.ownerId ? "sent" : "received";
     if (!messageId || messageId.length > 128) throw new Error("x_history_missing_message_id");
     const conversationId = id.replace(":", "-");
-    state.messages[JSON.stringify([conversationId, messageId])] = { counterpart: other, time, direction, messageId, conversationId };
+    const key = JSON.stringify([conversationId, messageId]);
+    const existing = state.messages[key];
+    if (!existing || (sequenceId && (!existing.sequenceId || existing.time.endsWith(".000Z")))) {
+      state.messages[key] = { counterpart: other, time, direction, messageId, conversationId, sequenceId, legacyEventId, legacy: !sequenceId };
+    }
     if (Object.keys(state.messages).length > 10_000) throw new Error("x_history_message_limit");
   };
   const events = (raw: unknown, id: string): ChatEventMetadata[] => array(raw).map((value) => {
     if (typeof value !== "string") throw new Error("x_history_invalid_event");
     const event = decodeChatEvent(value);
     if (event.conversationId !== id) throw new Error("x_history_conversation_mismatch");
-    if (event.kind === 1) add(id, event.senderId, event.occurredAt, event.messageId);
+    if (event.kind === 1) add(id, event.senderId, event.occurredAt, event.messageId, event.sequenceId);
     return event;
   });
   const minimum = (entries: ChatEventMetadata[]): string => {
@@ -123,16 +129,18 @@ export async function scanXMessageHistory(opts: {
     state.conversations.push(id);
     state.jobs.push({ kind: "conversation", conversation: id, cursor: entries.length ? minimum(entries) : "9223372036854775807" });
   };
-  const legacyEntries = (page: Record<string, unknown>) => {
+  const legacyEntries = (page: Record<string, unknown>, timeline?: Job["timeline"]) => {
     for (const raw of array(page.entries ?? [])) {
       const entry = object(raw);
       if (!entry.message) continue;
       const message = object(entry.message), data = object(message.message_data);
       const id = text(message.conversation_id);
-      if (!counterpart(id, opts.ownerId)) continue;
+      const other = counterpart(id, opts.ownerId);
+      if (!other) continue;
+      if (timeline) inboxStatus[other] ??= timeline === "untrusted" ? "pending" : "inbox";
       const time = toIso(data.time);
       if (!time) throw new Error("x_history_invalid_time");
-      add(id, text(data.sender_id), time, text(data.id) || text(message.id));
+      add(id, text(data.sender_id), time, text(data.id) || text(message.id), undefined, text(message.id));
     }
     const conversations = object(page.conversations ?? {});
     for (const [id, raw] of Object.entries(conversations)) {
@@ -163,6 +171,7 @@ export async function scanXMessageHistory(opts: {
           const other = counterpart(id, opts.ownerId);
           if (!other) continue;
           if (item.is_deleted_by_viewer === true) { state.excluded.push(other); continue; }
+          inboxStatus[other] ??= "inbox";
           const entries = events(item.latest_message_events, id);
           // Key-change records may be the only events in an otherwise empty
           // summary. Their sequence still gives us a history cursor.
@@ -178,7 +187,9 @@ export async function scanXMessageHistory(opts: {
         const data = object(object(raw.data).get_message_requests_page);
         for (const rawItem of array(data.message_request_items)) {
           const item = object(rawItem), id = text(item.conversation_id);
-          if (!counterpart(id, opts.ownerId)) continue;
+          const other = counterpart(id, opts.ownerId);
+          if (!other) continue;
+          inboxStatus[other] = "pending";
           const entries = events(item.latest_message_events ?? (item.encoded_message_create_event ? [item.encoded_message_create_event] : []), id);
           enqueueConversation(id, entries, true);
         }
@@ -209,7 +220,7 @@ export async function scanXMessageHistory(opts: {
       }
       case "legacyInbox": case "legacyConversation": {
         const data = object(raw[job.kind === "legacyInbox" ? "inbox_timeline" : "conversation_timeline"]);
-        legacyEntries(data);
+        legacyEntries(data, job.timeline);
         const cursor = legacyCursor(data);
         if (cursor) {
           if (job.cursor && BigInt(cursor) >= BigInt(String(job.cursor))) throw new Error("x_history_repeated_cursor");
@@ -223,7 +234,41 @@ export async function scanXMessageHistory(opts: {
     if (state.jobs.length) await opts.sleep(opts.jitter());
   }
   if (state.jobs.length) return { complete: false, messages: [] };
-  const observations = Object.values(state.messages).filter((m) => !state.excluded.includes(m.counterpart));
+  const observed = Object.values(state.messages).filter((m) => !state.excluded.includes(m.counterpart));
+  // X Chat can expose the client message ID separately from the sequence.
+  // Bridge to the legacy envelope only on shared provider identity and compatible metadata.
+  const legacyById = new Map<string, Observation | null>();
+  for (const m of observed) {
+    if (!m.legacy || !m.messageId || !/^\d+$/.test(m.messageId)) continue;
+    for (const id of new Set([m.messageId, m.legacyEventId].filter(Boolean))) {
+      const key = JSON.stringify([m.conversationId, id]);
+      legacyById.set(key, legacyById.has(key) ? null : m);
+    }
+  }
+  const modernBySequence = new Map<string, Observation | null>();
+  for (const m of observed) {
+    if (!m.sequenceId) continue;
+    const key = JSON.stringify([m.conversationId, m.sequenceId]);
+    modernBySequence.set(key, modernBySequence.has(key) ? null : m);
+  }
+  const aliases = new Set<Observation>();
+  const matches = new Map<Observation, Observation[]>();
+  for (const [key, modern] of modernBySequence) {
+    const legacy = legacyById.get(key);
+    if (!modern || !legacy || modern.direction !== legacy.direction ||
+        modern.time.slice(0, 19) !== legacy.time.slice(0, 19)) continue;
+    const group = matches.get(legacy) ?? [];
+    group.push(modern);
+    matches.set(legacy, group);
+  }
+  for (const [legacy, group] of matches) {
+    if (group.length !== 1) continue;
+    const modern = group[0]!;
+    modern.legacyMessageId = legacy.messageId;
+    if (modern.time.endsWith(".000Z")) modern.time = legacy.time;
+    aliases.add(legacy);
+  }
+  const observations = observed.filter((m) => !aliases.has(m));
   const directions = new Map<string, Set<string>>();
   for (const m of observations) {
     const set = directions.get(m.counterpart) ?? new Set<string>();
@@ -231,7 +276,9 @@ export async function scanXMessageHistory(opts: {
   }
   return { complete: true, messages: observations.map((m) => ({
     messageId: m.messageId, conversationId: m.conversationId,
+    ...(m.legacyMessageId ? { legacyMessageId: m.legacyMessageId } : {}),
     counterpartProfileUrl: m.counterpart, lastMessageAt: m.time, direction: m.direction,
     had_reply: directions.get(m.counterpart)!.size === 2,
+    ...(inboxStatus[m.counterpart] ? { request_status: inboxStatus[m.counterpart] } : {}),
   })) };
 }

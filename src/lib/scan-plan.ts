@@ -101,8 +101,10 @@ export function assembleScanPayload(
     const msgs = messages.map((m) => ({
       counterpartAccountId: m.counterpartProfileUrl,
       ...(m.messageId ? { messageId: m.messageId, conversationId: m.conversationId } : {}),
+      ...(m.legacyMessageId ? { legacyMessageId: m.legacyMessageId } : {}),
       lastMessageAt: m.lastMessageAt,
       direction: m.direction,
+      ...(m.request_status ? { request_status: m.request_status } : {}),
       ...(m.had_reply !== undefined ? { had_reply: m.had_reply } : {}),
     }));
     // Owner-tweet mention/reply edges (NT-63) ride along as `mentions` — the

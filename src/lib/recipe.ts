@@ -86,6 +86,7 @@ function composePictureUrl(element: unknown, fieldMap: FieldMap): string | null 
  */
 export type ScanMessage = {
   messageId?: string;
+  legacyMessageId?: string;
   conversationId?: string;
   counterpartProfileUrl: string;
   lastMessageAt: string; // ISO 8601
@@ -104,6 +105,7 @@ export type ScanMessage = {
    * the text.
    */
   had_reply?: boolean;
+  request_status?: "pending" | "inbox";
 };
 
 /**
