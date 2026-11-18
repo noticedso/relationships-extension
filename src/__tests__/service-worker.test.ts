@@ -3396,7 +3396,7 @@ describe("X history handoff", () => {
     const chrome = await prepareHistory();
     vi.spyOn(chrome.permissions, "contains").mockResolvedValue(true);
     const checkpoint = { version: 1, ownerId: "10", jobs: [{ kind: "initial" }], messages: {}, conversations: [], excluded: [],
-      visited: Array.from({ length: 5_000 }, (_, i) => `page-${i}`) };
+      inboxStatus: {}, visited: Array.from({ length: 5_000 }, (_, i) => `page-${i}`) };
     await chrome.storage.local.set({ scanItems: [checkpoint] });
     const fetchImpl = vi.fn();
     expect(await sw.continueScan({ fetchImpl })).toMatchObject({ note: "history-failed" });
