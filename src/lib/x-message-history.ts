@@ -144,8 +144,10 @@ export async function scanXMessageHistory(opts: {
     }
     const conversations = object(page.conversations ?? {});
     for (const [id, raw] of Object.entries(conversations)) {
-      if (!counterpart(id, opts.ownerId) || state.conversations.includes(id) || state.excluded.includes(counterpart(id, opts.ownerId)!)) continue;
-      if (object(raw).type !== "ONE_TO_ONE") continue;
+      const other = counterpart(id, opts.ownerId);
+      if (!other || state.excluded.includes(other) || object(raw).type !== "ONE_TO_ONE") continue;
+      if (timeline) inboxStatus[other] ??= timeline === "untrusted" ? "pending" : "inbox";
+      if (state.conversations.includes(id)) continue;
       state.conversations.push(id);
       state.jobs.push({ kind: "legacyConversation", conversation: id });
     }

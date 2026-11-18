@@ -86,3 +86,31 @@ test("keeps the precise timestamp when Chat and legacy share a message sequence"
     { messageId: "distinct", legacyMessageId: undefined, lastMessageAt: "2026-08-21T09:32:00.799Z" },
   ]);
 });
+
+test("keeps legacy request status when the messages arrive on a later conversation page", async () => {
+  const message = (id: string, sender: string) => ({
+    message: { id, conversation_id: "10-20", message_data: { sender_id: sender, time: "1787304720000" } },
+  });
+  const pages = {
+    "/initial": { data: { get_initial_chat_page: { items: [], inboxCursor: { __typename: "XChatGetInboxPageEndCursor" } } } },
+    "/requests": { data: { get_message_requests_page: {
+      message_request_items: [],
+      cursor: { __typename: "XChatGetMessageRequestsPageEndCursor", pull_finished: true },
+    } } },
+    "/legacy": { inbox_initial_state: { inbox_timelines: {
+      trusted: { status: "AT_END" }, untrusted: { status: "HAS_MORE", min_entry_id: "200" },
+    } } },
+    "/legacy/untrusted": { inbox_timeline: {
+      status: "AT_END", conversations: { "10-20": { type: "ONE_TO_ONE" } },
+    } },
+    "/legacy/conversation/10-20": { conversation_timeline: {
+      status: "AT_END", entries: [message("199", "10"), message("198", "20")],
+    } },
+  };
+  const result = await scanXMessageHistory({
+    config, ownerId: "10", maxPages: 20, sleep: async () => {}, jitter: () => 0,
+    fetchJson: async (path) => pages[new URL(path, "https://x.com").pathname as keyof typeof pages],
+  });
+  assert.equal(result.messages.length, 2);
+  assert.ok(result.messages.every((m) => m.request_status === "pending" && m.had_reply));
+});
