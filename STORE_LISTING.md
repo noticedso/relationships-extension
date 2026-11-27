@@ -46,7 +46,7 @@ releases auto-publish — see [PUBLISHING.md](./PUBLISHING.md).
   - `alarms` — `Runs the connection import every three days so the user's network stays current without manual re-triggering.`
   - `cookies` — `Reads the user's own LinkedIn session cookie in the browser to authenticate the connection-list request as the signed-in user. The value is used only as the request's CSRF header — never sent to our servers or stored.`
   - Host `*://*.linkedin.com/*` — `Reads the signed-in user's own first-degree connections and message metadata from LinkedIn (name, headline, profile link, connection date), after the user connects the extension to their noticed account. Requested at install so the connection page can start syncing without a second prompt.`
-  - Hosts `*://*.x.com/*`, `*://*.twitter.com/*` (optional, requested at runtime) — `Reads the signed-in user's own mutual follows and message metadata from X, after the user connects the extension to their noticed account. Requested when the user clicks the toolbar button, not at install.`
+  - Hosts `*://*.x.com/*`, `*://*.twitter.com/*` — `Reads the signed-in user's own mutual follows and message metadata from X, after the user connects the extension to their noticed account. Nothing is read while the user is signed out of X.`
   - Host `https://*.noticed.so/*` — `Sends the user's imported connections to their own noticed account and reads their import history, using the user's existing noticed session.`
 - **Remote code:** **No.** The extension fetches a JSON configuration ("recipe") and the user's data from noticed; it does not download or execute remote JavaScript.
 - **Data usage — collected:**
