@@ -107,9 +107,9 @@ export function isNoticedOrigin(origin: string | null | undefined): boolean {
 export const CONNECT_PATH = "/connectors";
 const DEFAULT_NOTICED_ORIGIN = "https://www.noticed.so";
 /**
- * The networks the extension reads. LinkedIn is granted at install (users can
- * still withhold it); X is optional and asked for here, so connecting it never
- * disables an existing LinkedIn-only install on update.
+ * The networks the extension reads. LinkedIn and X are granted at install
+ * (users can still withhold either); the toolbar click asks again for any
+ * access the user withheld.
  */
 const SOURCE_ORIGINS = ["*://*.linkedin.com/*", "*://*.x.com/*", "*://*.twitter.com/*"];
 
@@ -1399,11 +1399,26 @@ export async function runScan(source?: string, deps: RunScanDeps = {}): Promise<
 
 const LINKEDIN_MIN_SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+/** Networks held to one user-started scan a day everywhere. */
+const DAILY_LIMITED_SOURCES: readonly string[] = ["linkedin_extension"];
+/** A website request (noticed's Activity page on open) also holds X to once a
+ * day; the Connectors retry keeps its existing X behaviour. */
+const WEBSITE_DAILY_LIMITED_SOURCES: readonly string[] = ["linkedin_extension", "x", "x_extension"];
+
 /** Rate admission is inside the same lock as checkpoint/queue initialization. */
-function scanCooldown(state: Partial<State>, source: string): Extract<ScanNowResponse, { error: "rate_limited" }> | null {
-  if (source !== "linkedin_extension") return null;
-  const last = Math.max(state.lastScanAttemptBySource?.[source] ?? 0,
-    state.lastScanBySource?.[source]?.at ?? 0,
+function scanCooldown(state: Partial<State>, source: string) {
+  return scanCooldownFor(state, source);
+}
+
+function scanCooldownFor(
+  state: Partial<State>,
+  source: string,
+  limited: readonly string[] = DAILY_LIMITED_SOURCES,
+): Extract<ScanNowResponse, { error: "rate_limited" }> | null {
+  if (!limited.includes(source)) return null;
+  const aliases = sourceAliases(source);
+  const last = Math.max(...aliases.map(alias => state.lastScanAttemptBySource?.[alias] ?? 0),
+    ...aliases.map(alias => state.lastScanBySource?.[alias]?.at ?? 0),
     // Old installations did not persist per-source attempts. Once the map
     // exists, another source's scan says nothing about this one.
     state.lastScanAttemptBySource == null ? state.lastScanStartedAt ?? 0 : 0);
@@ -1415,8 +1430,15 @@ function scanCooldown(state: Partial<State>, source: string): Extract<ScanNowRes
 async function initializeScanPlan(
   sources: string[],
   refreshRecipes: boolean,
-  options: { accountId?: string; queueIfBusy?: boolean; beforeStart?: () => Promise<ScanNowError | undefined> } = {},
+  options: {
+    accountId?: string;
+    queueIfBusy?: boolean;
+    beforeStart?: () => Promise<ScanNowError | undefined>;
+    dailyLimited?: readonly string[];
+  } = {},
 ): Promise<ScanNowResponse> {
+  const scanCooldown = (state: Partial<State>, source: string) =>
+    scanCooldownFor(state, source, options.dailyLimited);
   return withAccountStateMutation(async () => {
     let state = await getState();
     if (options.accountId && state.account?.id !== options.accountId)
@@ -1860,15 +1882,20 @@ async function handleExternal(
         if (!message.accountId || state.account?.id !== message.accountId) {
           sendResponse({ok:false,error:"account_mismatch"}); return;
         }
-        if (message.source !== "linkedin_extension") {
+        if (message.source !== "linkedin_extension" && message.source !== "x_extension") {
           sendResponse({ok:false,error:"unsupported_source"}); return;
         }
-        const recipe = recipesOf(state)[message.source];
+        // noticed names X "x_extension"; its served recipe may be keyed "x".
+        const recipe = recipeForSource(recipesOf(state), message.source);
         if (!recipe) { sendResponse({ok:false,error:"not_connected"}); return; }
-        const result = await initializeScanPlan([message.source], true, {
+        const scanSource = sourceOf(recipe);
+        const result = await initializeScanPlan([scanSource], true, {
           accountId: message.accountId,
+          dailyLimited: WEBSITE_DAILY_LIMITED_SOURCES,
+          // Signed out stops here, before any attempt is recorded, so the page
+          // can stay quiet for people who do not use the network.
           beforeStart: async () => {
-            if (!(await grantedSources({ [message.source]: recipe })).includes(message.source))
+            if (!(await grantedSources({ [scanSource]: recipe })).includes(scanSource))
               return "permission_required";
             const signedIn = await isSignedIn(recipe);
             return signedIn === true ? undefined : signedIn === false ? "network_signin_required" : "request_failed";

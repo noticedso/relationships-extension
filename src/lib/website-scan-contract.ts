@@ -3,6 +3,7 @@ export const WEBSITE_SCAN_CAPABILITIES = {
   websiteScan: 1,
   linkedinSourceAccount: 1,
   linkedinDailyScan: 1,
+  xDailyScan: 1,
 } as const;
 export const SCAN_NOW_ERRORS = [
   "account_mismatch",
@@ -16,7 +17,7 @@ export const SCAN_NOW_ERRORS = [
 export type ScanNowError = (typeof SCAN_NOW_ERRORS)[number];
 export type ScanNowRequest = {
   type: "scanNow";
-  source: "linkedin_extension";
+  source: "linkedin_extension" | "x_extension";
   accountId: string;
 };
 export type ScanNowResponse =

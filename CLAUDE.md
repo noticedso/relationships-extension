@@ -29,9 +29,8 @@ Releasing is tag-driven (`git tag vX.Y.Z && git push origin vX.Y.Z`) — see `PU
 endpoints to hit. At pair time, noticed serves a JSON **"recipe"** (`targetOrigin`, `listPathTemplate`
 with `{start}`/`{count}`, `paginationParams`, `csrfRule`, `fieldMap`, `pacing`, `excludeSources`) that is
 stored in `chrome.storage` and drives a scan. This is config/data, never executable code. (`manifest.json`
-declares LinkedIn as a host permission **granted at install** (NT-300). X/Twitter stay **optional**, so
-the update doesn't disable LinkedIn-only installs; the toolbar button asks for X, and for any LinkedIn
-access the user withheld.)
+declares LinkedIn and X/Twitter as host permissions **granted at install** (NT-300, v1.4.0); the toolbar
+button asks again for any access the user withheld.)
 
 **`src/service-worker.ts` is the brain.** It registers listeners (idempotently — re-binds when the test
 harness swaps the global `chrome`):

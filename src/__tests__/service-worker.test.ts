@@ -470,6 +470,58 @@ describe("service worker", () => {
     expect(await dispatchExternal(message,noticedSender)).toMatchObject({ok:false,error:"network_signin_required"});
     expect(getChrome().permissions.request).not.toHaveBeenCalled();
   });
+  it("advertises the daily X scan capability", async () => {
+    expect(await dispatchExternal({type:"ping"},noticedSender)).toMatchObject({ok:true,websiteScan:1,linkedinDailyScan:1,xDailyScan:1});
+  });
+  it("starts an X scan from the website and records the attempt under the served X source", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"request");
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    const fetch=vi.fn(async (url: string)=>({ok:true,status:200,json:async()=>String(url).includes(RECIPE_PATH)?{recipe,recipes:[recipe,xRecipe],account}:{elements:[]}}));
+    vi.stubGlobal("fetch",fetch);
+    const result=await dispatchExternal({type:"scanNow",source:"x_extension",accountId:account.id},noticedSender);
+    expect(result).toMatchObject({ok:true,status:"started"});
+    const state=await getChrome().storage.local.get(null);
+    expect(state.lastScanAttemptBySource).toEqual({x:expect.any(Number)});
+    expect(state.scanQueue).toEqual([]);
+    await vi.waitFor(async()=>expect((await getChrome().storage.local.get(null)).scanInProgress).toBe(false));
+    expect(fetch.mock.calls.some(([url])=>String(url).startsWith(recipe.targetOrigin))).toBe(false);
+    expect(getChrome().permissions.request).not.toHaveBeenCalled();
+  });
+  it("holds website X scans to one a day, counted from the last attempt or sync", async () => {
+    const at=Date.now()-60_000;
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so",lastScanAttemptBySource:{x:at}});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue({name:"tok",value:"abc"});
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    expect(await dispatchExternal({type:"scanNow",source:"x_extension",accountId:account.id},noticedSender))
+      .toEqual({ok:false,error:"rate_limited",retryAt:new Date(at+86400000).toISOString()});
+    await getChrome().storage.local.set({lastScanAttemptBySource:{},lastScanBySource:{x_extension:{at,count:3}}});
+    expect(await dispatchExternal({type:"scanNow",source:"x_extension",accountId:account.id},noticedSender))
+      .toMatchObject({ok:false,error:"rate_limited"});
+    expect(fetch).not.toHaveBeenCalled();
+    expect((await getChrome().storage.local.get(null)).scanInProgress).not.toBe(true);
+  });
+  it("reports X signed out without recording an attempt, so the next open can still scan", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(true);
+    vi.spyOn(getChrome().cookies,"get").mockResolvedValue(null);
+    const fetch=vi.fn();vi.stubGlobal("fetch",fetch);
+    expect(await dispatchExternal({type:"scanNow",source:"x_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"network_signin_required"});
+    const state=await getChrome().storage.local.get(null);
+    expect(state.lastScanAttemptBySource).toBeUndefined();
+    expect(state.scanFailures).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it("reports X access the user withheld and X not paired", async () => {
+    await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe,x:xRecipe},account,noticedOrigin:"https://app.noticed.so"});
+    vi.spyOn(getChrome().permissions,"contains").mockResolvedValue(false);
+    expect(await dispatchExternal({type:"scanNow",source:"x_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"permission_required"});
+    await getChrome().storage.local.set({recipes:{linkedin_extension:recipe}});
+    expect(await dispatchExternal({type:"scanNow",source:"x_extension",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"not_connected"});
+    expect(await dispatchExternal({type:"scanNow",source:"gmail",accountId:account.id},noticedSender)).toMatchObject({ok:false,error:"unsupported_source"});
+  });
   it("reuses an active scan and rejects non-first-party senders", async () => {
     await getChrome().storage.local.set({recipe,recipes:{linkedin_extension:recipe},account,noticedOrigin:"https://app.noticed.so",...inProgress({scanAccountId:"id:acct-1"})});
     const message={type:"scanNow",source:"linkedin_extension",accountId:account.id};
